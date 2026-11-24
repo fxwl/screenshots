@@ -4,6 +4,9 @@
   <p>基于自建 WebDAV 与客户端端到端加密的多设备浏览器登录态自动同步扩展。</p>
 
   <p>
+    <a href="https://microsoftedge.microsoft.com/addons/detail/lciamlghddinjagggaocchcoifncbnak">
+      <img src="https://img.shields.io/badge/Microsoft%20Edge%20Add--ons-Install-0078D7?style=flat-square" alt="前往 Microsoft Edge 外接程序商店安装" />
+    </a>
     <a href="https://github.com/fxwl/screenshots/actions/workflows/build-zip.yml">
       <img src="https://github.com/fxwl/screenshots/actions/workflows/build-zip.yml/badge.svg" alt="自动编译状态" />
     </a>
@@ -28,7 +31,8 @@
 - **自选 WebDAV 存储与 19 项能力探测**：兼容坚果云、Nextcloud、群晖 NAS、Alist、Caddy、Nginx 等任意标准 WebDAV 服务（支持 Basic 账号密码、应用专用密码与 Bearer Token），内置 **19 项能力与强一致 CAS 并发探测**以及 HTTP `507` 空间满自动熔断保护。
 - **按需纳管、主基准设备与双层黑名单**：默认仅同步你主动纳入管理的网站（`managed_only`），支持空间统一基准策略（`ask` / `primary_device` / `latest_wins`）与单设备独立策略（只读跟随、仅上传、独立轨道、设备专属排除），并配备空间级 + 本机级双层黑名单与 SSO 关联域名分组。
 - **智能同步时机与高可靠同步内核**：默认支持**离开页面时上传（`on_page_leave`）**（页面打开期间静默合并变更，离开时自动批量落盘）与实时/定时同步；内置同名/同路径碰撞 Cookie 精确消歧、强制浏览器回读验证、异常退出启动补齐与 `>256KB` 超大 SPA `localStorage` 跳过保护。
-- **多账号轨道与 10 秒跨设备配对**：同一网站支持多账号轨道切换与独立维护，支持工作/个人多空间隔离，并可通过加密配对码（`smesh://pair/...`）10 秒接入新设备。
+- **多账号管理轮换与 10 秒跨设备配对**：同一网站支持无损新建空白账号（保留原账号会话不触发服务端登出）、一键顺序轮换切换多账号轨道、工作/个人多空间隔离，并可通过加密配对码（`smesh://pair/...`）10 秒接入新设备。
+- **开发与生产环境 Cookie 数据同步**：支持将线上生产/预发环境的登录态 Cookie 与 `localStorage` 一键或实时自动映射同步至 `localhost` / `127.0.0.1` / 本地开发域名，自动重写 `Domain` 并适配 HTTP 环境下的 `Secure` 与 `SameSite` 属性，支持绑定指定账号轨道或随多账号轮换联动更新。
 - **安全自动刷新守卫与防死循环护盾**：准备刷新标签页前自动检测未保存表单、活跃输入、富文本编辑或待上传文件，并屏蔽仅 `localStorage` 变更或后台轮询导致的刷新死循环。
 - **侧边栏与完整控制台**：支持逐条查看/编辑/导入导出 Cookie（含回读验证状态）与 `localStorage`、冲突处理、历史回滚、WebDAV AEAD 完整性校验、备份恢复与安全垃圾回收（GC）。
 
@@ -36,7 +40,7 @@
 
 ### 商店安装与自动编译发布包（推荐）
 
-- **Microsoft Edge Add-ons**：*审核上架中*
+- **Microsoft Edge Add-ons**：[前往 Microsoft Edge 外接程序商店一键安装](https://microsoftedge.microsoft.com/addons/detail/lciamlghddinjagggaocchcoifncbnak)
 - **GitHub Releases（每次推送自动编译）**：[前往 Releases 下载最新 `.zip`](https://github.com/fxwl/screenshots/releases) → 解压后在 `edge://extensions` 加载即可（其他 Chromium 内核浏览器亦可手动加载解压目录使用）。
 
 ### 从源码构建

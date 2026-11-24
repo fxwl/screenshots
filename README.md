@@ -4,6 +4,9 @@
   <p>Multi-device browser login state auto-sync over WebDAV with client-side E2E encryption.</p>
 
   <p>
+    <a href="https://microsoftedge.microsoft.com/addons/detail/lciamlghddinjagggaocchcoifncbnak">
+      <img src="https://img.shields.io/badge/Microsoft%20Edge%20Add--ons-Install-0078D7?style=flat-square" alt="Install on Microsoft Edge Add-ons" />
+    </a>
     <a href="https://github.com/fxwl/screenshots/actions/workflows/build-zip.yml">
       <img src="https://github.com/fxwl/screenshots/actions/workflows/build-zip.yml/badge.svg" alt="Auto Build" />
     </a>
@@ -28,7 +31,8 @@
 - **Bring Your Own WebDAV**: Works with Nextcloud, Jianguoyun (Nutstore), Synology NAS, Caddy, Nginx, Alist, or any standard WebDAV endpoint (Basic Auth, App Password, or Bearer Token) with a built-in **19-step capability & CAS consistency detector** and HTTP `507` storage-full circuit breaker.
 - **Managed Sites, Authority Policies & Dual-Layer Blacklist**: Sync only opted-in domains (`managed_only`), configure space authority modes (`ask`, `primary_device`, `latest_wins`) and per-device roles (`pull_only`, `push_only`, independent tracks), protected by space-wide + device-only blacklists and SSO domain groups.
 - **Smart Sync Timing & High-Reliability Engine**: Supports **`on_page_leave`** (quietly compacts changes while a tab is open and flushes on leave) alongside real-time/periodic sync, exact colliding-cookie disambiguation (`hostOnly` vs wildcard domain & sibling paths), mandatory browser readback verification, startup reconciliation, and `>256KB` SPA `localStorage` blob guards.
-- **Multi-Account Tracks & 10-Second Pairing**: Maintain separate account tracks per site, isolate work/personal spaces, and pair new devices via encrypted `smesh://pair/...` pairing codes.
+- **Multi-Account Management, Rotation & 10-Second Pairing**: Create clean account slots without invalidating existing server sessions, rotate through multiple accounts per site with one click, isolate work/personal spaces, and pair new devices via encrypted `smesh://pair/...` pairing codes.
+- **Dev & Prod Environment Cookie Sync**: Mirror production/staging Cookies and `localStorage` to `localhost`, `127.0.0.1`, or custom dev domains on demand or automatically—rewriting `Domain` and adapting `Secure`/`SameSite` for HTTP local debugging, with support for pinning specific account tracks or cascading on account rotation.
 - **Safe Auto-Refresh & Anti-Loop Shields**: Detects active form input, `contenteditable` edits, or pending file uploads before reloading tabs, and blocks reload loops across `localStorage`-only updates and background polls.
 - **Side Panel & Full Console**: Inspect, edit, import/export Cookies and `localStorage`, resolve conflicts, restore history snapshots, and run WebDAV AEAD integrity checks, backups & safe GC.
 
@@ -36,7 +40,7 @@
 
 ### Official Store & Pre-built Releases (Recommended)
 
-- **Microsoft Edge Add-ons**: *Under review*
+- **Microsoft Edge Add-ons**: [Install SessionMesh on Microsoft Edge Add-ons](https://microsoftedge.microsoft.com/addons/detail/lciamlghddinjagggaocchcoifncbnak)
 - **GitHub Releases (Auto-built on every push)**: [Download latest `.zip`](https://github.com/fxwl/screenshots/releases) → unzip → load unpacked in `edge://extensions` (also compatible with other Chromium-based browsers via manual unpacked install).
 
 ### Build from Source
