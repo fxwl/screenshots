@@ -2,6 +2,14 @@
 
 All notable changes to **SessionMesh** will be documented in this file.
 
+## [1.0.1] - 2026-11-24
+
+### Changed
+
+- **Visual Refresh (Microsoft Fluent 3D Cookie Icon)**:
+  - Replaced the previous purple icon across all extension sizes (`16×16`, `32×32`, `48×48`, `128×128`), in-app UI logos (`256×256` PNG and `logo.svg`), and Microsoft Edge Add-ons store icon (`300×300`) with a new sky-blue/aqua Fluent 3D chocolate-chip cookie sync icon.
+  - Redesigned store promotional tiles (`440×280` small tile and `1400×560` marquee banner) in a matching ocean-blue, aqua-mint, and warm amber palette (24-bit RGB PNG).
+
 ## [1.0.0] - 2026-11-24
 
 Initial open-source release of **SessionMesh** for Chrome and Microsoft Edge (Manifest V3).

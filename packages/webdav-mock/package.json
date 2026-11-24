@@ -1,6 +1,6 @@
 {
   "name": "@sessionmesh/webdav-mock",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "description": "Programmable RFC 4918 Mock WebDAV Server for SessionMesh acceptance testing",
   "private": true,
   "sideEffects": false,

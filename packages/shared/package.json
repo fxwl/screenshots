@@ -1,6 +1,6 @@
 {
   "name": "@sessionmesh/shared",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "description": "SessionMesh shared IPC protocol, hooks and providers",
   "private": true,
   "sideEffects": false,

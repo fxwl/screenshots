@@ -1,6 +1,6 @@
 {
   "name": "chrome-extension",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "description": "SessionMesh multi-device browser login state sync extension",
   "scripts": {
     "clean": "rimraf ../../dist && rimraf .turbo",

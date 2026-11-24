@@ -1,6 +1,6 @@
 {
   "name": "@sessionmesh/options",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "description": "SessionMesh onboarding wizard & WebDAV control center",
   "private": true,
   "sideEffects": true,

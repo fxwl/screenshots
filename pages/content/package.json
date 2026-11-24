@@ -1,6 +1,6 @@
 {
   "name": "@sessionmesh/content-script",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "description": "SessionMesh content script: LocalStorage auto-sync & form reload protection",
   "private": true,
   "sideEffects": true,
