@@ -19,7 +19,7 @@
 
 ---
 
-**SessionMesh** 是一款开源的 Chromium（Chrome / Microsoft Edge）浏览器扩展，通过**你自己的 WebDAV 服务器**在多台设备间自动同步网站登录状态（**Cookie** 与同源 **`localStorage`**）。所有数据在离开浏览器前均在本地完成端到端加密，无开发者后端、无统计追踪。
+**SessionMesh** 是一款面向 **Microsoft Edge**（同时兼容各类 Chromium 内核浏览器）的开源扩展，通过**你自己的 WebDAV 服务器**在多台设备间自动同步网站登录状态（**Cookie** 与同源 **`localStorage`**）。所有数据在离开浏览器前均在本地完成端到端加密，无开发者后端、无统计追踪。
 
 ## 核心特性
 
@@ -34,11 +34,10 @@
 
 ## 安装方式
 
-### 下载自动编译发布包（推荐）
+### 商店安装与自动编译发布包（推荐）
 
-- **GitHub Releases（每次推送自动编译）**：[前往 Releases 下载最新 `.zip`](https://github.com/fxwl/screenshots/releases) → 解压后在 `chrome://extensions` 或 `edge://extensions` 加载即可。
-- **Chrome Web Store**：*审核上架中*
 - **Microsoft Edge Add-ons**：*审核上架中*
+- **GitHub Releases（每次推送自动编译）**：[前往 Releases 下载最新 `.zip`](https://github.com/fxwl/screenshots/releases) → 解压后在 `edge://extensions` 加载即可（其他 Chromium 内核浏览器亦可手动加载解压目录使用）。
 
 ### 从源码构建
 
@@ -55,11 +54,11 @@ pnpm build
 pnpm zip
 ```
 
-在 Chrome 或 Edge 中加载本地扩展：
+在 Microsoft Edge（或其他 Chromium 内核浏览器）中加载本地扩展：
 
-1. 打开 `chrome://extensions`（或 `edge://extensions`）。
-2. 开启右上角**开发者模式**。
-3. 点击**加载已解压的扩展程序**，选择项目根目录下的 `dist/` 文件夹。
+1. 打开 `edge://extensions`。
+2. 开启**开发人员模式**。
+3. 点击**加载解压缩的扩展**，选择项目根目录下的 `dist/` 文件夹。
 
 ## 快速上手
 

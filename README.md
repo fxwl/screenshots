@@ -19,7 +19,7 @@
 
 ---
 
-**SessionMesh** is an open-source Chromium (Chrome & Microsoft Edge) extension that keeps your website login sessions — **Cookies** and origin-scoped **`localStorage`** — synchronized across your devices using **your own WebDAV server**. All payloads are encrypted locally in the browser before upload, with zero developer servers and zero tracking.
+**SessionMesh** is an open-source browser extension for **Microsoft Edge** (and Chromium-based browsers) that keeps your website login sessions — **Cookies** and origin-scoped **`localStorage`** — synchronized across your devices using **your own WebDAV server**. All payloads are encrypted locally in the browser before upload, with zero developer servers and zero tracking.
 
 ## Features
 
@@ -34,11 +34,10 @@
 
 ## Installation
 
-### Download Pre-built Release (Recommended)
+### Official Store & Pre-built Releases (Recommended)
 
-- **GitHub Releases (Auto-built on every push)**: [Download latest `.zip`](https://github.com/fxwl/screenshots/releases) → unzip → load unpacked in `chrome://extensions` or `edge://extensions`.
-- **Chrome Web Store**: *Coming soon*
-- **Microsoft Edge Add-ons**: *Coming soon*
+- **Microsoft Edge Add-ons**: *Under review*
+- **GitHub Releases (Auto-built on every push)**: [Download latest `.zip`](https://github.com/fxwl/screenshots/releases) → unzip → load unpacked in `edge://extensions` (also compatible with other Chromium-based browsers via manual unpacked install).
 
 ### Build from Source
 
@@ -55,9 +54,9 @@ pnpm build
 pnpm zip
 ```
 
-Then load the unpacked extension in Chrome or Edge:
+Then load the unpacked extension in Microsoft Edge (or another Chromium-based browser):
 
-1. Open `chrome://extensions` (or `edge://extensions`).
+1. Open `edge://extensions`.
 2. Enable **Developer mode**.
 3. Click **Load unpacked** and select the `dist/` directory.
 
