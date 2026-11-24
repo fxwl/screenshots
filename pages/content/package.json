@@ -1,0 +1,32 @@
+{
+  "name": "@sessionmesh/content-script",
+  "version": "1.0.0",
+  "description": "SessionMesh content script: LocalStorage auto-sync & form reload protection",
+  "private": true,
+  "sideEffects": true,
+  "files": [
+    "dist/**"
+  ],
+  "scripts": {
+    "clean:node_modules": "pnpx rimraf node_modules",
+    "clean:turbo": "rimraf .turbo",
+    "clean": "rimraf dist && pnpm clean:turbo",
+    "build": "vite build",
+    "build:watch": "cross-env __DEV__=true vite build -w --mode development",
+    "dev": "pnpm build:watch",
+    "lint": "eslint . --ext .ts,.tsx",
+    "lint:fix": "pnpm lint --fix",
+    "prettier": "prettier . --write --ignore-path ../../.prettierignore",
+    "type-check": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@sessionmesh/core": "workspace:*",
+    "@sessionmesh/shared": "workspace:*",
+    "@sessionmesh/storage": "workspace:*",
+    "eventemitter3": "^5.0.1"
+  },
+  "devDependencies": {
+    "@sessionmesh/hmr": "workspace:*",
+    "@sessionmesh/tsconfig": "workspace:*"
+  }
+}

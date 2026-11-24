@@ -1,0 +1,27 @@
+{
+  "name": "@sessionmesh/webdav-mock",
+  "version": "1.0.0",
+  "description": "Programmable RFC 4918 Mock WebDAV Server for SessionMesh acceptance testing",
+  "private": true,
+  "sideEffects": false,
+  "files": [
+    "dist/**"
+  ],
+  "main": "./dist/index.js",
+  "module": "./dist/index.mjs",
+  "types": "./dist/index.d.ts",
+  "scripts": {
+    "clean": "rimraf ./dist && rimraf .turbo",
+    "build": "tsup index.ts --format esm,cjs --dts",
+    "dev": "tsc -w",
+    "type-check": "tsc --noEmit",
+    "test": "vitest run --passWithNoTests"
+  },
+  "dependencies": {},
+  "devDependencies": {
+    "@sessionmesh/tsconfig": "workspace:*",
+    "@types/node": "^20.12.11",
+    "tsup": "8.0.2",
+    "vitest": "^1.6.0"
+  }
+}

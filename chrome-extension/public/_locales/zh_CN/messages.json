@@ -1,0 +1,10 @@
+{
+  "extensionName": {
+    "description": "扩展名称",
+    "message": "SessionMesh"
+  },
+  "extensionDescription": {
+    "description": "扩展描述",
+    "message": "基于 WebDAV 与端到端加密的多设备浏览器登录态自动同步扩展"
+  }
+}

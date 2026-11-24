@@ -1,0 +1,32 @@
+{
+  "name": "@sessionmesh/shared",
+  "version": "1.0.0",
+  "description": "SessionMesh shared IPC protocol, hooks and providers",
+  "private": true,
+  "sideEffects": false,
+  "files": [
+    "dist/**"
+  ],
+  "main": "./dist/index.js",
+  "module": "./dist/index.mjs",
+  "types": "./dist/index.d.ts",
+  "scripts": {
+    "clean": "rimraf ./dist && rimraf .turbo",
+    "build": "tsup index.ts --format esm,cjs --dts --external react,chrome",
+    "dev": "tsc -w",
+    "lint": "eslint . --ext .ts,.tsx",
+    "lint:fix": "pnpm lint --fix",
+    "prettier": "prettier . --write",
+    "type-check": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@sessionmesh/core": "workspace:*",
+    "@sessionmesh/storage": "workspace:*",
+    "p-timeout": "^6.1.4"
+  },
+  "devDependencies": {
+    "@sessionmesh/tsconfig": "workspace:*",
+    "sonner": "^1.5.0",
+    "tsup": "8.0.2"
+  }
+}

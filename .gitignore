@@ -1,0 +1,20 @@
+# Dependencies
+**/node_modules
+
+# Testing & coverage
+**/coverage
+
+# Build outputs
+**/dist
+**/dist-zip
+**/build
+**/.turbo
+
+# Environment files
+**/.env
+**/.env.local
+
+# OS & IDE
+.DS_Store
+Thumbs.db
+.idea

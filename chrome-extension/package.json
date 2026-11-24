@@ -1,0 +1,36 @@
+{
+  "name": "chrome-extension",
+  "version": "1.0.0",
+  "description": "SessionMesh multi-device browser login state sync extension",
+  "scripts": {
+    "clean": "rimraf ../../dist && rimraf .turbo",
+    "build": "tsc --noEmit && vite build",
+    "build:firefox": "tsc --noEmit && cross-env __FIREFOX__=true vite build",
+    "build:watch": "cross-env __DEV__=true vite build -w --mode development",
+    "build:firefox:watch": "cross-env __DEV__=true __FIREFOX__=true vite build -w --mode development",
+    "dev": "pnpm build:watch",
+    "dev:firefox": "pnpm build:firefox:watch",
+    "test": "tsc --noEmit",
+    "lint": "eslint ./ --ext .ts,.js,.tsx,.jsx",
+    "lint:fix": "pnpm lint --fix",
+    "prettier": "prettier . --write",
+    "type-check": "tsc --noEmit"
+  },
+  "type": "module",
+  "dependencies": {
+    "@sessionmesh/core": "workspace:*",
+    "@sessionmesh/shared": "workspace:*",
+    "@sessionmesh/storage": "workspace:*",
+    "p-timeout": "^6.1.4",
+    "webextension-polyfill": "^0.12.0"
+  },
+  "devDependencies": {
+    "@laynezh/vite-plugin-lib-assets": "^0.5.21",
+    "@sessionmesh/dev-utils": "workspace:*",
+    "@sessionmesh/hmr": "workspace:*",
+    "@sessionmesh/tsconfig": "workspace:*",
+    "@types/ws": "^8.5.10",
+    "magic-string": "^0.30.12",
+    "ts-loader": "^9.5.1"
+  }
+}

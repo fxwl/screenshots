@@ -1,0 +1,35 @@
+{
+  "name": "@sessionmesh/options",
+  "version": "1.0.0",
+  "description": "SessionMesh onboarding wizard & WebDAV control center",
+  "private": true,
+  "sideEffects": true,
+  "files": [
+    "dist/**"
+  ],
+  "scripts": {
+    "clean": "rimraf ./dist && rimraf .turbo",
+    "build": "pnpm run clean && tsc --noEmit && vite build",
+    "build:watch": "cross-env __DEV__=true vite build -w --mode development",
+    "dev": "pnpm build:watch",
+    "lint": "eslint . --ext .ts,.tsx",
+    "lint:fix": "pnpm lint --fix",
+    "prettier": "prettier . --write",
+    "type-check": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@sessionmesh/core": "workspace:*",
+    "@sessionmesh/shared": "workspace:*",
+    "@sessionmesh/storage": "workspace:*",
+    "clsx": "^2.1.1",
+    "lucide-react": "^0.394.0",
+    "sonner": "^1.5.0",
+    "tailwind-merge": "^2.3.0"
+  },
+  "devDependencies": {
+    "@sessionmesh/hmr": "workspace:*",
+    "@sessionmesh/tailwindcss-config": "workspace:*",
+    "@sessionmesh/tsconfig": "workspace:*",
+    "@sessionmesh/ui": "workspace:*"
+  }
+}

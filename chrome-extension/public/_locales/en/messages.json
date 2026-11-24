@@ -1,0 +1,10 @@
+{
+  "extensionName": {
+    "description": "Extension name",
+    "message": "SessionMesh"
+  },
+  "extensionDescription": {
+    "description": "Extension description",
+    "message": "Multi-device browser login state auto-sync over WebDAV with E2E encryption"
+  }
+}

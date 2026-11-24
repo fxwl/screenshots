@@ -1,0 +1,29 @@
+{
+  "name": "@sessionmesh/storage",
+  "version": "1.0.0",
+  "description": "SessionMesh extension storage & IndexedDB non-extractable key vault",
+  "private": true,
+  "sideEffects": false,
+  "files": [
+    "dist/**"
+  ],
+  "main": "./dist/index.js",
+  "module": "./dist/index.mjs",
+  "types": "./dist/index.d.ts",
+  "scripts": {
+    "clean": "rimraf ./dist && rimraf .turbo",
+    "build": "tsup index.ts --format esm,cjs --dts --external chrome",
+    "dev": "tsc -w",
+    "lint": "eslint . --ext .ts,.tsx",
+    "lint:fix": "pnpm lint --fix",
+    "prettier": "prettier . --write",
+    "type-check": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@sessionmesh/core": "workspace:*"
+  },
+  "devDependencies": {
+    "@sessionmesh/tsconfig": "workspace:*",
+    "tsup": "8.0.2"
+  }
+}

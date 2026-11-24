@@ -1,0 +1,1009 @@
+import { extractErrorMessage, sidePanelApi } from '@src/lib/api';
+import { useBannerPrefs } from '@src/lib/bannerPrefs';
+import {
+  buildCookieHeader,
+  copyToClipboard,
+  downloadJsonFile,
+  formatRelativeTime,
+  getBindingMeta,
+  getCookieSyncStatusMeta,
+  shortId,
+} from '@src/lib/format';
+import type {
+  BrowserCookieInput,
+  PendingSiteDecision,
+  SiteBindingState,
+  SiteDecisionAction,
+  SiteSummaryView,
+} from '@sessionmesh/shared';
+import { Button, Input } from '@sessionmesh/ui';
+import {
+  AlertTriangle,
+  Ban,
+  ChevronRight,
+  CloudDownload,
+  CloudUpload,
+  Cookie,
+  Copy,
+  Database,
+  Download,
+  FileJson,
+  GitBranch,
+  Globe,
+  Loader2,
+  Plus,
+  RefreshCw,
+  ShieldAlert,
+  Tag,
+  Unlink,
+  Upload,
+  Users,
+  X,
+} from 'lucide-react';
+import type React from 'react';
+import { useCallback, useEffect, useMemo, useState } from 'react';
+import { toast } from 'sonner';
+import { AddManagedSitesModal } from './AddManagedSitesModal';
+import { StatusBadge } from './common/Badge';
+import { EmptyState } from './common/EmptyState';
+import { JsonImportModal } from './common/JsonImportModal';
+import { Modal } from './common/Modal';
+import { CookieDetailView } from './CookieDetailView';
+import { UnmanageSiteModal } from './UnmanageSiteModal';
+import type { UnmanageSiteScope } from './UnmanageSiteModal';
+
+export interface SitesAndCookiesTabProps {
+  globalSearch: string;
+  initialSiteKey?: string | null;
+  onConsumeInitialSite?: () => void;
+  onStatusChanged: () => Promise<void> | void;
+  refreshSignal: number;
+}
+
+type BindingFilter = 'ALL' | SiteBindingState;
+
+const SiteFavicon: React.FC<{ url?: string; siteKey: string }> = ({ url, siteKey }) => {
+  const [failed, setFailed] = useState(false);
+  const src = url || `https://${siteKey}/favicon.ico`;
+  if (failed) {
+    return (
+      <div className="flex h-6 w-6 shrink-0 items-center justify-center rounded-md bg-muted text-muted-foreground">
+        <Globe className="h-3.5 w-3.5" />
+      </div>
+    );
+  }
+  return (
+    <img
+      src={src}
+      alt=""
+      className="h-6 w-6 shrink-0 rounded-md border border-border/60 bg-background object-contain p-0.5"
+      onError={() => setFailed(true)}
+    />
+  );
+};
+
+export const SitesAndCookiesTab: React.FC<SitesAndCookiesTabProps> = ({
+  globalSearch,
+  initialSiteKey,
+  onConsumeInitialSite,
+  onStatusChanged,
+  refreshSignal,
+}) => {
+  const [sites, setSites] = useState<SiteSummaryView[]>([]);
+  const [pendingDecisions, setPendingDecisions] = useState<PendingSiteDecision[]>([]);
+  const [loading, setLoading] = useState(true);
+  const [bindingFilter, setBindingFilter] = useState<BindingFilter>('ALL');
+  const [selectedSiteKey, setSelectedSiteKey] = useState<string | null>(null);
+  const [selectedPendingKeys, setSelectedPendingKeys] = useState<Set<string>>(new Set());
+  const [busyKey, setBusyKey] = useState<string | null>(null);
+
+  // Per-site modals
+  const [addSitesOpen, setAddSitesOpen] = useState(false);
+  const [unmanageTargetSite, setUnmanageTargetSite] = useState<string | null>(null);
+  const [importSiteKey, setImportSiteKey] = useState<string | undefined>(undefined);
+  const [importModalOpen, setImportModalOpen] = useState(false);
+  const [renameTarget, setRenameTarget] = useState<{ siteKey: string; trackId: string; label: string } | null>(null);
+  const [splitTargetSite, setSplitTargetSite] = useState<string | null>(null);
+  const [splitLabel, setSplitLabel] = useState('');
+
+  const { isBannerVisible, dismissBanner } = useBannerPrefs();
+
+  const loadData = useCallback(async () => {
+    setLoading(true);
+    try {
+      const [overview, pending] = await Promise.all([
+        sidePanelApi.getSitesOverview(),
+        sidePanelApi.getPendingDecisions(),
+      ]);
+      setSites(overview || []);
+      setPendingDecisions(pending || []);
+      setSelectedPendingKeys(prev => {
+        const valid = new Set((pending || []).map(p => p.siteKey));
+        return new Set([...prev].filter(k => valid.has(k)));
+      });
+    } catch (err) {
+      toast.error(`加载站点列表失败：${extractErrorMessage(err)}`);
+    } finally {
+      setLoading(false);
+    }
+  }, []);
+
+  useEffect(() => {
+    loadData();
+  }, [loadData, refreshSignal]);
+
+  useEffect(() => {
+    if (initialSiteKey && sites.some(s => s.siteKey === initialSiteKey)) {
+      setSelectedSiteKey(initialSiteKey);
+      onConsumeInitialSite?.();
+    }
+  }, [initialSiteKey, sites, onConsumeInitialSite]);
+
+  const handleAfterMutation = async () => {
+    await loadData();
+    await onStatusChanged();
+  };
+
+  // --- Pending Decision Handlers ---
+  const handleResolveSingle = async (siteKey: string, action: SiteDecisionAction, desc: string) => {
+    setBusyKey(`decision:${siteKey}`);
+    try {
+      await sidePanelApi.resolveSiteDecision(siteKey, action);
+      toast.success(`${siteKey}：${desc}`);
+      await handleAfterMutation();
+    } catch (err) {
+      toast.error(`决策失败：${extractErrorMessage(err)}`);
+    } finally {
+      setBusyKey(null);
+    }
+  };
+
+  const targetPendingKeys =
+    selectedPendingKeys.size > 0 ? [...selectedPendingKeys] : pendingDecisions.map(p => p.siteKey);
+
+  const handleBatchUniformDecision = async (action: SiteDecisionAction, label: string) => {
+    if (targetPendingKeys.length === 0) return;
+    setBusyKey('batch-decision');
+    try {
+      await sidePanelApi.resolveBatchDecisions(targetPendingKeys, action);
+      toast.success(`已批量处理 ${targetPendingKeys.length} 个站点：${label}`);
+      setSelectedPendingKeys(new Set());
+      await handleAfterMutation();
+    } catch (err) {
+      toast.error(`批量处理失败：${extractErrorMessage(err)}`);
+    } finally {
+      setBusyKey(null);
+    }
+  };
+
+  const handleBatchUseLatestRemote = async () => {
+    if (targetPendingKeys.length === 0) return;
+    setBusyKey('batch-remote');
+    let ok = 0;
+    let fail = 0;
+    try {
+      for (const sk of targetPendingKeys) {
+        const decision = pendingDecisions.find(d => d.siteKey === sk);
+        const latestTrack = decision?.remoteTracks?.slice().sort((a, b) => b.updatedAt - a.updatedAt)[0];
+        if (!latestTrack) {
+          fail++;
+          continue;
+        }
+        try {
+          await sidePanelApi.resolveSiteDecision(sk, { type: 'use_remote_track', trackId: latestTrack.trackId });
+          ok++;
+        } catch {
+          fail++;
+        }
+      }
+      if (fail === 0) {
+        toast.success(`已批量采用远端最新轨道 (${ok} 个站点)，原数据已自动备份至还原点`);
+      } else {
+        toast.warning(`批量处理完成：成功 ${ok} 个，失败 ${fail} 个`);
+      }
+      setSelectedPendingKeys(new Set());
+      await handleAfterMutation();
+    } finally {
+      setBusyKey(null);
+    }
+  };
+
+  // --- Site Track & Cookie Quick Controls ---
+  const handleSwitchTrack = async (siteKey: string, targetTrackId: string) => {
+    setBusyKey(`track:${siteKey}`);
+    try {
+      await sidePanelApi.switchSiteTrack(siteKey, targetTrackId);
+      toast.success(`${siteKey} 已切换轨道（已自动创建本机安全还原点）`);
+      await handleAfterMutation();
+    } catch (err) {
+      toast.error(`切换轨道失败：${extractErrorMessage(err)}`);
+    } finally {
+      setBusyKey(null);
+    }
+  };
+
+  const handleSiteSync = async (siteKey: string, direction: 'push' | 'pull') => {
+    setBusyKey(`sync:${direction}:${siteKey}`);
+    try {
+      const res = await sidePanelApi.syncNow({ siteKey, direction });
+      if (res.errorMessage) {
+        toast.warning(`${siteKey} 暂时无法连接云端，系统将继续后台自动重试：${res.errorMessage}`);
+      } else {
+        const refreshHint = direction === 'pull' && res.appliedCookies > 0 ? '，刷新对应网页即可生效' : '';
+        toast.success(
+          direction === 'push'
+            ? `${siteKey} 推送完成（${res.pushedEvents} 个事件）`
+            : `${siteKey} 拉取完成（应用 ${res.appliedCookies} 条，失败 ${res.failedCookies} 条${refreshHint}）`,
+        );
+      }
+      await handleAfterMutation();
+    } catch (err) {
+      toast.error(`单站同步失败：${extractErrorMessage(err)}`);
+    } finally {
+      setBusyKey(null);
+    }
+  };
+
+  const handleCopySiteCookies = async (siteKey: string, asJson: boolean) => {
+    setBusyKey(`copy:${siteKey}`);
+    try {
+      const exported = await sidePanelApi.exportCookiesJson(siteKey);
+      if (exported.length === 0) {
+        toast.warning(`${siteKey} 暂无可复制的 Cookie`);
+        return;
+      }
+      const text = asJson ? JSON.stringify(exported, null, 2) : buildCookieHeader(exported);
+      const ok = await copyToClipboard(text);
+      if (ok) toast.success(`已复制 ${siteKey} 的 ${exported.length} 条 Cookie (${asJson ? 'JSON' : 'Header'})`);
+      else toast.error('复制到剪贴板失败');
+    } catch (err) {
+      toast.error(`复制失败：${extractErrorMessage(err)}`);
+    } finally {
+      setBusyKey(null);
+    }
+  };
+
+  const handleExportSiteCookies = async (siteKey?: string) => {
+    setBusyKey(`export:${siteKey || 'all'}`);
+    try {
+      const exported = await sidePanelApi.exportCookiesJson(siteKey);
+      downloadJsonFile(`sessionmesh-cookies-${siteKey || 'all-sites'}.json`, exported);
+      toast.success(`已导出 ${exported.length} 条 Cookie`);
+    } catch (err) {
+      toast.error(`导出失败：${extractErrorMessage(err)}`);
+    } finally {
+      setBusyKey(null);
+    }
+  };
+
+  const handleImportCookies = async (parsed: unknown) => {
+    const arr = Array.isArray(parsed)
+      ? parsed
+      : parsed && typeof parsed === 'object' && Array.isArray((parsed as { cookies?: unknown }).cookies)
+        ? (parsed as { cookies: unknown[] }).cookies
+        : null;
+    if (!arr || arr.length === 0) {
+      throw new Error('JSON 必须是包含 Cookie 对象的数组');
+    }
+    const normalized: BrowserCookieInput[] = arr.map((item: Record<string, unknown>) => ({
+      name: String(item.name ?? ''),
+      value: String(item.value ?? ''),
+      domain: String(item.domain ?? importSiteKey ?? ''),
+      path: String(item.path ?? '/'),
+      secure: Boolean(item.secure ?? true),
+      httpOnly: Boolean(item.httpOnly ?? false),
+      sameSite: (item.sameSite as BrowserCookieInput['sameSite']) || 'unspecified',
+      session: Boolean(item.session ?? !item.expirationDate),
+      expirationDate: typeof item.expirationDate === 'number' ? item.expirationDate : undefined,
+      hostOnly: Boolean(item.hostOnly ?? false),
+      storeId: typeof item.storeId === 'string' ? item.storeId : undefined,
+      partitionKey: (item.partitionKey as BrowserCookieInput['partitionKey']) ?? null,
+    }));
+    const count = await sidePanelApi.importCookiesJson(normalized, importSiteKey);
+    toast.success(`已成功导入 ${count} 条 Cookie`);
+    await handleAfterMutation();
+  };
+
+  const handleQuickBlacklist = async (siteKey: string, scope: 'device' | 'space') => {
+    setBusyKey(`bl:${siteKey}`);
+    try {
+      await sidePanelApi.addBlacklistEntry({
+        pattern: siteKey,
+        matchType: 'subdomain',
+        scope,
+        reason: '侧边栏快捷拉黑',
+        presetCategory: 'custom',
+      });
+      toast.success(`已将 ${siteKey} 加入${scope === 'space' ? '空间级' : '本机级'}黑名单`);
+      await handleAfterMutation();
+    } catch (err) {
+      toast.error(`加入黑名单失败：${extractErrorMessage(err)}`);
+    } finally {
+      setBusyKey(null);
+    }
+  };
+
+  const handleConfirmRename = async () => {
+    if (!renameTarget || !renameTarget.label.trim()) return;
+    setBusyKey(`rename:${renameTarget.siteKey}`);
+    try {
+      await sidePanelApi.renameSiteTrack(renameTarget.siteKey, renameTarget.trackId, renameTarget.label.trim());
+      toast.success('轨道名称已更新');
+      setRenameTarget(null);
+      await handleAfterMutation();
+    } catch (err) {
+      toast.error(`重命名失败：${extractErrorMessage(err)}`);
+    } finally {
+      setBusyKey(null);
+    }
+  };
+
+  const handleConfirmSplit = async () => {
+    if (!splitTargetSite) return;
+    setBusyKey(`split:${splitTargetSite}`);
+    try {
+      await sidePanelApi.splitSiteIndependent(splitTargetSite, splitLabel.trim() || undefined);
+      toast.success(`${splitTargetSite} 已拆分为本机独立轨道`);
+      setSplitTargetSite(null);
+      setSplitLabel('');
+      await handleAfterMutation();
+    } catch (err) {
+      toast.error(`拆分独立轨道失败：${extractErrorMessage(err)}`);
+    } finally {
+      setBusyKey(null);
+    }
+  };
+
+  const handleConfirmUnmanage = async (siteKey: string, scope: UnmanageSiteScope) => {
+    await sidePanelApi.removeManagedSite(siteKey, scope);
+    toast.success(
+      scope === 'device_unmanage'
+        ? `已将 ${siteKey} 移出本机同步管理（不影响其他设备）`
+        : `已将 ${siteKey} 从整个同步空间移除`,
+    );
+    await handleAfterMutation();
+  };
+
+  // Drill-down Cookie Detail View
+  const activeSite = useMemo(
+    () => (selectedSiteKey ? sites.find(s => s.siteKey === selectedSiteKey) || null : null),
+    [selectedSiteKey, sites],
+  );
+
+  if (activeSite) {
+    return (
+      <CookieDetailView
+        site={activeSite}
+        globalSearch={globalSearch}
+        onBack={() => setSelectedSiteKey(null)}
+        onSiteMutated={handleAfterMutation}
+      />
+    );
+  }
+
+  const query = globalSearch.trim().toLowerCase();
+  const filteredSites = sites
+    .filter(s => {
+      if (bindingFilter !== 'ALL' && s.binding.state !== bindingFilter) return false;
+      if (!query) return true;
+      return (
+        s.siteKey.toLowerCase().includes(query) ||
+        (s.activeTrack?.label || '').toLowerCase().includes(query) ||
+        (s.sourceDeviceName || '').toLowerCase().includes(query)
+      );
+    })
+    .sort((a, b) => (b.updatedAt || 0) - (a.updatedAt || 0));
+
+  const allPendingSelected =
+    pendingDecisions.length > 0 && pendingDecisions.every(p => selectedPendingKeys.has(p.siteKey));
+
+  return (
+    <div className="flex h-full flex-col overflow-y-auto p-3 space-y-3">
+      {/* Pending Site Decisions Queue */}
+      {pendingDecisions.length > 0 ? (
+        <section className="rounded-xl border border-amber-500/40 bg-amber-500/[0.07] p-3 space-y-2.5">
+          <div className="flex items-start justify-between gap-2">
+            <div className="flex items-start gap-2">
+              <AlertTriangle className="mt-0.5 h-4 w-4 shrink-0 text-amber-600 dark:text-amber-400" />
+              <div>
+                <h3 className="text-xs font-semibold text-foreground">待确认站点队列 ({pendingDecisions.length})</h3>
+                <p className="mt-0.5 text-[11px] text-muted-foreground">
+                  为避免静默覆盖本机或远端登录态，以下站点需要您确认同步策略（覆盖前会自动创建本地还原点）。
+                </p>
+              </div>
+            </div>
+          </div>
+
+          {/* Batch Resolution Bar */}
+          <div className="flex flex-wrap items-center gap-1.5 rounded-lg border border-amber-500/25 bg-background/80 p-2">
+            <label className="mr-1 flex cursor-pointer items-center gap-1 text-[11px] font-medium">
+              <input
+                type="checkbox"
+                checked={allPendingSelected}
+                onChange={() => {
+                  if (allPendingSelected) setSelectedPendingKeys(new Set());
+                  else setSelectedPendingKeys(new Set(pendingDecisions.map(p => p.siteKey)));
+                }}
+                className="h-3.5 w-3.5 rounded accent-primary"
+              />
+              <span>
+                {selectedPendingKeys.size > 0
+                  ? `已选 ${selectedPendingKeys.size} 站`
+                  : `全选 (${pendingDecisions.length})`}
+              </span>
+            </label>
+            <Button
+              variant="default"
+              size="sm"
+              className="h-6 px-2 text-[11px]"
+              disabled={busyKey === 'batch-remote' || busyKey === 'batch-decision'}
+              onClick={handleBatchUseLatestRemote}>
+              一键采用最新远端
+            </Button>
+            <Button
+              variant="outline"
+              size="sm"
+              className="h-6 px-2 text-[11px]"
+              disabled={busyKey === 'batch-decision'}
+              onClick={() => handleBatchUniformDecision({ type: 'use_local_override_track' }, '全部用本机覆盖')}>
+              全部用本机覆盖
+            </Button>
+            <Button
+              variant="outline"
+              size="sm"
+              className="h-6 px-2 text-[11px]"
+              disabled={busyKey === 'batch-decision'}
+              onClick={() => handleBatchUniformDecision({ type: 'keep_independent' }, '全部各自独立维护')}>
+              全部独立维护
+            </Button>
+            <Button
+              variant="outline"
+              size="sm"
+              className="h-6 px-2 text-[11px] text-rose-600 dark:text-rose-400"
+              disabled={busyKey === 'batch-decision'}
+              onClick={() => handleBatchUniformDecision({ type: 'blacklist', scope: 'device' }, '全部本机拉黑')}>
+              批量拉黑
+            </Button>
+          </div>
+
+          {/* Individual Pending Site Cards */}
+          <div className="space-y-2">
+            {pendingDecisions.map(item => {
+              const isBusy = busyKey === `decision:${item.siteKey}`;
+              const checked = selectedPendingKeys.has(item.siteKey);
+              return (
+                <div key={item.siteKey} className="rounded-lg border border-border bg-card p-2.5 text-xs space-y-2">
+                  <div className="flex items-start justify-between gap-2">
+                    <div className="flex items-center gap-2 min-w-0">
+                      <input
+                        id={`pending-${item.siteKey}`}
+                        type="checkbox"
+                        checked={checked}
+                        onChange={() => {
+                          setSelectedPendingKeys(prev => {
+                            const next = new Set(prev);
+                            if (next.has(item.siteKey)) next.delete(item.siteKey);
+                            else next.add(item.siteKey);
+                            return next;
+                          });
+                        }}
+                        className="h-3.5 w-3.5 rounded accent-primary cursor-pointer"
+                      />
+                      <SiteFavicon siteKey={item.siteKey} />
+                      <label htmlFor={`pending-${item.siteKey}`} className="min-w-0 cursor-pointer">
+                        <div className="flex items-center gap-1.5">
+                          <span className="truncate font-semibold text-foreground">{item.siteKey}</span>
+                          <StatusBadge tone="warning">
+                            {item.reason === 'both_sides_have_data' ? '双端均有登录态' : '云端多轨道待选'}
+                          </StatusBadge>
+                        </div>
+                        <p className="text-[11px] text-muted-foreground">
+                          本机：
+                          {item.hasLocalData
+                            ? `${item.localCookieCount} Cookie · ${item.localLocalStorageCount} LS`
+                            : '无数据'}
+                          {' · '}
+                          云端：{item.remoteTracks.length} 条轨道
+                        </p>
+                      </label>
+                    </div>
+                    {isBusy ? <Loader2 className="h-4 w-4 animate-spin text-primary shrink-0" /> : null}
+                  </div>
+
+                  {/* Remote Track Choices */}
+                  <div className="space-y-1.5">
+                    {item.remoteTracks.map(tr => (
+                      <div
+                        key={tr.trackId}
+                        className="flex items-center justify-between gap-2 rounded-md border border-border/70 bg-muted/30 px-2 py-1.5">
+                        <div className="min-w-0">
+                          <p className="truncate text-[11px] font-medium text-foreground">
+                            轨道「{tr.label}」
+                            <span className="ml-1 font-normal text-muted-foreground">
+                              ({tr.originDeviceName} · {tr.memberDeviceIds.length} 设备)
+                            </span>
+                          </p>
+                          <p className="text-[10px] text-muted-foreground">
+                            {tr.cookieCount} Cookie · {tr.localStorageCount} LS · 更新于{' '}
+                            {formatRelativeTime(tr.updatedAt)}
+                          </p>
+                        </div>
+                        <Button
+                          size="sm"
+                          variant="default"
+                          className="h-6 px-2 text-[11px] shrink-0"
+                          disabled={isBusy}
+                          onClick={() =>
+                            handleResolveSingle(
+                              item.siteKey,
+                              { type: 'use_remote_track', trackId: tr.trackId },
+                              `已跟随轨道「${tr.label}」`,
+                            )
+                          }>
+                          采用此轨道
+                        </Button>
+                      </div>
+                    ))}
+                  </div>
+
+                  {/* Local Override / Independent / Blacklist */}
+                  <div className="flex flex-wrap items-center gap-1.5 pt-1 border-t border-border/60">
+                    {item.hasLocalData ? (
+                      <Button
+                        size="sm"
+                        variant="outline"
+                        className="h-6 px-2 text-[11px]"
+                        disabled={isBusy}
+                        onClick={() =>
+                          handleResolveSingle(
+                            item.siteKey,
+                            { type: 'use_local_override_track', trackId: item.remoteTracks[0]?.trackId },
+                            '已用本机版本覆盖远端轨道',
+                          )
+                        }>
+                        用本机覆盖
+                      </Button>
+                    ) : null}
+                    <Button
+                      size="sm"
+                      variant="outline"
+                      className="h-6 px-2 text-[11px]"
+                      disabled={isBusy}
+                      onClick={() =>
+                        handleResolveSingle(item.siteKey, { type: 'keep_independent' }, '已设为各自独立维护轨道')
+                      }>
+                      各自独立维护
+                    </Button>
+                    <Button
+                      size="sm"
+                      variant="ghost"
+                      className="h-6 px-2 text-[11px] text-muted-foreground hover:text-rose-600"
+                      disabled={isBusy}
+                      onClick={() =>
+                        handleResolveSingle(item.siteKey, { type: 'blacklist', scope: 'device' }, '已加入本机黑名单')
+                      }>
+                      本机拉黑
+                    </Button>
+                    <Button
+                      size="sm"
+                      variant="ghost"
+                      className="h-6 px-2 text-[11px] text-rose-600 hover:bg-rose-500/10"
+                      disabled={isBusy}
+                      onClick={() =>
+                        handleResolveSingle(item.siteKey, { type: 'blacklist', scope: 'space' }, '已加入空间黑名单')
+                      }>
+                      全空间拉黑
+                    </Button>
+                  </div>
+                </div>
+              );
+            })}
+          </div>
+        </section>
+      ) : null}
+
+      {/* Sites Primary Action & Binding Filter Toolbar */}
+      <div className="space-y-2">
+        <div className="flex flex-wrap items-center justify-between gap-2">
+          <Button
+            variant="default"
+            size="sm"
+            className="h-8 px-3 text-xs font-medium shadow-sm"
+            onClick={() => setAddSitesOpen(true)}>
+            <Plus className="mr-1 h-3.5 w-3.5" />
+            添加同步网站
+          </Button>
+
+          <div className="flex items-center gap-1">
+            <Button
+              variant="outline"
+              size="sm"
+              className="h-7 px-2 text-[11px]"
+              onClick={() => {
+                setImportSiteKey(undefined);
+                setImportModalOpen(true);
+              }}>
+              <Upload className="mr-1 h-3 w-3" />
+              导入
+            </Button>
+            <Button
+              variant="outline"
+              size="sm"
+              className="h-7 px-2 text-[11px]"
+              onClick={() => handleExportSiteCookies(undefined)}>
+              <Download className="mr-1 h-3 w-3" />
+              导出全部
+            </Button>
+            <Button variant="ghost" size="icon" className="h-7 w-7" onClick={loadData} disabled={loading}>
+              <RefreshCw className={`h-3.5 w-3.5 ${loading ? 'animate-spin' : ''}`} />
+            </Button>
+          </div>
+        </div>
+
+        <div className="flex items-center gap-1 overflow-x-auto no-scrollbar">
+          {(
+            [
+              ['ALL', `全部 (${sites.length})`],
+              ['AUTO_BOUND', '自动绑定'],
+              ['USER_BOUND', '手动跟随'],
+              ['INDEPENDENT', '独立轨道'],
+              ['PENDING_CHOICE', '待确认'],
+              ['BLACKLISTED', '黑名单'],
+            ] as Array<[BindingFilter, string]>
+          ).map(([state, label]) => (
+            <button
+              key={state}
+              type="button"
+              onClick={() => setBindingFilter(state)}
+              className={`shrink-0 rounded-full px-2.5 py-1 text-[11px] font-medium transition-colors ${
+                bindingFilter === state
+                  ? 'bg-primary text-primary-foreground'
+                  : 'bg-muted text-muted-foreground hover:text-foreground'
+              }`}>
+              {label}
+            </button>
+          ))}
+        </div>
+      </div>
+
+      {/* Dismissible Rolling Token Damping Notice */}
+      {sites.some(s => s.rollingTokenDamped) && isBannerVisible('sites_rolling_token_notice', 'degraded') ? (
+        <div className="rounded-xl border border-amber-500/35 bg-amber-500/[0.08] p-2.5 text-xs text-amber-900 dark:text-amber-200">
+          <div className="flex items-start justify-between gap-2">
+            <div className="flex items-start gap-2 min-w-0">
+              <ShieldAlert className="mt-0.5 h-4 w-4 shrink-0 text-amber-600 dark:text-amber-400" />
+              <div className="min-w-0 space-y-0.5">
+                <p className="font-semibold">检测到滚动令牌（Rolling Token）高频轮换，已自动启用阻尼保护</p>
+                <p className="text-[11px] opacity-90 leading-relaxed">
+                  部分站点短时间内频繁刷新会话令牌，SessionMesh 已自动降低高频写回频率以避免多设备互踢或同步风暴。
+                </p>
+              </div>
+            </div>
+            <div className="flex items-center gap-1 shrink-0">
+              <button
+                type="button"
+                onClick={() => void dismissBanner('sites_rolling_token_notice')}
+                className="rounded px-1.5 py-0.5 text-[10px] font-medium hover:bg-amber-500/20">
+                不再提示
+              </button>
+              <button
+                type="button"
+                onClick={() => void dismissBanner('sites_rolling_token_notice')}
+                className="rounded p-0.5 hover:bg-amber-500/20"
+                aria-label="关闭滚动令牌提示">
+                <X className="h-3.5 w-3.5" />
+              </button>
+            </div>
+          </div>
+        </div>
+      ) : null}
+
+      {/* Site & Track List */}
+      {loading && sites.length === 0 ? (
+        <div className="flex items-center justify-center py-12 text-xs text-muted-foreground">
+          <Loader2 className="mr-2 h-4 w-4 animate-spin" />
+          正在加载已同步站点与轨道...
+        </div>
+      ) : filteredSites.length === 0 ? (
+        <EmptyState
+          icon={<Cookie className="h-5 w-5" />}
+          title={sites.length === 0 ? '尚未添加需要同步的网站' : '暂无匹配的站点记录'}
+          description={
+            sites.length === 0
+              ? '按需选择需要同步登录态的网站，或手动输入域名预先纳管；未纳管的浏览网页不会被自动上传。'
+              : '可调整筛选条件或搜索关键词，也可以直接添加新的同步网站。'
+          }
+          action={
+            <Button size="sm" className="h-8 px-3 text-xs" onClick={() => setAddSitesOpen(true)}>
+              <Plus className="mr-1 h-3.5 w-3.5" />
+              添加同步网站
+            </Button>
+          }
+        />
+      ) : (
+        <div className="space-y-2.5">
+          {filteredSites.map(site => {
+            const bindingMeta = getBindingMeta(site.binding.state);
+            const syncMeta = getCookieSyncStatusMeta(site.syncStatus);
+            return (
+              <div
+                key={site.siteKey}
+                className="rounded-xl border border-border bg-card p-3 transition-colors hover:border-primary/40 space-y-2.5">
+                {/* Clickable Main Site Header */}
+                <div className="flex items-start justify-between gap-2">
+                  <button
+                    type="button"
+                    onClick={() => setSelectedSiteKey(site.siteKey)}
+                    className="group flex flex-1 items-start gap-2.5 text-left min-w-0">
+                    <SiteFavicon url={site.favIconUrl} siteKey={site.siteKey} />
+                    <div className="min-w-0 flex-1">
+                      <div className="flex flex-wrap items-center gap-1.5">
+                        <span className="truncate text-sm font-semibold text-foreground group-hover:text-primary group-hover:underline">
+                          {site.siteKey}
+                        </span>
+                        <StatusBadge tone={bindingMeta.tone}>{bindingMeta.label}</StatusBadge>
+                        <StatusBadge tone={syncMeta.tone}>{syncMeta.label}</StatusBadge>
+                        {site.rollingTokenDamped ? (
+                          <StatusBadge tone="warning">
+                            <ShieldAlert className="h-3 w-3" />
+                            滚动令牌阻尼
+                          </StatusBadge>
+                        ) : null}
+                      </div>
+
+                      {/* Track & Metrics */}
+                      <div className="mt-1 flex flex-wrap items-center gap-x-2.5 gap-y-1 text-[11px] text-muted-foreground">
+                        <span className="inline-flex items-center gap-1 text-foreground/85 font-medium">
+                          <GitBranch className="h-3 w-3 text-primary" />
+                          {site.activeTrack?.label || '未绑定轨道'}
+                        </span>
+                        {site.activeTrack ? (
+                          <span className="inline-flex items-center gap-0.5">
+                            <Users className="h-3 w-3" />
+                            {site.activeTrack.memberDeviceIds.length} 设备
+                          </span>
+                        ) : null}
+                        <span className="inline-flex items-center gap-0.5">
+                          <Cookie className="h-3 w-3" />
+                          {site.cookieCount}
+                        </span>
+                        <span className="inline-flex items-center gap-0.5">
+                          <Database className="h-3 w-3" />
+                          {site.localStorageCount}
+                        </span>
+                      </div>
+
+                      <div className="mt-1 flex flex-wrap items-center gap-x-2 text-[10px] text-muted-foreground">
+                        <span>版本：{shortId(site.latestVersionId, 14)}</span>
+                        <span>·</span>
+                        <span>来源：{site.sourceDeviceName || '-'}</span>
+                        <span>·</span>
+                        <span>更新：{formatRelativeTime(site.updatedAt)}</span>
+                      </div>
+                    </div>
+                  </button>
+
+                  <Button
+                    variant="ghost"
+                    size="sm"
+                    className="h-7 px-1.5 text-xs shrink-0 text-primary"
+                    onClick={() => setSelectedSiteKey(site.siteKey)}>
+                    详情
+                    <ChevronRight className="ml-0.5 h-3.5 w-3.5" />
+                  </Button>
+                </div>
+
+                {/* Track Controls & Site Actions */}
+                <div className="flex flex-wrap items-center gap-1.5 pt-2 border-t border-border/60">
+                  {site.allTracks.length > 0 ? (
+                    <select
+                      aria-label={`切换 ${site.siteKey} 的同步轨道`}
+                      value={site.activeTrack?.trackId || ''}
+                      disabled={busyKey === `track:${site.siteKey}`}
+                      onChange={e => handleSwitchTrack(site.siteKey, e.target.value)}
+                      className="h-6 max-w-[165px] truncate rounded border border-input bg-background px-1.5 text-[11px] text-foreground focus:outline-none focus:ring-1 focus:ring-ring">
+                      {site.allTracks.map(tr => (
+                        <option key={tr.trackId} value={tr.trackId}>
+                          {tr.label} ({tr.memberDeviceIds.length}设备·{tr.cookieCount}条)
+                        </option>
+                      ))}
+                    </select>
+                  ) : null}
+
+                  <Button
+                    variant="outline"
+                    size="sm"
+                    className="h-6 px-1.5 text-[11px]"
+                    onClick={() => {
+                      setSplitTargetSite(site.siteKey);
+                      setSplitLabel('');
+                    }}
+                    title="拆分为独立维护轨道">
+                    <GitBranch className="mr-1 h-3 w-3" />
+                    独立
+                  </Button>
+
+                  {site.activeTrack ? (
+                    <Button
+                      variant="outline"
+                      size="sm"
+                      className="h-6 px-1.5 text-[11px]"
+                      onClick={() =>
+                        setRenameTarget({
+                          siteKey: site.siteKey,
+                          trackId: site.activeTrack!.trackId,
+                          label: site.activeTrack!.label,
+                        })
+                      }
+                      title="重命名轨道">
+                      <Tag className="mr-1 h-3 w-3" />
+                      重命名
+                    </Button>
+                  ) : null}
+
+                  <Button
+                    variant="outline"
+                    size="sm"
+                    className="h-6 px-1.5 text-[11px]"
+                    disabled={busyKey === `sync:push:${site.siteKey}`}
+                    onClick={() => handleSiteSync(site.siteKey, 'push')}
+                    title="推送本机此站点变更">
+                    <CloudUpload className="mr-1 h-3 w-3" />推
+                  </Button>
+
+                  <Button
+                    variant="outline"
+                    size="sm"
+                    className="h-6 px-1.5 text-[11px]"
+                    disabled={busyKey === `sync:pull:${site.siteKey}`}
+                    onClick={() => handleSiteSync(site.siteKey, 'pull')}
+                    title="拉取此站点远端最新状态">
+                    <CloudDownload className="mr-1 h-3 w-3" />拉
+                  </Button>
+
+                  <Button
+                    variant="outline"
+                    size="sm"
+                    className="h-6 px-1.5 text-[11px]"
+                    onClick={() => handleCopySiteCookies(site.siteKey, false)}
+                    title="复制 Cookie Header (name=value; ...)">
+                    <Copy className="mr-1 h-3 w-3" />
+                    Header
+                  </Button>
+
+                  <Button
+                    variant="outline"
+                    size="sm"
+                    className="h-6 px-1.5 text-[11px]"
+                    onClick={() => handleCopySiteCookies(site.siteKey, true)}
+                    title="复制 Cookies JSON">
+                    <FileJson className="mr-1 h-3 w-3" />
+                    JSON
+                  </Button>
+
+                  <Button
+                    variant="outline"
+                    size="sm"
+                    className="h-6 px-1.5 text-[11px]"
+                    onClick={() => handleExportSiteCookies(site.siteKey)}
+                    title="导出 Cookies JSON 文件">
+                    <Download className="h-3 w-3" />
+                  </Button>
+
+                  <Button
+                    variant="outline"
+                    size="sm"
+                    className="h-6 px-1.5 text-[11px]"
+                    onClick={() => {
+                      setImportSiteKey(site.siteKey);
+                      setImportModalOpen(true);
+                    }}
+                    title="导入 Cookies JSON">
+                    <Upload className="h-3 w-3" />
+                  </Button>
+
+                  {site.binding.state !== 'BLACKLISTED' && site.binding.state !== 'UNMANAGED' ? (
+                    <Button
+                      variant="ghost"
+                      size="sm"
+                      className="h-6 px-1.5 text-[11px] text-amber-700 hover:bg-amber-500/10 hover:text-amber-700 dark:text-amber-400 dark:hover:text-amber-300"
+                      onClick={() => setUnmanageTargetSite(site.siteKey)}
+                      title="移出本机管理或从整个同步空间移除">
+                      <Unlink className="mr-1 h-3 w-3" />
+                      移出管理
+                    </Button>
+                  ) : null}
+
+                  {site.binding.state !== 'BLACKLISTED' ? (
+                    <Button
+                      variant="ghost"
+                      size="sm"
+                      className="h-6 px-1.5 text-[11px] text-rose-600 hover:bg-rose-500/10 hover:text-rose-600"
+                      disabled={busyKey === `bl:${site.siteKey}`}
+                      onClick={() => handleQuickBlacklist(site.siteKey, 'device')}
+                      title="快捷加入本机黑名单">
+                      <Ban className="mr-1 h-3 w-3" />
+                      拉黑
+                    </Button>
+                  ) : null}
+                </div>
+              </div>
+            );
+          })}
+        </div>
+      )}
+
+      {/* Add Managed Sites Modal */}
+      <AddManagedSitesModal open={addSitesOpen} onClose={() => setAddSitesOpen(false)} onAdded={handleAfterMutation} />
+
+      {/* Unmanage / Remove Site Confirmation Modal */}
+      <UnmanageSiteModal
+        siteKey={unmanageTargetSite}
+        onClose={() => setUnmanageTargetSite(null)}
+        onConfirm={handleConfirmUnmanage}
+      />
+
+      {/* Import Cookies Modal */}
+      <JsonImportModal
+        open={importModalOpen}
+        onClose={() => setImportModalOpen(false)}
+        title={importSiteKey ? `导入 Cookies JSON (${importSiteKey})` : '导入 Cookies JSON'}
+        description="支持粘贴标准 Cookie JSON 数组或从文件读取，导入后将自动进入因果版本库同步。"
+        placeholder='[{"name": "token", "value": "xxx", "domain": "github.com", "path": "/", "secure": true}]'
+        onImport={handleImportCookies}
+      />
+
+      {/* Rename Track Modal */}
+      <Modal
+        open={!!renameTarget}
+        onClose={() => setRenameTarget(null)}
+        title={`重命名轨道 (${renameTarget?.siteKey || ''})`}
+        description="为该站点轨道设置易于辨认的别名，如「公司账号」「个人主号」。"
+        footer={
+          <>
+            <Button variant="outline" size="sm" onClick={() => setRenameTarget(null)}>
+              取消
+            </Button>
+            <Button size="sm" disabled={!renameTarget?.label.trim()} onClick={handleConfirmRename}>
+              保存
+            </Button>
+          </>
+        }>
+        <Input
+          value={renameTarget?.label || ''}
+          onChange={e => setRenameTarget(prev => (prev ? { ...prev, label: e.target.value } : null))}
+          placeholder="输入轨道名称"
+          onKeyDown={e => {
+            if (e.key === 'Enter') handleConfirmRename();
+          }}
+        />
+      </Modal>
+
+      {/* Split Independent Track Modal */}
+      <Modal
+        open={!!splitTargetSite}
+        onClose={() => setSplitTargetSite(null)}
+        title={`拆分为独立轨道 (${splitTargetSite || ''})`}
+        description="本机将为该站点创建一条独立同步轨道，不再与其他设备的原轨道互相覆盖。"
+        footer={
+          <>
+            <Button variant="outline" size="sm" onClick={() => setSplitTargetSite(null)}>
+              取消
+            </Button>
+            <Button size="sm" onClick={handleConfirmSplit}>
+              确认拆分
+            </Button>
+          </>
+        }>
+        <Input
+          value={splitLabel}
+          onChange={e => setSplitLabel(e.target.value)}
+          placeholder="自定义新轨道名称（可选）"
+          onKeyDown={e => {
+            if (e.key === 'Enter') handleConfirmSplit();
+          }}
+        />
+      </Modal>
+    </div>
+  );
+};

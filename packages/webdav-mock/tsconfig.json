@@ -1,0 +1,12 @@
+{
+  "extends": "@sessionmesh/tsconfig/utils",
+  "compilerOptions": {
+    "outDir": "dist",
+    "target": "ES2022",
+    "lib": ["ES2022", "DOM"],
+    "checkJs": false,
+    "allowJs": false,
+    "types": ["node"]
+  },
+  "include": ["index.ts", "src", "tests"]
+}

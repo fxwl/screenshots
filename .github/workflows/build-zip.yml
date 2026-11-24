@@ -1,0 +1,94 @@
+name: Auto Build & Release Extension
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: Lint, Test & Build Extension
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version-file: '.nvmrc'
+          cache: 'pnpm'
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Lint
+        run: pnpm lint
+
+      - name: Type check
+        run: pnpm type-check
+
+      - name: Run tests
+        run: pnpm test
+
+      - name: Build and package extension
+        run: pnpm zip
+
+      - name: Prepare release asset filename
+        id: asset
+        shell: bash
+        run: |
+          ZIP_FILE=$(ls dist-zip/*.zip | head -n 1)
+          VERSION=$(node -p "require('./package.json').version")
+          if [[ "${GITHUB_REF_TYPE}" == "tag" ]]; then
+            ASSET_NAME="sessionmesh-${GITHUB_REF_NAME}.zip"
+          else
+            ASSET_NAME="sessionmesh-v${VERSION}-latest.zip"
+          fi
+          cp "$ZIP_FILE" "dist-zip/${ASSET_NAME}"
+          echo "zip_path=dist-zip/${ASSET_NAME}" >> "$GITHUB_OUTPUT"
+          echo "asset_name=${ASSET_NAME}" >> "$GITHUB_OUTPUT"
+          echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
+
+      - name: Upload extension artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: sessionmesh-extension-${{ steps.asset.outputs.version }}
+          path: ${{ steps.asset.outputs.zip_path }}
+          retention-days: 30
+
+      - name: Publish rolling latest build on main push
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: latest
+          target_commitish: ${{ github.sha }}
+          name: Latest Automated Build (v${{ steps.asset.outputs.version }})
+          body: |
+            Automated build from `main` commit `${{ github.sha }}`.
+
+            - Passed `pnpm lint`, `pnpm type-check`, and `pnpm test`
+            - Compatible with Chrome & Microsoft Edge (Manifest V3)
+          prerelease: true
+          make_latest: 'false'
+          files: ${{ steps.asset.outputs.zip_path }}
+
+      - name: Publish official versioned GitHub Release on tag push
+        if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          name: SessionMesh ${{ github.ref_name }}
+          generate_release_notes: true
+          prerelease: false
+          make_latest: 'true'
+          files: ${{ steps.asset.outputs.zip_path }}

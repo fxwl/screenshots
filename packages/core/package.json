@@ -1,0 +1,33 @@
+{
+  "name": "@sessionmesh/core",
+  "version": "1.0.0",
+  "description": "SessionMesh core engine: WebDAV, E2E Crypto, Causal Versioning, SiteTrack, Rules, Sync & Refresh",
+  "private": true,
+  "sideEffects": false,
+  "files": [
+    "dist/**"
+  ],
+  "main": "./dist/index.js",
+  "module": "./dist/index.mjs",
+  "types": "./dist/index.d.ts",
+  "scripts": {
+    "clean": "rimraf ./dist && rimraf .turbo",
+    "build": "tsup index.ts --format esm,cjs --dts --external chrome",
+    "dev": "tsc -w",
+    "type-check": "tsc --noEmit",
+    "test": "vitest run"
+  },
+  "dependencies": {
+    "pako": "^2.1.0",
+    "protobufjs": "^7.3.2"
+  },
+  "devDependencies": {
+    "@sessionmesh/webdav-mock": "workspace:*",
+    "@sessionmesh/tsconfig": "workspace:*",
+    "@types/chrome": "^0.0.268",
+    "@types/node": "^20.12.11",
+    "@types/pako": "^2.0.3",
+    "tsup": "8.0.2",
+    "vitest": "^1.6.0"
+  }
+}
