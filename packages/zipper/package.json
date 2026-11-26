@@ -24,7 +24,7 @@
   },
   "devDependencies": {
     "@sessionmesh/tsconfig": "workspace:*",
-    "fflate": "^0.8.2",
+    "fflate": "^0.8.3",
     "fast-glob": "^3.3.3"
   }
 }
