@@ -22,12 +22,12 @@
     "type-check": "tsc --noEmit"
   },
   "dependencies": {
-    "ws": "8.17.0"
+    "ws": "8.23.0"
   },
   "devDependencies": {
     "@sessionmesh/tsconfig": "workspace:*",
     "@rollup/plugin-sucrase": "^5.0.2",
-    "@types/ws": "^8.5.10",
+    "@types/ws": "^8.18.2",
     "esm": "^3.2.25",
     "rollup": "^4.17.2",
     "ts-node": "^10.9.2"
