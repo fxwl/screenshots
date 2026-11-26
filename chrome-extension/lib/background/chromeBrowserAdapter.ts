@@ -12,6 +12,7 @@ import type {
   PartitionKeyInfo,
   SameSiteValue,
 } from '@sessionmesh/core';
+import { detectBrowserRuntime } from '@sessionmesh/shared';
 import type { AccountSwitchToastPayload, ContentScriptCommand } from '@sessionmesh/shared';
 
 type ChromeCookieWithPartition = chrome.cookies.Cookie & {
@@ -145,19 +146,6 @@ function sendTabMessageWithTimeout<T>(
       finish(null);
     }
   });
-}
-
-function parseBrowserFromUserAgent(ua: string): { browser: string; browserVersion: string } {
-  const edgeMatch = ua.match(/Edg\/([\d.]+)/);
-  if (edgeMatch) return { browser: 'Edge', browserVersion: edgeMatch[1] };
-
-  const firefoxMatch = ua.match(/Firefox\/([\d.]+)/);
-  if (firefoxMatch) return { browser: 'Firefox', browserVersion: firefoxMatch[1] };
-
-  const chromeMatch = ua.match(/Chrome\/([\d.]+)/);
-  if (chromeMatch) return { browser: 'Chrome', browserVersion: chromeMatch[1] };
-
-  return { browser: 'Chromium', browserVersion: 'unknown' };
 }
 
 export interface ChromeBrowserAdapterOptions {
@@ -809,10 +797,9 @@ export class ChromeBrowserAdapter implements BrowserApiAdapter {
     extensionVersion: string;
     platform: string;
   }> {
-    const ua = typeof navigator !== 'undefined' ? navigator.userAgent : '';
-    const { browser, browserVersion } = parseBrowserFromUserAgent(ua);
+    const { browser, browserVersion } = await detectBrowserRuntime();
     const extensionVersion =
-      typeof chrome !== 'undefined' && chrome.runtime?.getManifest ? chrome.runtime.getManifest().version : '2.0.0';
+      typeof chrome !== 'undefined' && chrome.runtime?.getManifest ? chrome.runtime.getManifest().version : '1.3.1';
 
     let platform = 'unknown';
     if (typeof chrome !== 'undefined' && chrome.runtime?.getPlatformInfo) {

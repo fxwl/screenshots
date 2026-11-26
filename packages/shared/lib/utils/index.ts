@@ -132,3 +132,5 @@ export async function extractDomainAndPort(url: string, isRemoveWWW = true): Pro
   const siteKey = extractSiteKeyFromUrl(urlObj.href) || hostname;
   return [siteKey, port, hostname];
 }
+
+export * from './browserDetect';

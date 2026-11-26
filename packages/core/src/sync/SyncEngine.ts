@@ -943,6 +943,50 @@ export class SyncEngine {
       meta.space.status = 'PAUSED';
     }
 
+    // Refresh local browser/platform/extension metadata on startup so upgrades
+    // (e.g. improved multi-browser detection or browser version updates) take effect automatically.
+    let deviceMetaUpdated = false;
+    try {
+      const freshPlatform = await this.browser.getDevicePlatformInfo();
+      const prevDefaultName = this.identity.defaultName;
+      const prevDerivedName = `${meta.localDevice.platform} ${meta.localDevice.browser}`.trim();
+      const freshDefaultName = `${freshPlatform.platform} ${freshPlatform.browser}`.trim() || prevDefaultName;
+
+      if (
+        meta.localDevice.browser !== freshPlatform.browser ||
+        meta.localDevice.browserVersion !== freshPlatform.browserVersion ||
+        meta.localDevice.extensionVersion !== freshPlatform.extensionVersion ||
+        meta.localDevice.platform !== freshPlatform.platform
+      ) {
+        meta.localDevice.browser = freshPlatform.browser;
+        meta.localDevice.browserVersion = freshPlatform.browserVersion;
+        meta.localDevice.extensionVersion = freshPlatform.extensionVersion;
+        meta.localDevice.platform = freshPlatform.platform;
+        deviceMetaUpdated = true;
+      }
+
+      if (freshDefaultName && freshDefaultName !== prevDefaultName) {
+        this.identity.defaultName = freshDefaultName;
+        await this.storage.set(GLOBAL_NS, 'deviceIdentity', this.identity);
+      }
+
+      // Only auto-update device display name if the user has NOT manually renamed it.
+      if (
+        freshDefaultName &&
+        meta.localDevice.name !== freshDefaultName &&
+        (meta.localDevice.name === prevDefaultName || meta.localDevice.name === prevDerivedName)
+      ) {
+        meta.localDevice.name = freshDefaultName;
+        deviceMetaUpdated = true;
+      }
+
+      if (deviceMetaUpdated) {
+        await this.storage.set(ns, 'meta', meta);
+      }
+    } catch {
+      // Non-fatal: keep previously persisted device metadata
+    }
+
     const rt: LoadedSpaceRuntime = {
       spaceId,
       storage,

@@ -2,6 +2,16 @@
 
 All notable changes to **SessionMesh** will be documented in this file.
 
+## [1.3.1] - 2026-11-27
+
+### Improved
+
+- **Enhanced Multi-Browser Detection on Same Device**:
+  - Upgraded browser identification (`detectBrowserRuntime` / `detectBrowserFromHints`) to combine `navigator.userAgent`, Chromium Client Hints (`navigator.userAgentData.brands` & high-entropy `fullVersionList`), and `navigator.brave.isBrave()`.
+  - Accurately distinguishes **Chrome**, **Chromium**, **Edge**, **Brave**, **Opera**, **Opera GX**, **Vivaldi**, **Arc**, **Yandex**, **Whale**, **Samsung Internet**, **DuckDuckGo**, **QQ Browser**, **360 Extreme / Safe**, **Sogou**, **Quark**, **UC Browser**, **Maxthon**, **Firefox**, **Zen**, **Floorp**, **Waterfox**, **LibreWolf**, and **Safari**.
+- **Automatic Local Device Metadata Refresh on Startup**:
+  - `SyncEngine` now refreshes the local device's detected `browser`, `browserVersion`, `extensionVersion`, and `platform` on startup/space load, and updates the default device display name automatically only when the user has not manually renamed it.
+
 ## [1.3.0] - 2026-11-26
 
 ### Added
