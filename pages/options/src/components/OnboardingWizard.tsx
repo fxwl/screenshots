@@ -3,6 +3,7 @@ import type {
   CapabilityReport,
   InitialJoinReport,
   PendingSiteDecision,
+  RemoteSpacePasswordVerifyResult,
   RemoteSpaceProbeItem,
   SpaceSettings,
   SyncScopeMode,
@@ -63,7 +64,7 @@ import {
   Sparkles,
   X,
 } from 'lucide-react';
-import { useCallback, useEffect, useMemo, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { toast } from 'sonner';
 import {
   detectDefaultDeviceName,
@@ -142,10 +143,17 @@ export function OnboardingWizard({ alreadyConfigured = false, onComplete, onCanc
   const [spaceMode, setSpaceMode] = useState<'create' | 'join'>('create');
   const [spaceId, setSpaceId] = useState('default');
   const [spaceName, setSpaceName] = useState('默认同步空间');
+  const userEditedStep2Ref = useRef(false);
   const [deviceName, setDeviceName] = useState(() => detectDefaultDeviceName());
   const [encryptionPassword, setEncryptionPassword] = useState('');
   const [confirmPassword, setConfirmPassword] = useState('');
   const [showEncPassword, setShowEncPassword] = useState(false);
+  const [verifyingPassword, setVerifyingPassword] = useState(false);
+  const [passwordVerifyState, setPasswordVerifyState] = useState<{
+    ok: boolean;
+    key: string;
+    message: string;
+  } | null>(null);
 
   // Step 3: Managed scope, authority device, security & blacklist presets + settings
   const [syncScopeMode, setSyncScopeMode] = useState<SyncScopeMode>('managed_only');
@@ -252,17 +260,19 @@ export function OnboardingWizard({ alreadyConfigured = false, onComplete, onCanc
       const safeList = Array.isArray(list) ? list : [];
       setRemoteSpaces(safeList);
       setHasProbedSpaces(true);
-      if (safeList.length > 0 && !pairedFromDevice) {
-        setSpaceMode('join');
-        const first = safeList[0];
-        if (first) {
-          const targetId = resolveProbeSpaceId(first);
-          const targetName = resolveProbeSpaceName(first);
-          setSpaceId(targetId);
-          setSpaceName(targetName);
+      if (!pairedFromDevice && !userEditedStep2Ref.current) {
+        if (safeList.length > 0) {
+          setSpaceMode('join');
+          const first = safeList[0];
+          if (first) {
+            const targetId = resolveProbeSpaceId(first);
+            const targetName = resolveProbeSpaceName(first);
+            setSpaceId(targetId);
+            setSpaceName(targetName);
+          }
+        } else {
+          setSpaceMode('create');
         }
-      } else if (safeList.length === 0 && !pairedFromDevice) {
-        setSpaceMode('create');
       }
     } catch (err) {
       setProbeError(extractErrorMessage(err));
@@ -394,7 +404,89 @@ export function OnboardingWizard({ alreadyConfigured = false, onComplete, onCanc
     }
   };
 
-  const goToStep3 = () => {
+  const currentVerifyKey = `${url.trim()}|${rootPath.trim()}|${spaceMode}|${spaceId.trim()}|${encryptionPassword}`;
+
+  const verifyStep2EncryptionPassword = async (): Promise<boolean> => {
+    const trimmedSpaceId = spaceId.trim();
+    if (!trimmedSpaceId) {
+      toast.warning('请先填写同步空间 ID（如 default）');
+      return false;
+    }
+    if (!encryptionPassword || encryptionPassword.length < 6) {
+      toast.warning('请输入至少 6 位的端到端加密主密码');
+      return false;
+    }
+    if (spaceMode === 'create' && encryptionPassword !== confirmPassword) {
+      toast.warning('两次输入的端到端加密密码不一致，请核对');
+      return false;
+    }
+
+    setVerifyingPassword(true);
+    try {
+      const cfg = buildWebDAVConfig();
+      const res = await unwrapCommand<RemoteSpacePasswordVerifyResult>({
+        type: 'VERIFY_SPACE_PASSWORD',
+        webdav: cfg,
+        spaceId: trimmedSpaceId,
+        encryptionPassword,
+      });
+
+      if (spaceMode === 'join') {
+        if (!res.exists) {
+          const msg = `远端 WebDAV 未找到 ID 为「${trimmedSpaceId}」的同步空间，请核对空间 ID 或切换为「创建新同步空间」`;
+          setPasswordVerifyState({ ok: false, key: currentVerifyKey, message: msg });
+          toast.error(msg);
+          return false;
+        }
+        if (!res.verified) {
+          const msg = res.errorMessage || '端到端加密主密码错误，无法解密远端空间元数据，请核对后重试';
+          setPasswordVerifyState({ ok: false, key: currentVerifyKey, message: msg });
+          toast.error(msg);
+          return false;
+        }
+        if (res.spaceName) {
+          setSpaceName(res.spaceName);
+        }
+        const okMsg = `主密码验证通过：已成功解密远端空间「${res.spaceName || res.spaceId || trimmedSpaceId}」`;
+        setPasswordVerifyState({ ok: true, key: currentVerifyKey, message: okMsg });
+        toast.success(okMsg);
+        return true;
+      }
+
+      // spaceMode === 'create'
+      if (res.exists && !res.verified) {
+        const msg = `远端已存在 ID 为「${trimmedSpaceId}」的同步空间，但当前主密码无法解密。请更换全新的空间 ID，或切换为「加入已有同步空间」并输入原主密码。`;
+        setPasswordVerifyState({ ok: false, key: currentVerifyKey, message: msg });
+        toast.error(msg);
+        return false;
+      }
+      if (res.exists && res.verified) {
+        if (res.spaceName) {
+          setSpaceName(res.spaceName);
+        }
+        setSpaceMode('join');
+        const nextKey = `${url.trim()}|${rootPath.trim()}|join|${trimmedSpaceId}|${encryptionPassword}`;
+        const okMsg = `检测到远端已存在空间「${res.spaceName || res.spaceId || trimmedSpaceId}」且主密码校验通过，已自动切换为加入模式`;
+        setPasswordVerifyState({ ok: true, key: nextKey, message: okMsg });
+        toast.success(okMsg);
+        return true;
+      }
+
+      const okMsg = `校验通过：远端空间 ID「${trimmedSpaceId}」尚未占用，主密码可用于初始化新空间`;
+      setPasswordVerifyState({ ok: true, key: currentVerifyKey, message: okMsg });
+      toast.success(okMsg);
+      return true;
+    } catch (err) {
+      const msg = `主密码校验失败：${extractErrorMessage(err)}`;
+      setPasswordVerifyState({ ok: false, key: currentVerifyKey, message: msg });
+      toast.error(msg);
+      return false;
+    } finally {
+      setVerifyingPassword(false);
+    }
+  };
+
+  const goToStep3 = async () => {
     if (!spaceId.trim()) {
       toast.warning('请填写同步空间 ID（如 default）');
       return;
@@ -413,6 +505,14 @@ export function OnboardingWizard({ alreadyConfigured = false, onComplete, onCanc
     }
     if (authType !== 'bearer' && password && encryptionPassword === password) {
       toast.warning('强烈建议端到端加密密码与 WebDAV 密码不同，以防云盘密码泄漏导致密文被解');
+    }
+
+    // Always verify E2E encryption password against remote WebDAV before leaving Step 2
+    if (!passwordVerifyState?.ok || passwordVerifyState.key !== currentVerifyKey) {
+      const ok = await verifyStep2EncryptionPassword();
+      if (!ok) {
+        return;
+      }
     }
     setStep(3);
   };
@@ -788,6 +888,7 @@ export function OnboardingWizard({ alreadyConfigured = false, onComplete, onCanc
                       setUrl(e.target.value);
                       setStep1Error(null);
                       setHasProbedSpaces(false);
+                      userEditedStep2Ref.current = false;
                     }}
                     placeholder="https://dav.jianguoyun.com/dav/ 或 https://cloud.example.com/remote.php/dav/files/user/"
                   />
@@ -815,6 +916,7 @@ export function OnboardingWizard({ alreadyConfigured = false, onComplete, onCanc
                     onChange={e => {
                       setRootPath(e.target.value);
                       setHasProbedSpaces(false);
+                      userEditedStep2Ref.current = false;
                     }}
                     placeholder="/SessionMesh"
                   />
@@ -1112,6 +1214,7 @@ export function OnboardingWizard({ alreadyConfigured = false, onComplete, onCanc
                 <button
                   type="button"
                   onClick={() => {
+                    userEditedStep2Ref.current = true;
                     setSpaceMode('create');
                     if (!spaceId) setSpaceId('default');
                   }}
@@ -1131,7 +1234,10 @@ export function OnboardingWizard({ alreadyConfigured = false, onComplete, onCanc
 
                 <button
                   type="button"
-                  onClick={() => setSpaceMode('join')}
+                  onClick={() => {
+                    userEditedStep2Ref.current = true;
+                    setSpaceMode('join');
+                  }}
                   className={`rounded-xl border p-3.5 text-left transition-all ${
                     spaceMode === 'join'
                       ? 'border-primary bg-primary/8 ring-1 ring-primary/40'
@@ -1191,7 +1297,15 @@ export function OnboardingWizard({ alreadyConfigured = false, onComplete, onCanc
             <div className="grid gap-4 sm:grid-cols-3">
               <div className="space-y-1.5">
                 <Label htmlFor="spaceId">同步空间 ID *</Label>
-                <Input id="spaceId" value={spaceId} onChange={e => setSpaceId(e.target.value)} placeholder="default" />
+                <Input
+                  id="spaceId"
+                  value={spaceId}
+                  onChange={e => {
+                    userEditedStep2Ref.current = true;
+                    setSpaceId(e.target.value);
+                  }}
+                  placeholder="default"
+                />
                 <p className="text-[11px] text-muted-foreground">同一空间的多台设备需填写相同 ID</p>
               </div>
               <div className="space-y-1.5">
@@ -1199,7 +1313,10 @@ export function OnboardingWizard({ alreadyConfigured = false, onComplete, onCanc
                 <Input
                   id="spaceName"
                   value={spaceName}
-                  onChange={e => setSpaceName(e.target.value)}
+                  onChange={e => {
+                    userEditedStep2Ref.current = true;
+                    setSpaceName(e.target.value);
+                  }}
                   placeholder="我的主力空间"
                 />
               </div>
@@ -1249,7 +1366,16 @@ export function OnboardingWizard({ alreadyConfigured = false, onComplete, onCanc
                     id="encPass"
                     type={showEncPassword ? 'text' : 'password'}
                     value={encryptionPassword}
-                    onChange={e => setEncryptionPassword(e.target.value)}
+                    onChange={e => {
+                      setEncryptionPassword(e.target.value);
+                      setPasswordVerifyState(null);
+                    }}
+                    onKeyDown={e => {
+                      if (e.key === 'Enter' && encryptionPassword.length >= 6 && !verifyingPassword) {
+                        e.preventDefault();
+                        void verifyStep2EncryptionPassword();
+                      }
+                    }}
                     placeholder="至少 6 位，建议包含字母、数字与符号"
                   />
                 </div>
@@ -1261,16 +1387,88 @@ export function OnboardingWizard({ alreadyConfigured = false, onComplete, onCanc
                       id="confirmEncPass"
                       type={showEncPassword ? 'text' : 'password'}
                       value={confirmPassword}
-                      onChange={e => setConfirmPassword(e.target.value)}
+                      onChange={e => {
+                        setConfirmPassword(e.target.value);
+                        setPasswordVerifyState(null);
+                      }}
                       placeholder="再次输入以防误填"
                     />
                   </div>
                 ) : (
-                  <div className="flex items-end pb-2 text-xs text-muted-foreground">
-                    加入时将先校验解密 <code>metadata/space.enc</code>，若密码错误立即拦截且零破坏。
+                  <div className="flex flex-col justify-end gap-2">
+                    <Button
+                      type="button"
+                      variant="outline"
+                      size="sm"
+                      disabled={verifyingPassword || encryptionPassword.length < 6 || !spaceId.trim()}
+                      onClick={() => void verifyStep2EncryptionPassword()}
+                      className="h-9 w-fit text-xs">
+                      {verifyingPassword ? (
+                        <Loader2 className="mr-1.5 h-3.5 w-3.5 animate-spin" />
+                      ) : (
+                        <ShieldCheck className="mr-1.5 h-3.5 w-3.5 text-primary" />
+                      )}
+                      立即验证主密码
+                    </Button>
+                    <span className="text-[11px] text-muted-foreground">
+                      将只读解密校验 <code>metadata/space.enc</code>，密码错误立即拦截且零破坏。
+                    </span>
                   </div>
                 )}
               </div>
+
+              {spaceMode === 'create' ? (
+                <div className="flex flex-wrap items-center justify-between gap-2 text-xs">
+                  <div className="text-[11px] text-muted-foreground">
+                    {confirmPassword && encryptionPassword !== confirmPassword ? (
+                      <span className="text-destructive font-medium">两次输入的加密主密码不一致</span>
+                    ) : encryptionPassword.length > 0 && encryptionPassword.length < 6 ? (
+                      <span className="text-amber-600 dark:text-amber-400">主密码至少需要 6 位字符</span>
+                    ) : encryptionPassword.length >= 6 && encryptionPassword === confirmPassword ? (
+                      <span className="text-emerald-600 dark:text-emerald-400">
+                        两次输入一致，可校验远端空间 ID 是否可用
+                      </span>
+                    ) : (
+                      <span>点击「校验空间与密码」或「下一步」时将自动核验远端空间状态</span>
+                    )}
+                  </div>
+                  <Button
+                    type="button"
+                    variant="outline"
+                    size="sm"
+                    disabled={
+                      verifyingPassword ||
+                      encryptionPassword.length < 6 ||
+                      encryptionPassword !== confirmPassword ||
+                      !spaceId.trim()
+                    }
+                    onClick={() => void verifyStep2EncryptionPassword()}
+                    className="h-7 px-2.5 text-[11px]">
+                    {verifyingPassword ? (
+                      <Loader2 className="mr-1 h-3 w-3 animate-spin" />
+                    ) : (
+                      <ShieldCheck className="mr-1 h-3 w-3 text-primary" />
+                    )}
+                    校验空间与密码
+                  </Button>
+                </div>
+              ) : null}
+
+              {passwordVerifyState && passwordVerifyState.key === currentVerifyKey ? (
+                <div
+                  className={`flex items-center gap-2 rounded-lg border px-3 py-2 text-xs ${
+                    passwordVerifyState.ok
+                      ? 'border-emerald-500/35 bg-emerald-500/10 text-emerald-700 dark:text-emerald-300'
+                      : 'border-destructive/40 bg-destructive/10 text-destructive'
+                  }`}>
+                  {passwordVerifyState.ok ? (
+                    <CheckCircle2 className="h-4 w-4 shrink-0" />
+                  ) : (
+                    <AlertTriangle className="h-4 w-4 shrink-0" />
+                  )}
+                  <span>{passwordVerifyState.message}</span>
+                </div>
+              ) : null}
 
               {authType !== 'bearer' &&
               password &&
@@ -1294,13 +1492,22 @@ export function OnboardingWizard({ alreadyConfigured = false, onComplete, onCanc
             </div>
 
             <div className="flex items-center justify-between pt-2">
-              <Button type="button" variant="outline" onClick={() => setStep(1)}>
+              <Button type="button" variant="outline" onClick={() => setStep(1)} disabled={verifyingPassword}>
                 <ArrowLeft className="mr-2 h-4 w-4" />
                 上一步
               </Button>
-              <Button type="button" onClick={goToStep3}>
-                下一步：安全须知与黑名单
-                <ArrowRight className="ml-2 h-4 w-4" />
+              <Button type="button" onClick={() => void goToStep3()} disabled={verifyingPassword}>
+                {verifyingPassword ? (
+                  <>
+                    <Loader2 className="mr-2 h-4 w-4 animate-spin" />
+                    正在校验主密码...
+                  </>
+                ) : (
+                  <>
+                    下一步：安全须知与黑名单
+                    <ArrowRight className="ml-2 h-4 w-4" />
+                  </>
+                )}
               </Button>
             </div>
           </CardContent>

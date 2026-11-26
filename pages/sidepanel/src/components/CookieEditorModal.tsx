@@ -13,6 +13,14 @@ export interface CookieEditorModalProps {
   onSave: (cookie: BrowserCookieInput) => Promise<void>;
 }
 
+function isLocalOrSingleLabelDomain(rawDomain: string): boolean {
+  const clean = rawDomain.trim().toLowerCase().replace(/^\.+/, '');
+  if (!clean) return false;
+  if (clean === 'localhost' || !clean.includes('.') || clean.includes(':')) return true;
+  const parts = clean.split('.');
+  return parts.length === 4 && parts.every(p => /^\d{1,3}$/.test(p) && Number(p) >= 0 && Number(p) <= 255);
+}
+
 function toDatetimeLocalValue(expirationDate?: number): string {
   if (!expirationDate) return '';
   const ms = expirationDate > 1e12 ? expirationDate : expirationDate * 1000;
@@ -69,7 +77,7 @@ export const CookieEditorModal: React.FC<CookieEditorModalProps> = ({
       setSecure(true);
       setHttpOnly(false);
       setSession(false);
-      setHostOnly(false);
+      setHostOnly(isLocalOrSingleLabelDomain(siteKey));
       const oneYearLater = Math.floor(Date.now() / 1000) + 86400 * 365;
       setExpiryInput(toDatetimeLocalValue(oneYearLater));
       setPartitionTopLevelSite('');
@@ -87,6 +95,9 @@ export const CookieEditorModal: React.FC<CookieEditorModalProps> = ({
   }
   if (isSecurePrefix && !secure) {
     warnings.push('__Secure- 前缀 Cookie 要求 Secure=true。');
+  }
+  if (!hostOnly && isLocalOrSingleLabelDomain(domain)) {
+    warnings.push('localhost / IP / 单段主机名在 Chromium/Edge 中始终为 HostOnly，保存时将自动规范化。');
   }
 
   const handleSubmit = async () => {

@@ -1,4 +1,4 @@
-import type { BadgeTone } from '@src/lib/format';
+import type { BadgeTone } from '@console/lib/format';
 import { cn } from '@sessionmesh/ui';
 import type React from 'react';
 

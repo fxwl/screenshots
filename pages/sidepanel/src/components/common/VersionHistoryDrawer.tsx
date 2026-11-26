@@ -1,5 +1,5 @@
-import { extractErrorMessage, sidePanelApi } from '@src/lib/api';
-import { formatDateTime, formatRelativeTime, getOperationMeta, shortId } from '@src/lib/format';
+import { extractErrorMessage, sidePanelApi } from '@console/lib/api';
+import { formatDateTime, formatRelativeTime, getOperationMeta, shortId } from '@console/lib/format';
 import type { SyncEvent } from '@sessionmesh/shared';
 import { Button } from '@sessionmesh/ui';
 import { History, Loader2, RefreshCw, RotateCcw } from 'lucide-react';

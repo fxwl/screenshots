@@ -1,5 +1,6 @@
 import type {
   BlacklistEntry,
+  EnvCookieSyncRule,
   SiteRuleOverride,
   SiteSummaryView,
   SsoDomainGroup,
@@ -13,6 +14,8 @@ export interface SyncRuleUpdatePayload {
   deviceBlacklist?: BlacklistEntry[];
   siteOverrides?: Record<string, SiteRuleOverride>;
   ssoGroups?: SsoDomainGroup[];
+  envSyncRules?: EnvCookieSyncRule[];
+  deviceEnvSyncRules?: EnvCookieSyncRule[];
 }
 
 export interface CurrentSiteSnapshot {
@@ -21,6 +24,7 @@ export interface CurrentSiteSnapshot {
   url?: string;
   favIconUrl?: string;
   summary?: SiteSummaryView;
+  matchingEnvRules?: EnvCookieSyncRule[];
 }
 
 export interface PopupSummaryPayload {

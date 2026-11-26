@@ -2,7 +2,8 @@ import { describe, it, expect, afterEach } from 'vitest';
 import { MockWebDAVServer } from '@sessionmesh/webdav-mock';
 import { MultiDeviceHarness } from '../src/sim';
 import { ChangeDetector } from '../src/sync/ChangeDetector';
-import { EchoSuppressor } from '../src/sync/EchoSuppressor';
+import { toStructuredError } from '../src/diagnostics';
+import { EchoSuppressor, buildEchoCookieKey } from '../src/sync/EchoSuppressor';
 import { applyCookieWithVerification } from '../src/sync/CookieApplyHelper';
 import type { BrowserApiAdapter, BrowserCookieInput, WebDAVConfig } from '../src/types';
 
@@ -2153,5 +2154,152 @@ describe('Managed Sites, Space Auto-Detection, Authority Mode & Per-Device Polic
     expect(records).toHaveLength(1);
     expect(records[0].name).toBe('color_mode');
     expect(records[0].storeScope).toBe('default');
+  });
+
+  it('M-037: buildEchoCookieKey normalizes storeId/storeScope so local_only cookie deletion never emits cross-device tombstones on Chromium', async () => {
+    // Key parity across CookieRecord (storeScope: 'default') and BrowserCookieInput (storeId: 'default' | '0' | undefined)
+    const kScope = buildEchoCookieKey({ domain: '.r.io', path: '/', name: 'ck', storeScope: 'default' });
+    const kDefault = buildEchoCookieKey({ domain: '.r.io', path: '/', name: 'ck', storeId: 'default' });
+    const kZero = buildEchoCookieKey({ domain: '.r.io', path: '/', name: 'ck', storeId: '0' });
+    const kUndef = buildEchoCookieKey({ domain: '.r.io', path: '/', name: 'ck' });
+    expect(kScope).toBe(kDefault);
+    expect(kDefault).toBe(kZero);
+    expect(kZero).toBe(kUndef);
+
+    const { webdav, harness: h } = setup();
+    const devA = await h.createDevice('Edge-A');
+    const devB = await h.createDevice('Chrome-B');
+
+    // Simulate ChromeBrowserAdapter behavior emitting storeId: 'default' on onCookieChanged
+    const origOnCookieChanged = devA.browser.onCookieChanged.bind(devA.browser);
+    devA.browser.onCookieChanged = (listener) =>
+      origOnCookieChanged((evt) =>
+        listener({
+          ...evt,
+          cookie: { ...evt.cookie, storeId: evt.cookie.storeId && evt.cookie.storeId !== '0' ? evt.cookie.storeId : 'default' },
+        }),
+      );
+
+    await devA.engine.dispose();
+    await devA.engine.init();
+    devA.browser.seedCookie({ domain: '.localonly.test', name: 'local_drop', value: 'keep_on_b', secure: true });
+    await devA.engine.saveAndJoinSpace({
+      webdav,
+      spaceId: SPACE_ID,
+      spaceName: SPACE_NAME,
+      encryptionPassword: ENC_PASS,
+      deviceName: 'Edge-A',
+      settingsPatch: { syncScopeMode: 'managed_only', syncTimingMode: 'realtime' },
+      initialManagedSiteKeys: ['localonly.test'],
+    });
+    await devB.engine.saveAndJoinSpace({
+      webdav,
+      spaceId: SPACE_ID,
+      spaceName: SPACE_NAME,
+      encryptionPassword: ENC_PASS,
+      deviceName: 'Chrome-B',
+    });
+
+    const targetRec = (await devA.engine.getSiteCookies('localonly.test')).find((c) => c.name === 'local_drop')!;
+    expect(targetRec).toBeTruthy();
+
+    await devA.engine.deleteCookies([targetRec.logicalId], 'local_only', 'localonly.test');
+    await devA.engine.flushPendingLocalChanges();
+    await devA.engine.syncNow({ triggerRefresh: false });
+    await devB.engine.syncNow({ triggerRefresh: false });
+
+    expect(devA.browser.findJarCookie('local_drop', 'localonly.test')).toBeUndefined();
+    expect(devB.browser.findJarCookie('local_drop', 'localonly.test')?.value).toBe('keep_on_b');
+    const recAfterA = (await devA.engine.getSiteCookies('localonly.test')).find((c) => c.name === 'local_drop');
+    expect(recAfterA?.syncStatus).toBe('REMOTE_ONLY');
+    expect(recAfterA?.deleted).toBe(false);
+
+    // Regression: offline WebDAV error whose hex deviceId contains substring `aad` must classify as ERR_NETWORK_OFFLINE, never DECRYPT_ERROR
+    const hexNetworkErr = toStructuredError(
+      new Error(
+        'WebDAV putBytes network error (/SessionMesh/v1/spaces/sp_6618/events/dev_17185bf6deaadc59/0000000004_b_bb41.enc): Failed to fetch: MockWebDAVServer is offline',
+      ),
+      'push',
+    );
+    expect(hexNetworkErr.code).toBe('ERR_NETWORK_OFFLINE');
+    expect(hexNetworkErr.retryable).toBe(true);
+  });
+
+  it('M-038: addManagedSites pre-pulls remote tracks before creating a local track so B adopts or surfaces pendingDecisions immediately', async () => {
+    const { webdav, harness: h } = setup();
+    const devA = await h.createDevice('PrePull-A');
+    const devB = await h.createDevice('PrePull-B');
+
+    devA.browser.seedCookie({
+      domain: '.prepull-clean.test',
+      name: 'sid',
+      value: 'A_CLEAN_1',
+      secure: true,
+    });
+    devA.browser.seedCookie({
+      domain: '.prepull-clash.test',
+      name: 'sid',
+      value: 'A_CLASH_1',
+      secure: true,
+    });
+
+    await devA.engine.saveAndJoinSpace({
+      webdav,
+      spaceId: SPACE_ID,
+      spaceName: SPACE_NAME,
+      encryptionPassword: ENC_PASS,
+      deviceName: 'PrePull-A',
+      settingsPatch: { syncScopeMode: 'managed_only', authorityMode: 'ask' },
+      initialManagedSiteKeys: ['prepull-clean.test'],
+    });
+
+    // B joins in managed_only mode before prepull-late.test or prepull-clash.test exist in WebDAV
+    await devB.engine.saveAndJoinSpace({
+      webdav,
+      spaceId: SPACE_ID,
+      spaceName: SPACE_NAME,
+      encryptionPassword: ENC_PASS,
+      deviceName: 'PrePull-B',
+      settingsPatch: { syncScopeMode: 'managed_only', authorityMode: 'ask' },
+    });
+
+    // Simulate A adding two new sites AFTER B already joined (B has not polled yet!)
+    devA.browser.seedCookie({
+      domain: '.prepull-late.test',
+      name: 'sid',
+      value: 'A_LATE_99',
+      secure: true,
+    });
+    await devA.engine.addManagedSites(['prepull-late.test', 'prepull-clash.test']);
+
+    // B seeds local cookie on prepull-clash.test and adds BOTH sites on B without calling syncNow() first
+    devB.browser.seedCookie({
+      domain: '.prepull-clash.test',
+      name: 'sid',
+      value: 'B_CLASH_2',
+      secure: true,
+    });
+
+    const resB = await devB.engine.addManagedSites(['prepull-late.test', 'prepull-clash.test']);
+
+    // 1) prepull-late.test (clean on B): auto-pulled A's session without creating a duplicate local track!
+    expect(resB.added).toContain('prepull-late.test');
+    const bLateCookies = (await devB.browser.getAllCookies())
+      .filter((c) => c.domain.includes('prepull-late.test'));
+    expect(bLateCookies.map((c) => c.value)).toEqual(['A_LATE_99']);
+
+    const bLateOverview = (await devB.engine.getSitesOverview()).find(
+      (s) => s.siteKey === 'prepull-late.test',
+    );
+    expect(bLateOverview?.allTracks).toHaveLength(1);
+    expect(bLateOverview?.binding.trackId).toBe(bLateOverview?.allTracks[0].trackId);
+
+    // 2) prepull-clash.test (overlapping local cookie under ask mode): surfaces pendingDecision instead of creating an unlinked duplicate track
+    expect(resB.pendingDecisions.map((d) => d.siteKey)).toContain('prepull-clash.test');
+    const bClashOverview = (await devB.engine.getSitesOverview()).find(
+      (s) => s.siteKey === 'prepull-clash.test',
+    );
+    expect(bClashOverview?.allTracks).toHaveLength(1);
+    expect(bClashOverview?.binding.state).toBe('PENDING_CHOICE');
   });
 });

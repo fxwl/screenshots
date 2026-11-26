@@ -1,13 +1,18 @@
 import { sendSessionMeshCommand, unwrapCommand } from '@sessionmesh/shared';
 import type {
+  AccountRotationResult,
   BlacklistEntry,
   BrowserCandidateSite,
   BrowserCookieInput,
   ConflictRecord,
   CookieRecord,
+  CreateSiteAccountOptions,
   CurrentSiteSnapshot,
   DeleteScope,
   Device,
+  EnvCookieSyncResult,
+  EnvCookieSyncRule,
+  ExecuteEnvSyncInput,
   LocalStorageRecord,
   LogEntry,
   PendingSiteDecision,
@@ -18,12 +23,14 @@ import type {
   SiteDecisionAction,
   SiteRuleOverride,
   SiteSummaryView,
+  SiteTrack,
   SpaceAuthorityMode,
   SpaceSettings,
   SsoDomainGroup,
   SyncEvent,
   SyncRuleUpdatePayload,
   SyncStatusSummary,
+  UpdateSiteTrackPatch,
   WebDAVConfig,
 } from '@sessionmesh/shared';
 
@@ -53,6 +60,7 @@ export interface RulesAndBlacklistData {
   deviceBlacklist: BlacklistEntry[];
   siteOverrides: Record<string, SiteRuleOverride>;
   ssoGroups: SsoDomainGroup[];
+  envSyncRules: EnvCookieSyncRule[];
 }
 
 export interface HistoryAndLogsData {
@@ -193,12 +201,36 @@ export const sidePanelApi = {
     return runCommand<void>({ type: 'RENAME_SITE_TRACK', siteKey, trackId, label });
   },
 
+  updateSiteTrack(siteKey: string, trackId: string, patch: UpdateSiteTrackPatch): Promise<SiteTrack> {
+    return runCommand<SiteTrack>({ type: 'UPDATE_SITE_TRACK', siteKey, trackId, patch });
+  },
+
+  reorderSiteTracks(siteKey: string, orderedTrackIds: string[]): Promise<SiteTrack[]> {
+    return runCommand<SiteTrack[]>({ type: 'REORDER_SITE_TRACKS', siteKey, orderedTrackIds });
+  },
+
+  createSiteAccountTrack(siteKey: string, options: CreateSiteAccountOptions): Promise<SiteTrack> {
+    return runCommand<SiteTrack>({ type: 'CREATE_SITE_ACCOUNT_TRACK', siteKey, options });
+  },
+
+  rotateSiteTrack(siteKey: string, direction: 'next' | 'prev' = 'next'): Promise<AccountRotationResult> {
+    return runCommand<AccountRotationResult>({ type: 'ROTATE_SITE_TRACK', siteKey, direction });
+  },
+
+  deleteSiteTrack(siteKey: string, trackId: string): Promise<{ deletedTrackId: string; switchedToTrack?: SiteTrack }> {
+    return runCommand<{ deletedTrackId: string; switchedToTrack?: SiteTrack }>({
+      type: 'DELETE_SITE_TRACK',
+      siteKey,
+      trackId,
+    });
+  },
+
   getSiteCookies(siteKey: string, trackId?: string): Promise<CookieRecord[]> {
     return runCommand<CookieRecord[]>({ type: 'GET_SITE_COOKIES', siteKey, trackId });
   },
 
-  upsertCookie(siteKey: string, cookie: BrowserCookieInput): Promise<CookieRecord> {
-    return runCommand<CookieRecord>({ type: 'UPSERT_COOKIE', siteKey, cookie });
+  upsertCookie(siteKey: string, cookie: BrowserCookieInput, trackId?: string): Promise<CookieRecord> {
+    return runCommand<CookieRecord>({ type: 'UPSERT_COOKIE', siteKey, cookie, trackId });
   },
 
   applyCookieToBrowser(logicalId: string): Promise<CookieRecord> {
@@ -209,39 +241,47 @@ export const sidePanelApi = {
     return runCommand<void>({ type: 'DELETE_COOKIES', logicalIds, scope, siteKey });
   },
 
-  async importCookiesJson(cookies: BrowserCookieInput[], siteKey?: string): Promise<number> {
+  async importCookiesJson(cookies: BrowserCookieInput[], siteKey?: string, trackId?: string): Promise<number> {
     const res = await runCommand<number | { imported?: number; count?: number }>({
       type: 'IMPORT_COOKIES_JSON',
       siteKey,
+      trackId,
       cookies,
     });
     if (typeof res === 'number') return res;
     return res?.imported ?? res?.count ?? cookies.length;
   },
 
-  async exportCookiesJson(siteKey?: string): Promise<BrowserCookieInput[]> {
+  async exportCookiesJson(siteKey?: string, trackId?: string): Promise<BrowserCookieInput[]> {
     const res = await runCommand<BrowserCookieInput[] | { cookies?: BrowserCookieInput[] }>({
       type: 'EXPORT_COOKIES_JSON',
       siteKey,
+      trackId,
     });
     if (Array.isArray(res)) return res;
     return res?.cookies ?? [];
   },
 
-  getLocalStorageRecords(filter?: { siteKey?: string; origin?: string }): Promise<LocalStorageRecord[]> {
+  getLocalStorageRecords(filter?: {
+    siteKey?: string;
+    origin?: string;
+    trackId?: string;
+  }): Promise<LocalStorageRecord[]> {
     return runCommand<LocalStorageRecord[]>({
       type: 'GET_LOCAL_STORAGE_RECORDS',
       siteKey: filter?.siteKey,
       origin: filter?.origin,
+      trackId: filter?.trackId,
     });
   },
 
-  upsertLocalStorageItem(origin: string, key: string, value: string): Promise<LocalStorageRecord> {
+  upsertLocalStorageItem(origin: string, key: string, value: string, trackId?: string): Promise<LocalStorageRecord> {
     return runCommand<LocalStorageRecord>({
       type: 'UPSERT_LOCAL_STORAGE_ITEM',
       origin,
       key,
       value,
+      trackId,
     });
   },
 
@@ -286,6 +326,23 @@ export const sidePanelApi = {
 
   removeSsoGroup(groupId: string): Promise<void> {
     return runCommand<void>({ type: 'REMOVE_SSO_GROUP', groupId });
+  },
+
+  upsertEnvSyncRule(
+    rule: Omit<EnvCookieSyncRule, 'id' | 'name' | 'createdAt' | 'updatedAt'> & {
+      id?: string;
+      name?: string;
+    },
+  ): Promise<EnvCookieSyncRule> {
+    return runCommand<EnvCookieSyncRule>({ type: 'UPSERT_ENV_SYNC_RULE', rule });
+  },
+
+  removeEnvSyncRule(ruleId: string, scope?: 'space' | 'device'): Promise<void> {
+    return runCommand<void>({ type: 'REMOVE_ENV_SYNC_RULE', ruleId, scope });
+  },
+
+  executeEnvSync(input: ExecuteEnvSyncInput): Promise<EnvCookieSyncResult> {
+    return runCommand<EnvCookieSyncResult>({ type: 'EXECUTE_ENV_SYNC', input });
   },
 
   importRulesJson(payload: SyncRuleUpdatePayload): Promise<void> {

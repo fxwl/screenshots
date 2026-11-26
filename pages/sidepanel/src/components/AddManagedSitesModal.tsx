@@ -1,5 +1,5 @@
-import { extractErrorMessage, sidePanelApi } from '@src/lib/api';
-import { parseManualSiteKeysInput } from '@src/lib/format';
+import { extractErrorMessage, sidePanelApi } from '@console/lib/api';
+import { parseManualSiteKeysInput } from '@console/lib/format';
 import type { BrowserCandidateSite } from '@sessionmesh/shared';
 import { Button, Input } from '@sessionmesh/ui';
 import { CheckCircle2, Cookie, Globe, Loader2, Plus, RefreshCw, Search, ShieldBan, X } from 'lucide-react';

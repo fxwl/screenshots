@@ -12,7 +12,7 @@ interface EchoSuppressionEntry {
   expiresAt: number;
 }
 
-const POLL_INTERVAL_MS = 15_000;
+const POLL_INTERVAL_MS = 3_000;
 const ECHO_SUPPRESSION_TTL_MS = 2_500;
 const MAX_SYNCABLE_LS_VALUE_LENGTH = 256 * 1024;
 

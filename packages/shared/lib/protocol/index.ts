@@ -2,6 +2,8 @@
  * SessionMesh Runtime IPC Protocol (Background <-> Popup / Options / SidePanel / Content Script)
  */
 import type {
+  AccountCreateMode,
+  AccountRotationResult,
   AttentionItem,
   AttentionItemKind,
   BlacklistEntry,
@@ -10,8 +12,12 @@ import type {
   CapabilityReport,
   ConflictRecord,
   CookieRecord,
+  CreateSiteAccountOptions,
   DeleteScope,
   Device,
+  EnvCookieSyncResult,
+  EnvCookieSyncRule,
+  ExecuteEnvSyncInput,
   InitialJoinReport,
   IntegrityReport,
   LocalStorageRecord,
@@ -19,6 +25,7 @@ import type {
   PageReloadSafetyStatus,
   PendingSiteDecision,
   PerDeviceSyncPolicy,
+  RemoteSpacePasswordVerifyResult,
   RemoteSpaceProbeItem,
   SafetyUndoPoint,
   SiteDecisionAction,
@@ -30,6 +37,7 @@ import type {
   SyncEvent,
   SyncRuleUpdatePayload,
   SyncStatusSummary,
+  UpdateSiteTrackPatch,
   WebDAVConfig,
   WebDAVResourceStat,
 } from './extra';
@@ -40,6 +48,12 @@ export type SessionMeshCommand =
   | { type: 'GET_STATUS_SUMMARY'; activeUrl?: string }
   | { type: 'TEST_WEBDAV_CONNECTION'; config: WebDAVConfig }
   | { type: 'PROBE_REMOTE_SPACES'; config: WebDAVConfig }
+  | {
+      type: 'VERIFY_SPACE_PASSWORD';
+      webdav: WebDAVConfig;
+      spaceId: string;
+      encryptionPassword: string;
+    }
   | {
       type: 'SAVE_AND_JOIN_SPACE';
       webdav: WebDAVConfig;
@@ -80,14 +94,19 @@ export type SessionMeshCommand =
   | { type: 'SWITCH_SITE_TRACK'; siteKey: string; targetTrackId: string }
   | { type: 'SPLIT_SITE_INDEPENDENT'; siteKey: string; customLabel?: string }
   | { type: 'RENAME_SITE_TRACK'; siteKey: string; trackId: string; label: string }
+  | { type: 'UPDATE_SITE_TRACK'; siteKey: string; trackId: string; patch: UpdateSiteTrackPatch }
+  | { type: 'REORDER_SITE_TRACKS'; siteKey: string; orderedTrackIds: string[] }
+  | { type: 'CREATE_SITE_ACCOUNT_TRACK'; siteKey: string; options: CreateSiteAccountOptions }
+  | { type: 'ROTATE_SITE_TRACK'; siteKey: string; direction?: 'next' | 'prev' }
+  | { type: 'DELETE_SITE_TRACK'; siteKey: string; trackId: string }
   | { type: 'GET_SITE_COOKIES'; siteKey: string; trackId?: string }
-  | { type: 'UPSERT_COOKIE'; siteKey: string; cookie: BrowserCookieInput }
+  | { type: 'UPSERT_COOKIE'; siteKey: string; cookie: BrowserCookieInput; trackId?: string }
   | { type: 'APPLY_COOKIE_TO_BROWSER'; logicalId: string }
   | { type: 'DELETE_COOKIES'; logicalIds: string[]; siteKey?: string; scope: DeleteScope }
-  | { type: 'IMPORT_COOKIES_JSON'; siteKey?: string; cookies: BrowserCookieInput[] }
-  | { type: 'EXPORT_COOKIES_JSON'; siteKey?: string }
-  | { type: 'GET_LOCAL_STORAGE_RECORDS'; siteKey?: string; origin?: string }
-  | { type: 'UPSERT_LOCAL_STORAGE_ITEM'; origin: string; key: string; value: string }
+  | { type: 'IMPORT_COOKIES_JSON'; siteKey?: string; trackId?: string; cookies: BrowserCookieInput[] }
+  | { type: 'EXPORT_COOKIES_JSON'; siteKey?: string; trackId?: string }
+  | { type: 'GET_LOCAL_STORAGE_RECORDS'; siteKey?: string; origin?: string; trackId?: string }
+  | { type: 'UPSERT_LOCAL_STORAGE_ITEM'; origin: string; key: string; value: string; trackId?: string }
   | { type: 'APPLY_LOCAL_STORAGE_ITEM'; logicalId: string }
   | { type: 'DELETE_LOCAL_STORAGE_ITEMS'; logicalIds: string[]; scope: DeleteScope }
   | { type: 'GET_RULES_AND_BLACKLIST' }
@@ -97,6 +116,15 @@ export type SessionMeshCommand =
   | { type: 'REMOVE_SITE_RULE'; siteKey: string }
   | { type: 'UPSERT_SSO_GROUP'; group: SsoDomainGroup }
   | { type: 'REMOVE_SSO_GROUP'; groupId: string }
+  | {
+      type: 'UPSERT_ENV_SYNC_RULE';
+      rule: Omit<EnvCookieSyncRule, 'id' | 'name' | 'createdAt' | 'updatedAt'> & {
+        id?: string;
+        name?: string;
+      };
+    }
+  | { type: 'REMOVE_ENV_SYNC_RULE'; ruleId: string; scope?: 'space' | 'device' }
+  | { type: 'EXECUTE_ENV_SYNC'; input: ExecuteEnvSyncInput }
   | { type: 'IMPORT_RULES_JSON'; payload: SyncRuleUpdatePayload }
   | { type: 'EXPORT_RULES_JSON' }
   | { type: 'GET_DEVICES' }
@@ -149,6 +177,8 @@ export interface SessionMeshResponse<T = unknown> {
 }
 
 export type {
+  AccountCreateMode,
+  AccountRotationResult,
   AttentionItem,
   AttentionItemKind,
   BlacklistEntry,
@@ -157,8 +187,12 @@ export type {
   CapabilityReport,
   ConflictRecord,
   CookieRecord,
+  CreateSiteAccountOptions,
   DeleteScope,
   Device,
+  EnvCookieSyncResult,
+  EnvCookieSyncRule,
+  ExecuteEnvSyncInput,
   InitialJoinReport,
   IntegrityReport,
   LocalStorageRecord,
@@ -166,6 +200,7 @@ export type {
   PageReloadSafetyStatus,
   PendingSiteDecision,
   PerDeviceSyncPolicy,
+  RemoteSpacePasswordVerifyResult,
   RemoteSpaceProbeItem,
   SafetyUndoPoint,
   SiteDecisionAction,
@@ -176,6 +211,7 @@ export type {
   SsoDomainGroup,
   SyncEvent,
   SyncStatusSummary,
+  UpdateSiteTrackPatch,
   WebDAVConfig,
   WebDAVResourceStat,
 };

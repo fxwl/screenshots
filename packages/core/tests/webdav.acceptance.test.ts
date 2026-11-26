@@ -1041,4 +1041,23 @@ describe('WebDAV Acceptance Suite (W-001 through W-018)', () => {
     expect(report.consistencyLevel).toBe('append_only_degraded');
     expect(report.recommendedStorageFormat).toBe('base64_txt');
   });
+
+  it('W-025: enforces fetch cache="no-store" on WebDAV requests so stale/corrupt HTTP cache never poisons reads or rebuildIndex', async () => {
+    const server = new MockWebDAVServer();
+    const seenCaches: Array<RequestCache | undefined> = [];
+    const spyingFetch: typeof fetch = async (input, init) => {
+      seenCaches.push(init?.cache);
+      return server.fetchImpl(input, init);
+    };
+    const client = new WebDAVClient(makeHttpsConfig({ url: 'https://dav.sessionmesh.test', rootPath: '/SessionMesh' }), {
+      fetchImpl: spyingFetch,
+    });
+    await client.ensureDir('devices');
+    await client.putBytes('devices/devA.enc', new TextEncoder().encode('fresh-payload'));
+    await client.getBytes('devices/devA.enc');
+    await client.propfind('devices', 1);
+
+    expect(seenCaches.length).toBeGreaterThanOrEqual(4);
+    expect(seenCaches.every((c) => c === 'no-store')).toBe(true);
+  });
 });

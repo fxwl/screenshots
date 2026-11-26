@@ -5,11 +5,29 @@ import type {
   CookieRecord,
   PartitionKeyInfo,
 } from '../types';
+import { isLocalOrSingleLabelHost } from './EnvCookieMapper';
+
+/**
+ * Chromium / RFC 6265 ALWAYS forces `hostOnly = true` (bare domain, no leading dot) for:
+ * - `__Host-` prefix cookies
+ * - `localhost`, IPv4/IPv6 literals, and single-label intranet hostnames
+ */
+export function resolveEffectiveHostOnly(
+  domain: string,
+  hostOnly: boolean,
+  name?: string,
+): boolean {
+  if (name?.startsWith('__Host-')) return true;
+  const bare = domain.trim().toLowerCase().replace(/^\.+/, '');
+  if (isLocalOrSingleLabelHost(bare)) return true;
+  return Boolean(hostOnly);
+}
 
 export function normalizeCookieDomain(domain: string, hostOnly: boolean): string {
   const clean = domain.trim().toLowerCase();
-  if (hostOnly) {
-    return clean.replace(/^\.+/, '');
+  const bare = clean.replace(/^\.+/, '');
+  if (hostOnly || isLocalOrSingleLabelHost(bare)) {
+    return bare;
   }
   return clean.startsWith('.') ? clean : `.${clean}`;
 }
@@ -25,8 +43,13 @@ export function matchesCookieIdentity(
   },
 ): boolean {
   if (candidate.name !== target.name) return false;
-  if (Boolean(candidate.hostOnly) !== Boolean(target.hostOnly)) return false;
-  if (normalizeCookieDomain(candidate.domain, Boolean(candidate.hostOnly)) !== normalizeCookieDomain(target.domain, Boolean(target.hostOnly))) {
+  const candHostOnly = resolveEffectiveHostOnly(candidate.domain, candidate.hostOnly, candidate.name);
+  const targetHostOnly = resolveEffectiveHostOnly(target.domain, target.hostOnly, target.name);
+  if (candHostOnly !== targetHostOnly) return false;
+  if (
+    normalizeCookieDomain(candidate.domain, candHostOnly) !==
+    normalizeCookieDomain(target.domain, targetHostOnly)
+  ) {
     return false;
   }
   if ((candidate.path || '/') !== (target.path || '/')) return false;
@@ -125,9 +148,10 @@ export function cookieContentCanonicalHash(
       : String(Math.round(cookie.expirationDate));
   const pk = cookie.partitionKey?.topLevelSite ?? '';
   const dom = cookie.domain.trim().toLowerCase().replace(/^\.+/, '');
+  const effectiveHostOnly = resolveEffectiveHostOnly(cookie.domain, cookie.hostOnly, cookie.name);
   return JSON.stringify([
     dom,
-    cookie.hostOnly ? 1 : 0,
+    effectiveHostOnly ? 1 : 0,
     cookie.path || '/',
     cookie.name,
     cookie.value,
@@ -178,13 +202,11 @@ export async function applyCookieWithVerification(
   const isSecurePrefix = cookie.name.startsWith('__Secure-');
   const isSameSiteNone = cookie.sameSite === 'no_restriction';
 
-  // Enforce Chromium prefix/SameSite constraints
-  const effectiveHostOnly = isHostPrefix ? true : cookie.hostOnly;
+  // Enforce Chromium prefix/SameSite & localhost/IP hostOnly constraints
+  const effectiveHostOnly = resolveEffectiveHostOnly(cookie.domain, cookie.hostOnly, cookie.name);
   const effectivePath = isHostPrefix ? '/' : cookie.path || '/';
   const effectiveSecure = isHostPrefix || isSecurePrefix || isSameSiteNone ? true : cookie.secure;
-  const effectiveDomain = isHostPrefix
-    ? cookie.domain.trim().toLowerCase().replace(/^\.+/, '')
-    : cookie.domain.trim().toLowerCase();
+  const effectiveDomain = normalizeCookieDomain(cookie.domain, effectiveHostOnly);
 
   // If the incoming record explicitly violated __Host- / __Secure- / SameSite=None invariants
   // AND had incompatible attributes that we shouldn't silently lie about, check:

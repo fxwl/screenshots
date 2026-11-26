@@ -1,4 +1,4 @@
-import { extractErrorMessage } from '@src/lib/api';
+import { extractErrorMessage } from '@console/lib/api';
 import { Button } from '@sessionmesh/ui';
 import { CloudOff, Laptop, Loader2, Unlink } from 'lucide-react';
 import type React from 'react';

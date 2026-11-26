@@ -259,12 +259,16 @@ export function toStructuredError(
     };
   }
 
-  // Decryption / password / integrity error detection
+  // Explicit WebDAV network errors & offline conditions must NEVER be misclassified as DECRYPT_ERROR
+  // (e.g., if a random hex deviceId/objectId in the URL path contains letters like "aad")
   const combinedText = `${obj.code || ''} ${obj.name || ''} ${rawMessage}`;
+  const isCryptoErrorInstance = obj.name === 'SmesCryptoError' || String(obj.code || '').startsWith('DECRYPT');
   if (
-    /DECRYPT|decrypt|OperationError|authentication tag|wrong password|invalid password|invalid passphrase|AAD|SMES|tamper|corrupt/i.test(
+    isCryptoErrorInstance ||
+    /\bDECRYPT(?:_[A-Z0-9_]+)?\b|\bdecrypt(?:ion)?\b|OperationError|authentication tag|wrong password|invalid password|invalid passphrase|\btamper(?:ed)?\b|\bcorrupt(?:ed)?\b/i.test(
       combinedText,
-    )
+    ) ||
+    /\b(?:AAD|SMES)\b/.test(combinedText)
   ) {
     return {
       code: 'DECRYPT_ERROR',

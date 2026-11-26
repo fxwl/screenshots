@@ -1,4 +1,9 @@
-import { InMemoryStorageBackend, SyncEngine, type SyncEngineOptions } from '../sync';
+import {
+  InMemoryStorageBackend,
+  isLocalOrSingleLabelHost,
+  SyncEngine,
+  type SyncEngineOptions,
+} from '../sync';
 import type {
   BrowserApiAdapter,
   BrowserCookieChangeCause,
@@ -291,9 +296,12 @@ export class SimulatedBrowserDevice implements BrowserApiAdapter {
       return { cookie: null, error: 'SameSite=None cookie requires secure=true' };
     }
 
+    const cleanDomain = details.domain.toLowerCase().replace(/^\.+/, '');
+    // Emulate real Chromium CanonicalCookie semantics: localhost, IPv4/IPv6, and single-label hosts are ALWAYS hostOnly
+    const effectiveHostOnly = isLocalOrSingleLabelHost(cleanDomain) ? true : Boolean(details.hostOnly);
     const stored: BrowserCookieInput = {
-      domain: details.hostOnly
-        ? details.domain.toLowerCase().replace(/^\.+/, '')
+      domain: effectiveHostOnly
+        ? cleanDomain
         : details.domain.toLowerCase().startsWith('.')
           ? details.domain.toLowerCase()
           : `.${details.domain.toLowerCase()}`,
@@ -305,7 +313,7 @@ export class SimulatedBrowserDevice implements BrowserApiAdapter {
       sameSite: details.sameSite,
       session: details.session,
       expirationDate: details.session ? undefined : details.expirationDate,
-      hostOnly: details.hostOnly,
+      hostOnly: effectiveHostOnly,
       storeId: details.storeId && details.storeId !== 'default' ? details.storeId : '0',
       partitionKey: details.partitionKey ? { ...details.partitionKey } : null,
     };
@@ -415,9 +423,16 @@ export class SimulatedBrowserDevice implements BrowserApiAdapter {
       return { available: false, items: {} };
     }
     const store = this.localStorageByOrigin.get(norm);
-    const items: Record<string, string> = {};
+    const items: Record<string, string> = Object.create(null);
     if (store) {
-      for (const [k, v] of store.entries()) items[k] = v;
+      for (const [k, v] of store.entries()) {
+        Object.defineProperty(items, k, {
+          value: v,
+          enumerable: true,
+          writable: true,
+          configurable: true,
+        });
+      }
     }
     return { available: true, items };
   }

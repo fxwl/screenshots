@@ -1,5 +1,6 @@
 import type {
   BlacklistEntry,
+  EnvCookieSyncRule,
   SiteRuleOverride,
   SpaceRuleSet,
   SpaceSettings,
@@ -7,6 +8,7 @@ import type {
   SyncDirection,
 } from '../types';
 import { normalizeDomain, resolveSiteKey } from '../psl';
+import { parseEnvTarget } from '../sync/EnvCookieMapper';
 
 export { buildPresetBlacklistEntries } from './presets';
 
@@ -320,6 +322,79 @@ function sanitizeSsoGroups(raw: unknown): SsoDomainGroup[] {
   return groups;
 }
 
+function sanitizeEnvSyncRule(
+  raw: unknown,
+  defaultScope: 'space' | 'device',
+  index: number,
+): EnvCookieSyncRule | null {
+  if (!raw || typeof raw !== 'object') return null;
+  const obj = raw as Record<string, unknown>;
+  const rawSource = typeof obj.sourceSiteKey === 'string' ? obj.sourceSiteKey.trim() : '';
+  const sourceSiteKey = rawSource ? resolveSiteKey(rawSource) || normalizeDomain(rawSource) : '';
+  const targetUrl = typeof obj.targetUrl === 'string' ? obj.targetUrl.trim() : '';
+  if (!sourceSiteKey || !targetUrl || !parseEnvTarget(targetUrl)) return null;
+
+  const rawSourceHost = normalizeDomain(rawSource);
+  const sanitizedHostFilter =
+    typeof obj.sourceHostFilter === 'string' && obj.sourceHostFilter.trim()
+      ? normalizeDomain(obj.sourceHostFilter)
+      : rawSourceHost && rawSourceHost !== sourceSiteKey
+        ? rawSourceHost
+        : undefined;
+
+  const scope: 'space' | 'device' =
+    obj.scope === 'space' || obj.scope === 'device' ? obj.scope : defaultScope;
+  const now = Date.now();
+  const createdAt =
+    typeof obj.createdAt === 'number' && Number.isFinite(obj.createdAt) ? obj.createdAt : now;
+  const updatedAt =
+    typeof obj.updatedAt === 'number' && Number.isFinite(obj.updatedAt) ? obj.updatedAt : now;
+
+  const includeCookieNames = Array.isArray(obj.includeCookieNames)
+    ? obj.includeCookieNames
+        .filter((n): n is string => typeof n === 'string' && n.trim().length > 0)
+        .map((n) => n.trim())
+    : undefined;
+  const excludeCookieNames = Array.isArray(obj.excludeCookieNames)
+    ? obj.excludeCookieNames
+        .filter((n): n is string => typeof n === 'string' && n.trim().length > 0)
+        .map((n) => n.trim())
+    : undefined;
+
+  return {
+    id:
+      typeof obj.id === 'string' && obj.id.trim()
+        ? obj.id.trim()
+        : `env_${scope}_${index}_${now}`,
+    name:
+      typeof obj.name === 'string' && obj.name.trim()
+        ? obj.name.trim()
+        : `${sourceSiteKey} → ${targetUrl}`,
+    scope,
+    enabled: typeof obj.enabled === 'boolean' ? obj.enabled : true,
+    sourceSiteKey,
+    sourceHostFilter: sanitizedHostFilter,
+    sourceTrackId:
+      typeof obj.sourceTrackId === 'string' && obj.sourceTrackId.trim()
+        ? obj.sourceTrackId.trim()
+        : undefined,
+    targetUrl,
+    syncCookies: typeof obj.syncCookies === 'boolean' ? obj.syncCookies : true,
+    syncLocalStorage: typeof obj.syncLocalStorage === 'boolean' ? obj.syncLocalStorage : false,
+    adaptForHttp: typeof obj.adaptForHttp === 'boolean' ? obj.adaptForHttp : true,
+    cleanTargetBeforeSync:
+      typeof obj.cleanTargetBeforeSync === 'boolean' ? obj.cleanTargetBeforeSync : false,
+    autoSync: typeof obj.autoSync === 'boolean' ? obj.autoSync : true,
+    autoReloadTarget: typeof obj.autoReloadTarget === 'boolean' ? obj.autoReloadTarget : false,
+    includeCookieNames: includeCookieNames && includeCookieNames.length > 0 ? includeCookieNames : undefined,
+    excludeCookieNames: excludeCookieNames && excludeCookieNames.length > 0 ? excludeCookieNames : undefined,
+    lastSyncedAt: typeof obj.lastSyncedAt === 'number' ? obj.lastSyncedAt : undefined,
+    lastSyncedCount: typeof obj.lastSyncedCount === 'number' ? obj.lastSyncedCount : undefined,
+    createdAt,
+    updatedAt,
+  };
+}
+
 /**
  * Two-Tier Blacklist & Rules Engine.
  * Priority: Device Blacklist > Space Blacklist > Per-Site Overrides (origin > exact > subdomain > wildcard) > Global Defaults.
@@ -328,35 +403,44 @@ export class RulesEngine {
   private spaceSettings: SpaceSettings;
   private spaceRules: SpaceRuleSet;
   private deviceBlacklist: BlacklistEntry[];
+  private deviceEnvSyncRules: EnvCookieSyncRule[];
 
   constructor(
     spaceSettings: SpaceSettings,
     spaceRules: SpaceRuleSet,
     deviceBlacklist: BlacklistEntry[] = [],
+    deviceEnvSyncRules: EnvCookieSyncRule[] = [],
   ) {
     this.spaceSettings = { ...spaceSettings };
     this.spaceRules = {
       spaceBlacklist: [...(spaceRules.spaceBlacklist ?? [])],
       siteOverrides: { ...(spaceRules.siteOverrides ?? {}) },
       ssoGroups: [...(spaceRules.ssoGroups ?? [])],
+      envSyncRules: [...(spaceRules.envSyncRules ?? [])],
       updatedAt: spaceRules.updatedAt,
     };
     this.deviceBlacklist = [...deviceBlacklist];
+    this.deviceEnvSyncRules = [...deviceEnvSyncRules];
   }
 
   update(
     spaceSettings: SpaceSettings,
     spaceRules: SpaceRuleSet,
     deviceBlacklist: BlacklistEntry[] = [],
+    deviceEnvSyncRules?: EnvCookieSyncRule[],
   ): void {
     this.spaceSettings = { ...spaceSettings };
     this.spaceRules = {
       spaceBlacklist: [...(spaceRules.spaceBlacklist ?? [])],
       siteOverrides: { ...(spaceRules.siteOverrides ?? {}) },
       ssoGroups: [...(spaceRules.ssoGroups ?? [])],
+      envSyncRules: [...(spaceRules.envSyncRules ?? [])],
       updatedAt: spaceRules.updatedAt,
     };
     this.deviceBlacklist = [...deviceBlacklist];
+    if (deviceEnvSyncRules !== undefined) {
+      this.deviceEnvSyncRules = [...deviceEnvSyncRules];
+    }
   }
 
   isBlacklisted(domainOrOriginOrUrl: string): { blacklisted: boolean; entry?: BlacklistEntry } {
@@ -456,9 +540,11 @@ export class RulesEngine {
           spaceBlacklist: this.spaceRules.spaceBlacklist,
           siteOverrides: this.spaceRules.siteOverrides,
           ssoGroups: this.spaceRules.ssoGroups,
+          envSyncRules: this.spaceRules.envSyncRules ?? [],
           updatedAt: this.spaceRules.updatedAt,
         },
         deviceBlacklist: this.deviceBlacklist,
+        deviceEnvSyncRules: this.deviceEnvSyncRules,
       },
       null,
       2,
@@ -467,7 +553,11 @@ export class RulesEngine {
 
   static parseRulesJson(
     json: string,
-  ): { spaceRules: Partial<SpaceRuleSet>; deviceBlacklist: BlacklistEntry[] } {
+  ): {
+    spaceRules: Partial<SpaceRuleSet>;
+    deviceBlacklist: BlacklistEntry[];
+    deviceEnvSyncRules: EnvCookieSyncRule[];
+  } {
     let parsed: unknown;
     try {
       parsed = JSON.parse(json);
@@ -507,6 +597,12 @@ export class RulesEngine {
       spaceRules.ssoGroups = sanitizeSsoGroups(rawSpaceRules.ssoGroups);
     }
 
+    if (Array.isArray(rawSpaceRules.envSyncRules)) {
+      spaceRules.envSyncRules = rawSpaceRules.envSyncRules
+        .map((item, idx) => sanitizeEnvSyncRule(item, 'space', idx))
+        .filter((item): item is EnvCookieSyncRule => item !== null);
+    }
+
     if (typeof rawSpaceRules.updatedAt === 'number' && Number.isFinite(rawSpaceRules.updatedAt)) {
       spaceRules.updatedAt = rawSpaceRules.updatedAt;
     }
@@ -516,6 +612,13 @@ export class RulesEngine {
       .map((item, idx) => sanitizeBlacklistEntry(item, 'device', idx))
       .filter((item): item is BlacklistEntry => item !== null);
 
-    return { spaceRules, deviceBlacklist };
+    const rawDeviceEnvRules = Array.isArray(root.deviceEnvSyncRules)
+      ? root.deviceEnvSyncRules
+      : [];
+    const deviceEnvSyncRules = rawDeviceEnvRules
+      .map((item, idx) => sanitizeEnvSyncRule(item, 'device', idx))
+      .filter((item): item is EnvCookieSyncRule => item !== null);
+
+    return { spaceRules, deviceBlacklist, deviceEnvSyncRules };
   }
 }

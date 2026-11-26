@@ -1,6 +1,6 @@
 {
   "name": "@sessionmesh/sidepanel",
-  "version": "1.0.1",
+  "version": "1.1.0",
   "description": "SessionMesh 6-tab management sidepanel",
   "private": true,
   "sideEffects": true,

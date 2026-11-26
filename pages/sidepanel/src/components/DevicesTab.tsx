@@ -1,5 +1,5 @@
-import { extractErrorMessage, sidePanelApi } from '@src/lib/api';
-import { useBannerPrefs } from '@src/lib/bannerPrefs';
+import { extractErrorMessage, sidePanelApi } from '@console/lib/api';
+import { useBannerPrefs } from '@console/lib/bannerPrefs';
 import {
   copyToClipboard,
   formatDateTime,
@@ -7,7 +7,7 @@ import {
   getAuthorityModeLabel,
   getDeviceStateMeta,
   shortId,
-} from '@src/lib/format';
+} from '@console/lib/format';
 import type { Device, PerDeviceSyncPolicy, SpaceAuthorityMode, SpaceSettings } from '@sessionmesh/shared';
 import { Button, Input, Label } from '@sessionmesh/ui';
 import {
@@ -40,6 +40,7 @@ export interface DevicesTabProps {
   globalSearch: string;
   onStatusChanged: () => Promise<void> | void;
   refreshSignal: number;
+  layout?: 'compact' | 'wide';
 }
 
 export const DevicesTab: React.FC<DevicesTabProps> = ({
@@ -47,6 +48,7 @@ export const DevicesTab: React.FC<DevicesTabProps> = ({
   globalSearch,
   onStatusChanged,
   refreshSignal,
+  layout = 'compact',
 }) => {
   const [devices, setDevices] = useState<Device[]>([]);
   const [settings, setSettings] = useState<SpaceSettings | null>(null);
@@ -299,7 +301,7 @@ export const DevicesTab: React.FC<DevicesTabProps> = ({
   };
 
   return (
-    <div className="flex h-full flex-col overflow-y-auto p-3 space-y-3">
+    <div className={layout === 'wide' ? 'space-y-4' : 'flex h-full flex-col overflow-y-auto p-3 space-y-3'}>
       {/* Unified Space Authority Policy Card */}
       <section className="rounded-xl border border-primary/30 bg-card p-3 text-xs space-y-2.5 shadow-sm">
         <div className="flex items-start justify-between gap-2">

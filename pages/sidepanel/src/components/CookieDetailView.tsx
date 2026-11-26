@@ -1,5 +1,5 @@
-import { extractErrorMessage, sidePanelApi } from '@src/lib/api';
-import { useBannerPrefs } from '@src/lib/bannerPrefs';
+import { extractErrorMessage, sidePanelApi } from '@console/lib/api';
+import { useBannerPrefs } from '@console/lib/bannerPrefs';
 import {
   buildCookieHeader,
   copyToClipboard,
@@ -10,11 +10,27 @@ import {
   getBindingMeta,
   getCookieSyncStatusMeta,
   getSameSiteLabel,
+  parseImportedCookiesJson,
   shortId,
   toBrowserCookieInput,
-} from '@src/lib/format';
-import type { BrowserCookieInput, CookieRecord, DeleteScope, SiteSummaryView } from '@sessionmesh/shared';
-import { Button, Input } from '@sessionmesh/ui';
+} from '@console/lib/format';
+import type {
+  AccountCreateMode,
+  BrowserCookieInput,
+  CookieRecord,
+  DeleteScope,
+  SiteSummaryView,
+} from '@sessionmesh/shared';
+import {
+  Button,
+  DropdownMenu,
+  DropdownMenuContent,
+  DropdownMenuItem,
+  DropdownMenuSeparator,
+  DropdownMenuTrigger,
+  Input,
+  Label,
+} from '@sessionmesh/ui';
 import {
   AlertCircle,
   CheckCircle2,
@@ -24,6 +40,7 @@ import {
   CloudDownload,
   CloudUpload,
   Copy,
+  Database,
   Download,
   Edit3,
   Eye,
@@ -32,20 +49,24 @@ import {
   GitBranch,
   Globe,
   History,
+  Info,
   Loader2,
+  MoreHorizontal,
   Play,
   Plus,
   RefreshCw,
+  Repeat,
   Search,
   ShieldAlert,
   Tag,
   Trash2,
   Unlink,
   Upload,
+  UserPlus,
   X,
 } from 'lucide-react';
 import type React from 'react';
-import { useCallback, useEffect, useMemo, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { toast } from 'sonner';
 import { StatusBadge } from './common/Badge';
 import { EmptyState } from './common/EmptyState';
@@ -62,11 +83,23 @@ export interface CookieDetailViewProps {
   globalSearch: string;
   onBack: () => void;
   onSiteMutated: () => Promise<void>;
+  initialTrackId?: string | null;
+  layout?: 'compact' | 'wide';
+  onOpenLocalStorage?: (siteKey: string, trackId?: string, trackLabel?: string) => void;
 }
 
 type CookieQuickFilter = 'all' | 'active' | 'failed' | 'deleted' | 'httpOnly' | 'secure' | 'session';
 
-export const CookieDetailView: React.FC<CookieDetailViewProps> = ({ site, globalSearch, onBack, onSiteMutated }) => {
+export const CookieDetailView: React.FC<CookieDetailViewProps> = ({
+  site,
+  globalSearch,
+  onBack,
+  onSiteMutated,
+  initialTrackId,
+  layout = 'compact',
+  onOpenLocalStorage,
+}) => {
+  const [viewingTrackId, setViewingTrackId] = useState<string | undefined>(initialTrackId || site.activeTrack?.trackId);
   const [cookies, setCookies] = useState<CookieRecord[]>([]);
   const [loading, setLoading] = useState(true);
   const [localSearch, setLocalSearch] = useState('');
@@ -85,27 +118,61 @@ export const CookieDetailView: React.FC<CookieDetailViewProps> = ({ site, global
   const [importOpen, setImportOpen] = useState(false);
   const [renameTrackOpen, setRenameTrackOpen] = useState(false);
   const [renameTrackValue, setRenameTrackValue] = useState('');
+  const [renameTrackNote, setRenameTrackNote] = useState('');
   const [splitTrackOpen, setSplitTrackOpen] = useState(false);
   const [splitTrackLabel, setSplitTrackLabel] = useState('');
+  const [createAcctOpen, setCreateAcctOpen] = useState(false);
+  const [createAcctMode, setCreateAcctMode] = useState<AccountCreateMode>('clean_new');
+  const [createAcctLabel, setCreateAcctLabel] = useState('');
+  const [createAcctNote, setCreateAcctNote] = useState('');
   const [unmanageOpen, setUnmanageOpen] = useState(false);
 
   const { isBannerVisible, dismissBanner } = useBannerPrefs();
+  const loadSeqRef = useRef(0);
+
+  useEffect(() => {
+    if (initialTrackId && site.allTracks.some(t => t.trackId === initialTrackId)) {
+      setViewingTrackId(initialTrackId);
+      return;
+    }
+    setViewingTrackId(prev => {
+      if (prev && site.allTracks.some(t => t.trackId === prev)) return prev;
+      return site.activeTrack?.trackId;
+    });
+  }, [initialTrackId, site.siteKey, site.activeTrack?.trackId, site.allTracks]);
+
+  const viewingTrack = useMemo(() => {
+    if (viewingTrackId) {
+      const found = site.allTracks.find(t => t.trackId === viewingTrackId);
+      if (found) return found;
+    }
+    return site.activeTrack;
+  }, [viewingTrackId, site.allTracks, site.activeTrack]);
+
+  const isViewingInactiveTrack = Boolean(
+    viewingTrack && site.activeTrack && viewingTrack.trackId !== site.activeTrack.trackId,
+  );
 
   const loadCookies = useCallback(async () => {
+    const seq = ++loadSeqRef.current;
     setLoading(true);
     try {
-      const list = await sidePanelApi.getSiteCookies(site.siteKey, site.activeTrack?.trackId);
+      const list = await sidePanelApi.getSiteCookies(site.siteKey, viewingTrack?.trackId);
+      if (seq !== loadSeqRef.current) return;
       setCookies(list || []);
       setSelectedIds(prev => {
         const valid = new Set((list || []).map(c => c.logicalId));
         return new Set([...prev].filter(id => valid.has(id)));
       });
     } catch (err) {
+      if (seq !== loadSeqRef.current) return;
       toast.error(`加载 Cookies 失败：${extractErrorMessage(err)}`);
     } finally {
-      setLoading(false);
+      if (seq === loadSeqRef.current) {
+        setLoading(false);
+      }
     }
-  }, [site.siteKey, site.activeTrack?.trackId]);
+  }, [site.siteKey, viewingTrack?.trackId]);
 
   useEffect(() => {
     loadCookies();
@@ -176,8 +243,10 @@ export const CookieDetailView: React.FC<CookieDetailViewProps> = ({ site, global
   };
 
   const handleSaveCookie = async (input: BrowserCookieInput) => {
-    const saved = await sidePanelApi.upsertCookie(site.siteKey, input);
-    if (saved.applyResult?.accepted === false) {
+    const saved = await sidePanelApi.upsertCookie(site.siteKey, input, viewingTrack?.trackId);
+    if (isViewingInactiveTrack) {
+      toast.success(`已保存 Cookie「${input.name}」至账号「${viewingTrack?.label}」（不影响当前网页登录态）`);
+    } else if (saved.applyResult?.accepted === false) {
       toast.warning(`Cookie 已保存到轨道，但本机写入未通过校验：${saved.applyResult.reason || '浏览器拒绝'}`);
     } else {
       toast.success(`已保存 Cookie「${input.name}」并同步至当前轨道`);
@@ -298,8 +367,9 @@ export const CookieDetailView: React.FC<CookieDetailViewProps> = ({ site, global
   const handleExportJson = async () => {
     setBusyAction('export');
     try {
-      const exported = await sidePanelApi.exportCookiesJson(site.siteKey);
-      downloadJsonFile(`sessionmesh-cookies-${site.siteKey}.json`, exported);
+      const exported = await sidePanelApi.exportCookiesJson(site.siteKey, viewingTrack?.trackId);
+      const trackSuffix = viewingTrack ? `-${viewingTrack.label.replace(/[^\w\u4e00-\u9fa5-]+/g, '_')}` : '';
+      downloadJsonFile(`sessionmesh-cookies-${site.siteKey}${trackSuffix}.json`, exported);
       toast.success(`已导出 ${exported.length} 条 Cookie JSON`);
     } catch (err) {
       toast.error(`导出失败：${extractErrorMessage(err)}`);
@@ -309,30 +379,9 @@ export const CookieDetailView: React.FC<CookieDetailViewProps> = ({ site, global
   };
 
   const handleImportJson = async (parsed: unknown) => {
-    const arr = Array.isArray(parsed)
-      ? parsed
-      : parsed && typeof parsed === 'object' && Array.isArray((parsed as { cookies?: unknown }).cookies)
-        ? (parsed as { cookies: unknown[] }).cookies
-        : null;
-    if (!arr || arr.length === 0) {
-      throw new Error('JSON 必须是包含 Cookie 对象的非空数组');
-    }
-    const normalized: BrowserCookieInput[] = arr.map((item: Record<string, unknown>) => ({
-      name: String(item.name ?? ''),
-      value: String(item.value ?? ''),
-      domain: String(item.domain ?? site.siteKey),
-      path: String(item.path ?? '/'),
-      secure: Boolean(item.secure ?? true),
-      httpOnly: Boolean(item.httpOnly ?? false),
-      sameSite: (item.sameSite as BrowserCookieInput['sameSite']) || 'unspecified',
-      session: Boolean(item.session ?? !item.expirationDate),
-      expirationDate: typeof item.expirationDate === 'number' ? item.expirationDate : undefined,
-      hostOnly: Boolean(item.hostOnly ?? false),
-      storeId: typeof item.storeId === 'string' && item.storeId !== 'default' ? item.storeId : undefined,
-      partitionKey: (item.partitionKey as BrowserCookieInput['partitionKey']) ?? null,
-    }));
-    const count = await sidePanelApi.importCookiesJson(normalized, site.siteKey);
-    toast.success(`已导入 ${count} 条 Cookie 到 ${site.siteKey}`);
+    const normalized = parseImportedCookiesJson(parsed, site.siteKey);
+    const count = await sidePanelApi.importCookiesJson(normalized, site.siteKey, viewingTrack?.trackId);
+    toast.success(`已导入 ${count} 条 Cookie 到 ${site.siteKey}${viewingTrack ? `（${viewingTrack.label}）` : ''}`);
     await loadCookies();
     await onSiteMutated();
   };
@@ -342,9 +391,9 @@ export const CookieDetailView: React.FC<CookieDetailViewProps> = ({ site, global
     setBusyAction('track-switch');
     try {
       await sidePanelApi.switchSiteTrack(site.siteKey, targetTrackId);
+      setViewingTrackId(targetTrackId);
       toast.success('已切换同步轨道（切换前已自动保存本地还原点）');
       await onSiteMutated();
-      await loadCookies();
     } catch (err) {
       toast.error(`切换轨道失败：${extractErrorMessage(err)}`);
     } finally {
@@ -353,15 +402,18 @@ export const CookieDetailView: React.FC<CookieDetailViewProps> = ({ site, global
   };
 
   const handleConfirmRenameTrack = async () => {
-    if (!site.activeTrack || !renameTrackValue.trim()) return;
+    if (!viewingTrack || !renameTrackValue.trim()) return;
     setBusyAction('track-rename');
     try {
-      await sidePanelApi.renameSiteTrack(site.siteKey, site.activeTrack.trackId, renameTrackValue.trim());
-      toast.success('轨道名称已更新');
+      await sidePanelApi.updateSiteTrack(site.siteKey, viewingTrack.trackId, {
+        label: renameTrackValue.trim(),
+        accountNote: renameTrackNote.trim(),
+      });
+      toast.success('账号信息已更新');
       setRenameTrackOpen(false);
       await onSiteMutated();
     } catch (err) {
-      toast.error(`重命名失败：${extractErrorMessage(err)}`);
+      toast.error(`更新账号信息失败：${extractErrorMessage(err)}`);
     } finally {
       setBusyAction(null);
     }
@@ -375,9 +427,68 @@ export const CookieDetailView: React.FC<CookieDetailViewProps> = ({ site, global
       setSplitTrackOpen(false);
       setSplitTrackLabel('');
       await onSiteMutated();
-      await loadCookies();
     } catch (err) {
       toast.error(`拆分独立轨道失败：${extractErrorMessage(err)}`);
+    } finally {
+      setBusyAction(null);
+    }
+  };
+
+  const handleRotateAccount = async () => {
+    setBusyAction('track-rotate');
+    try {
+      const res = await sidePanelApi.rotateSiteTrack(site.siteKey, 'next');
+      setViewingTrackId(res.track.trackId);
+      toast.success(`已轮换至账号「${res.track.label}」(${res.index}/${res.total})`);
+      await onSiteMutated();
+    } catch (err) {
+      toast.error(`轮换账号失败：${extractErrorMessage(err)}`);
+    } finally {
+      setBusyAction(null);
+    }
+  };
+
+  const handleConfirmCreateAccount = async () => {
+    setBusyAction('track-create');
+    try {
+      const created = await sidePanelApi.createSiteAccountTrack(site.siteKey, {
+        mode: createAcctMode,
+        label: createAcctLabel.trim() || undefined,
+        accountNote: createAcctNote.trim() || undefined,
+        triggerRefresh: createAcctMode === 'clean_new',
+      });
+      setViewingTrackId(created.trackId);
+      toast.success(
+        createAcctMode === 'clean_new'
+          ? `已保存原账号并切换至空白账号「${created.label}」，请在网页登录新账号`
+          : `已保存为新账号「${created.label}」`,
+      );
+      setCreateAcctOpen(false);
+      setCreateAcctLabel('');
+      setCreateAcctNote('');
+      await onSiteMutated();
+    } catch (err) {
+      toast.error(`新增账号失败：${extractErrorMessage(err)}`);
+    } finally {
+      setBusyAction(null);
+    }
+  };
+
+  const handleDeleteViewingAccount = async () => {
+    if (!viewingTrack) return;
+    const { trackId, label } = viewingTrack;
+    setBusyAction('track-delete');
+    try {
+      const res = await sidePanelApi.deleteSiteTrack(site.siteKey, trackId);
+      if (res.switchedToTrack) {
+        setViewingTrackId(res.switchedToTrack.trackId);
+      } else {
+        setViewingTrackId(undefined);
+      }
+      toast.success(`已移除账号「${label}」`);
+      await onSiteMutated();
+    } catch (err) {
+      toast.error(`删除账号失败：${extractErrorMessage(err)}`);
     } finally {
       setBusyAction(null);
     }
@@ -398,9 +509,14 @@ export const CookieDetailView: React.FC<CookieDetailViewProps> = ({ site, global
   const selectedCookies = cookies.filter(c => selectedIds.has(c.logicalId));
 
   return (
-    <div className="flex h-full flex-col">
+    <div className={layout === 'wide' ? 'space-y-4' : 'flex h-full flex-col'}>
       {/* Site Detail Top Bar */}
-      <div className="shrink-0 border-b border-border bg-card/60 px-3 py-2.5 space-y-2">
+      <div
+        className={
+          layout === 'wide'
+            ? 'rounded-xl border border-border bg-card p-4 space-y-3'
+            : 'shrink-0 border-b border-border bg-card/60 px-3 py-2.5 space-y-2'
+        }>
         <div className="flex items-center justify-between gap-2">
           <div className="flex items-center gap-2 min-w-0">
             <Button variant="outline" size="icon" className="h-7 w-7 shrink-0" onClick={onBack} title="返回站点列表">
@@ -417,12 +533,16 @@ export const CookieDetailView: React.FC<CookieDetailViewProps> = ({ site, global
               <Globe className="h-4 w-4 shrink-0 text-muted-foreground" />
             )}
             <div className="min-w-0">
-              <div className="flex items-center gap-1.5 min-w-0">
+              <div className="flex flex-wrap items-center gap-1.5 min-w-0">
                 <h2 className="truncate text-sm font-semibold">{site.siteKey}</h2>
                 <StatusBadge tone={bindingMeta.tone}>{bindingMeta.label}</StatusBadge>
+                {viewingTrack?.accountNote ? (
+                  <span className="truncate text-[11px] text-muted-foreground">· {viewingTrack.accountNote}</span>
+                ) : null}
               </div>
               <p className="truncate text-[11px] text-muted-foreground">
-                轨道：{site.activeTrack?.label || '未绑定'} · {site.activeTrack?.memberDeviceIds?.length || 0} 台设备 ·{' '}
+                查看账号：{viewingTrack?.label || '未绑定'}
+                {isViewingInactiveTrack ? '（非激活）' : ''} · {viewingTrack?.memberDeviceIds?.length || 0} 台设备 ·{' '}
                 {cookies.filter(c => !c.deleted).length} 条生效 Cookie
               </p>
             </div>
@@ -430,114 +550,189 @@ export const CookieDetailView: React.FC<CookieDetailViewProps> = ({ site, global
 
           <Button
             size="sm"
-            className="h-7 px-2 text-xs shrink-0"
+            className="h-7 px-2.5 text-xs shrink-0"
+            disabled={site.binding.state === 'BLACKLISTED'}
             onClick={() => {
               setEditingCookie(null);
               setEditorOpen(true);
             }}>
             <Plus className="mr-1 h-3.5 w-3.5" />
-            新建
+            新建 Cookie
           </Button>
         </div>
 
-        {/* Track Switcher & Actions Row */}
-        <div className="flex flex-wrap items-center gap-1.5">
-          {site.allTracks.length > 0 ? (
-            <select
-              aria-label="切换站点同步轨道"
-              value={site.activeTrack?.trackId || ''}
+        {/* Viewing Inactive Account Banner */}
+        {isViewingInactiveTrack && viewingTrack ? (
+          <div className="flex flex-wrap items-center justify-between gap-2 rounded-lg border border-sky-500/35 bg-sky-500/[0.08] px-2.5 py-2 text-[11px] text-sky-900 dark:text-sky-200">
+            <div className="flex items-center gap-1.5 min-w-0">
+              <Info className="h-3.5 w-3.5 shrink-0 text-sky-600 dark:text-sky-400" />
+              <span>
+                当前正在查看非激活账号 <strong>「{viewingTrack.label}」</strong>{' '}
+                的数据（编辑或导入导出仅作用于该账号，不会影响当前网页登录态）。
+              </span>
+            </div>
+            <Button
+              size="sm"
+              variant="default"
+              className="h-6 px-2 text-[11px] shrink-0"
               disabled={busyAction === 'track-switch'}
-              onChange={e => handleSwitchTrack(e.target.value)}
-              className="h-7 max-w-[185px] truncate rounded-md border border-input bg-background px-2 text-[11px] text-foreground focus:outline-none focus:ring-1 focus:ring-ring">
-              {site.allTracks.map(tr => (
-                <option key={tr.trackId} value={tr.trackId}>
-                  {tr.label} ({tr.cookieCount}条 · {tr.memberDeviceIds.length}设备)
-                </option>
-              ))}
-            </select>
-          ) : null}
-
-          {site.activeTrack ? (
-            <Button
-              variant="outline"
-              size="sm"
-              className="h-7 px-2 text-[11px]"
-              onClick={() => {
-                setRenameTrackValue(site.activeTrack?.label || '');
-                setRenameTrackOpen(true);
-              }}
-              title="重命名当前轨道">
-              <Tag className="mr-1 h-3 w-3" />
-              重命名
+              onClick={() => void handleSwitchTrack(viewingTrack.trackId)}>
+              切换激活此账号
             </Button>
-          ) : null}
+          </div>
+        ) : null}
 
-          <Button
-            variant="outline"
-            size="sm"
-            className="h-7 px-2 text-[11px]"
-            onClick={() => setSplitTrackOpen(true)}
-            title="拆分为独立维护轨道">
-            <GitBranch className="mr-1 h-3 w-3" />
-            独立维护
-          </Button>
+        {/* Track Switcher & Structured Actions */}
+        <div className="flex flex-wrap items-center justify-between gap-1.5">
+          {site.binding.state === 'BLACKLISTED' ? (
+            <span className="text-[11px] text-muted-foreground">
+              此站点处于黑名单保护中，已阻断同步、新建与多账号轮换（移出黑名单后自动恢复）。
+            </span>
+          ) : (
+            <div className="flex flex-wrap items-center gap-1.5">
+              {site.allTracks.length > 0 ? (
+                <select
+                  aria-label="选择要查看的站点账号轨道"
+                  value={viewingTrack?.trackId || ''}
+                  disabled={busyAction === 'track-switch'}
+                  onChange={e => setViewingTrackId(e.target.value)}
+                  className="h-7 max-w-[210px] truncate rounded-md border border-input bg-background px-2 text-[11px] text-foreground focus:outline-none focus:ring-1 focus:ring-ring">
+                  {site.allTracks.map((tr, idx) => (
+                    <option key={tr.trackId} value={tr.trackId}>
+                      #{idx + 1} {tr.label}
+                      {tr.trackId === site.activeTrack?.trackId ? ' (当前激活)' : ''} ({tr.cookieCount}条)
+                    </option>
+                  ))}
+                </select>
+              ) : null}
 
-          <Button
-            variant="outline"
-            size="sm"
-            className="h-7 px-2 text-[11px]"
-            disabled={busyAction === 'sync:push'}
-            onClick={() => handleSiteSync('push')}>
-            <CloudUpload className="mr-1 h-3 w-3" />
-            推送
-          </Button>
+              {site.allTracks.length > 1 ? (
+                <Button
+                  variant="default"
+                  size="sm"
+                  className="h-7 px-2 text-[11px]"
+                  disabled={busyAction === 'track-rotate'}
+                  onClick={handleRotateAccount}
+                  title="按顺序一键轮换到下一个账号并刷新页面">
+                  <Repeat className="mr-1 h-3 w-3" />
+                  轮换
+                </Button>
+              ) : null}
 
-          <Button
-            variant="outline"
-            size="sm"
-            className="h-7 px-2 text-[11px]"
-            disabled={busyAction === 'sync:pull'}
-            onClick={() => handleSiteSync('pull')}>
-            <CloudDownload className="mr-1 h-3 w-3" />
-            拉取
-          </Button>
+              <Button
+                variant="outline"
+                size="sm"
+                className="h-7 px-2 text-[11px]"
+                onClick={() => {
+                  setCreateAcctMode('clean_new');
+                  setCreateAcctLabel('');
+                  setCreateAcctNote('');
+                  setCreateAcctOpen(true);
+                }}
+                title="新增多账号轨道">
+                <UserPlus className="mr-1 h-3 w-3" />
+                新账号
+              </Button>
 
-          <Button variant="outline" size="sm" className="h-7 px-2 text-[11px]" onClick={() => handleCopyHeader()}>
-            <Copy className="mr-1 h-3 w-3" />
-            Header
-          </Button>
+              <Button
+                variant="outline"
+                size="sm"
+                className="h-7 px-2 text-[11px]"
+                disabled={busyAction === 'sync:push'}
+                onClick={() => handleSiteSync('push')}>
+                <CloudUpload className="mr-1 h-3 w-3" />
+                推送
+              </Button>
 
-          <Button variant="outline" size="sm" className="h-7 px-2 text-[11px]" onClick={() => handleCopyJson()}>
-            <FileJson className="mr-1 h-3 w-3" />
-            复制 JSON
-          </Button>
+              <Button
+                variant="outline"
+                size="sm"
+                className="h-7 px-2 text-[11px]"
+                disabled={busyAction === 'sync:pull'}
+                onClick={() => handleSiteSync('pull')}>
+                <CloudDownload className="mr-1 h-3 w-3" />
+                拉取
+              </Button>
+            </div>
+          )}
 
-          <Button
-            variant="outline"
-            size="sm"
-            className="h-7 px-2 text-[11px]"
-            disabled={busyAction === 'export'}
-            onClick={handleExportJson}>
-            <Download className="mr-1 h-3 w-3" />
-            导出
-          </Button>
-
-          <Button variant="outline" size="sm" className="h-7 px-2 text-[11px]" onClick={() => setImportOpen(true)}>
-            <Upload className="mr-1 h-3 w-3" />
-            导入
-          </Button>
-
-          {site.binding.state !== 'BLACKLISTED' && site.binding.state !== 'UNMANAGED' ? (
-            <Button
-              variant="outline"
-              size="sm"
-              className="h-7 px-2 text-[11px] border-amber-500/40 text-amber-700 hover:bg-amber-500/10 dark:text-amber-300"
-              onClick={() => setUnmanageOpen(true)}
-              title="移出本机管理或从整个同步空间移除">
-              <Unlink className="mr-1 h-3 w-3" />
-              移出管理
+          <div className="flex flex-wrap items-center gap-1">
+            <Button variant="outline" size="sm" className="h-7 px-2 text-[11px]" onClick={() => handleCopyHeader()}>
+              <Copy className="mr-1 h-3 w-3" />
+              Header
             </Button>
-          ) : null}
+
+            <Button variant="outline" size="sm" className="h-7 px-2 text-[11px]" onClick={() => handleCopyJson()}>
+              <FileJson className="mr-1 h-3 w-3" />
+              JSON
+            </Button>
+
+            <DropdownMenu modal={false}>
+              <DropdownMenuTrigger asChild>
+                <Button variant="outline" size="sm" className="h-7 px-2 text-[11px]">
+                  <MoreHorizontal className="mr-1 h-3.5 w-3.5" />
+                  更多
+                </Button>
+              </DropdownMenuTrigger>
+              <DropdownMenuContent align="end" className="w-48">
+                <DropdownMenuItem disabled={busyAction === 'export'} onClick={handleExportJson}>
+                  <Download className="mr-2 h-3.5 w-3.5" />
+                  导出 Cookies JSON 文件
+                </DropdownMenuItem>
+                <DropdownMenuItem onClick={() => setImportOpen(true)}>
+                  <Upload className="mr-2 h-3.5 w-3.5" />
+                  导入 Cookies JSON
+                </DropdownMenuItem>
+                {onOpenLocalStorage ? (
+                  <DropdownMenuItem
+                    onClick={() => onOpenLocalStorage(site.siteKey, viewingTrack?.trackId, viewingTrack?.label)}>
+                    <Database className="mr-2 h-3.5 w-3.5" />
+                    查看此账号 LocalStorage
+                  </DropdownMenuItem>
+                ) : null}
+                {site.binding.state !== 'BLACKLISTED' ? (
+                  <>
+                    <DropdownMenuSeparator />
+                    {viewingTrack ? (
+                      <DropdownMenuItem
+                        onClick={() => {
+                          setRenameTrackValue(viewingTrack.label || '');
+                          setRenameTrackNote(viewingTrack.accountNote || '');
+                          setRenameTrackOpen(true);
+                        }}>
+                        <Tag className="mr-2 h-3.5 w-3.5" />
+                        编辑账号名称与备注
+                      </DropdownMenuItem>
+                    ) : null}
+                    <DropdownMenuItem onClick={() => setSplitTrackOpen(true)}>
+                      <GitBranch className="mr-2 h-3.5 w-3.5" />
+                      拆分为独立维护轨道
+                    </DropdownMenuItem>
+                    {viewingTrack && site.allTracks.length > 1 ? (
+                      <DropdownMenuItem
+                        className="text-rose-600 focus:text-rose-600"
+                        disabled={busyAction === 'track-delete'}
+                        onClick={() => void handleDeleteViewingAccount()}>
+                        <Trash2 className="mr-2 h-3.5 w-3.5" />
+                        删除账号「{viewingTrack.label}」
+                      </DropdownMenuItem>
+                    ) : null}
+                  </>
+                ) : null}
+                {site.binding.state !== 'BLACKLISTED' && site.binding.state !== 'UNMANAGED' ? (
+                  <>
+                    <DropdownMenuSeparator />
+                    <DropdownMenuItem
+                      className="text-amber-700 focus:text-amber-700 dark:text-amber-400"
+                      onClick={() => setUnmanageOpen(true)}>
+                      <Unlink className="mr-2 h-3.5 w-3.5" />
+                      移出同步管理
+                    </DropdownMenuItem>
+                  </>
+                ) : null}
+              </DropdownMenuContent>
+            </DropdownMenu>
+          </div>
         </div>
 
         {/* Dismissible Rolling Token Damping Notice */}
@@ -657,7 +852,7 @@ export const CookieDetailView: React.FC<CookieDetailViewProps> = ({ site, global
       </div>
 
       {/* Cookie List */}
-      <div className="flex-1 overflow-y-auto p-3 space-y-2">
+      <div className={layout === 'wide' ? 'space-y-2.5' : 'flex-1 overflow-y-auto p-3 space-y-2'}>
         {loading && cookies.length === 0 ? (
           <div className="flex items-center justify-center py-12 text-xs text-muted-foreground">
             <Loader2 className="mr-2 h-4 w-4 animate-spin" />
@@ -954,12 +1149,12 @@ export const CookieDetailView: React.FC<CookieDetailViewProps> = ({ site, global
         onImport={handleImportJson}
       />
 
-      {/* Rename Track Modal */}
+      {/* Rename & Edit Account Note Modal */}
       <Modal
         open={renameTrackOpen}
         onClose={() => setRenameTrackOpen(false)}
-        title={`重命名轨道 (${site.siteKey})`}
-        description="例如改为「工作账号」「个人主号」「测试小号」，方便多设备识别。"
+        title={`编辑账号信息 (${site.siteKey})`}
+        description="设置账号别名与备注（如「工作主号」「超级管理员 / 尾号 1234」），同步至所有设备。"
         footer={
           <>
             <Button variant="outline" size="sm" onClick={() => setRenameTrackOpen(false)}>
@@ -969,18 +1164,40 @@ export const CookieDetailView: React.FC<CookieDetailViewProps> = ({ site, global
               size="sm"
               disabled={!renameTrackValue.trim() || busyAction === 'track-rename'}
               onClick={handleConfirmRenameTrack}>
-              保存名称
+              保存信息
             </Button>
           </>
         }>
-        <Input
-          value={renameTrackValue}
-          onChange={e => setRenameTrackValue(e.target.value)}
-          placeholder="输入新轨道名称"
-          onKeyDown={e => {
-            if (e.key === 'Enter') handleConfirmRenameTrack();
-          }}
-        />
+        <div className="space-y-3 text-xs">
+          <div className="space-y-1">
+            <Label htmlFor="detail-edit-track-label" className="text-xs">
+              账号名称 *
+            </Label>
+            <Input
+              id="detail-edit-track-label"
+              value={renameTrackValue}
+              onChange={e => setRenameTrackValue(e.target.value)}
+              placeholder="输入新账号名称"
+              onKeyDown={e => {
+                if (e.key === 'Enter') void handleConfirmRenameTrack();
+              }}
+            />
+          </div>
+          <div className="space-y-1">
+            <Label htmlFor="detail-edit-track-note" className="text-xs">
+              账号备注（可选）
+            </Label>
+            <Input
+              id="detail-edit-track-note"
+              value={renameTrackNote}
+              onChange={e => setRenameTrackNote(e.target.value)}
+              placeholder="例如：管理员权限 / 绑定手机号尾号 8888"
+              onKeyDown={e => {
+                if (e.key === 'Enter') void handleConfirmRenameTrack();
+              }}
+            />
+          </div>
+        </div>
       </Modal>
 
       {/* Split Independent Track Modal */}
@@ -1007,6 +1224,73 @@ export const CookieDetailView: React.FC<CookieDetailViewProps> = ({ site, global
             if (e.key === 'Enter') handleConfirmSplitTrack();
           }}
         />
+      </Modal>
+
+      <Modal
+        open={createAcctOpen}
+        onClose={() => setCreateAcctOpen(false)}
+        title={`新增账号 (${site.siteKey})`}
+        description="支持无损保存当前登录态并清空页面以登录新账号，随时一键轮换。"
+        footer={
+          <>
+            <Button variant="outline" size="sm" onClick={() => setCreateAcctOpen(false)}>
+              取消
+            </Button>
+            <Button size="sm" disabled={busyAction === 'track-create'} onClick={handleConfirmCreateAccount}>
+              {createAcctMode === 'clean_new' ? '创建并清空页面去登录' : '保存当前登录态'}
+            </Button>
+          </>
+        }>
+        <div className="space-y-3 text-xs">
+          <div className="space-y-1.5">
+            <div className="flex items-start gap-2 rounded-lg border border-border p-2.5 hover:bg-muted/30">
+              <input
+                id="detail-acct-mode-clean"
+                type="radio"
+                name="detail-create-acct-mode"
+                checked={createAcctMode === 'clean_new'}
+                onChange={() => setCreateAcctMode('clean_new')}
+                className="mt-0.5 cursor-pointer accent-primary"
+              />
+              <label htmlFor="detail-acct-mode-clean" className="min-w-0 flex-1 cursor-pointer">
+                <span className="block font-medium text-foreground">新建空白账号（清空当前页面重新登录）</span>
+                <span className="block text-[11px] text-muted-foreground">
+                  自动保留原账号 Cookie，仅清空本机页面 Cookie 并刷新以登录新账号
+                </span>
+              </label>
+            </div>
+            <div className="flex items-start gap-2 rounded-lg border border-border p-2.5 hover:bg-muted/30">
+              <input
+                id="detail-acct-mode-save"
+                type="radio"
+                name="detail-create-acct-mode"
+                checked={createAcctMode === 'save_current'}
+                onChange={() => setCreateAcctMode('save_current')}
+                className="mt-0.5 cursor-pointer accent-primary"
+              />
+              <label htmlFor="detail-acct-mode-save" className="min-w-0 flex-1 cursor-pointer">
+                <span className="block font-medium text-foreground">将当前浏览器登录态另存为新账号</span>
+                <span className="block text-[11px] text-muted-foreground">复制当前网页 Cookie 创建一条新账号轨道</span>
+              </label>
+            </div>
+          </div>
+          <Input
+            value={createAcctLabel}
+            onChange={e => setCreateAcctLabel(e.target.value)}
+            placeholder="输入账号名称（如 管理员 / 测试号 B）"
+            onKeyDown={e => {
+              if (e.key === 'Enter') void handleConfirmCreateAccount();
+            }}
+          />
+          <Input
+            value={createAcctNote}
+            onChange={e => setCreateAcctNote(e.target.value)}
+            placeholder="账号备注（可选，如 角色权限 / 绑定邮箱或尾号）"
+            onKeyDown={e => {
+              if (e.key === 'Enter') void handleConfirmCreateAccount();
+            }}
+          />
+        </div>
       </Modal>
 
       <UnmanageSiteModal

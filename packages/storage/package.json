@@ -1,6 +1,6 @@
 {
   "name": "@sessionmesh/storage",
-  "version": "1.0.1",
+  "version": "1.1.0",
   "description": "SessionMesh extension storage & IndexedDB non-extractable key vault",
   "private": true,
   "sideEffects": false,

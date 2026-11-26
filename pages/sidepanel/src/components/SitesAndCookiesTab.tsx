@@ -1,5 +1,5 @@
-import { extractErrorMessage, sidePanelApi } from '@src/lib/api';
-import { useBannerPrefs } from '@src/lib/bannerPrefs';
+import { extractErrorMessage, sidePanelApi } from '@console/lib/api';
+import { useBannerPrefs } from '@console/lib/bannerPrefs';
 import {
   buildCookieHeader,
   copyToClipboard,
@@ -8,15 +8,25 @@ import {
   getBindingMeta,
   getCookieSyncStatusMeta,
   shortId,
-} from '@src/lib/format';
+} from '@console/lib/format';
 import type {
+  AccountCreateMode,
   BrowserCookieInput,
   PendingSiteDecision,
   SiteBindingState,
   SiteDecisionAction,
   SiteSummaryView,
 } from '@sessionmesh/shared';
-import { Button, Input } from '@sessionmesh/ui';
+import {
+  Button,
+  DropdownMenu,
+  DropdownMenuContent,
+  DropdownMenuItem,
+  DropdownMenuSeparator,
+  DropdownMenuTrigger,
+  Input,
+  Label,
+} from '@sessionmesh/ui';
 import {
   AlertTriangle,
   Ban,
@@ -31,12 +41,17 @@ import {
   GitBranch,
   Globe,
   Loader2,
+  MoreHorizontal,
   Plus,
   RefreshCw,
+  Repeat,
   ShieldAlert,
+  ShieldBan,
   Tag,
+  Trash2,
   Unlink,
   Upload,
+  UserPlus,
   Users,
   X,
 } from 'lucide-react';
@@ -55,9 +70,13 @@ import type { UnmanageSiteScope } from './UnmanageSiteModal';
 export interface SitesAndCookiesTabProps {
   globalSearch: string;
   initialSiteKey?: string | null;
+  initialTrackId?: string | null;
   onConsumeInitialSite?: () => void;
   onStatusChanged: () => Promise<void> | void;
   refreshSignal: number;
+  layout?: 'compact' | 'wide';
+  onOpenAccounts?: (siteKey?: string) => void;
+  onOpenLocalStorage?: (siteKey: string, trackId?: string, trackLabel?: string) => void;
 }
 
 type BindingFilter = 'ALL' | SiteBindingState;
@@ -85,15 +104,20 @@ const SiteFavicon: React.FC<{ url?: string; siteKey: string }> = ({ url, siteKey
 export const SitesAndCookiesTab: React.FC<SitesAndCookiesTabProps> = ({
   globalSearch,
   initialSiteKey,
+  initialTrackId,
   onConsumeInitialSite,
   onStatusChanged,
   refreshSignal,
+  layout = 'compact',
+  onOpenAccounts,
+  onOpenLocalStorage,
 }) => {
   const [sites, setSites] = useState<SiteSummaryView[]>([]);
   const [pendingDecisions, setPendingDecisions] = useState<PendingSiteDecision[]>([]);
   const [loading, setLoading] = useState(true);
   const [bindingFilter, setBindingFilter] = useState<BindingFilter>('ALL');
   const [selectedSiteKey, setSelectedSiteKey] = useState<string | null>(null);
+  const [selectedTrackId, setSelectedTrackId] = useState<string | null>(null);
   const [selectedPendingKeys, setSelectedPendingKeys] = useState<Set<string>>(new Set());
   const [busyKey, setBusyKey] = useState<string | null>(null);
 
@@ -102,9 +126,18 @@ export const SitesAndCookiesTab: React.FC<SitesAndCookiesTabProps> = ({
   const [unmanageTargetSite, setUnmanageTargetSite] = useState<string | null>(null);
   const [importSiteKey, setImportSiteKey] = useState<string | undefined>(undefined);
   const [importModalOpen, setImportModalOpen] = useState(false);
-  const [renameTarget, setRenameTarget] = useState<{ siteKey: string; trackId: string; label: string } | null>(null);
+  const [renameTarget, setRenameTarget] = useState<{
+    siteKey: string;
+    trackId: string;
+    label: string;
+    accountNote: string;
+  } | null>(null);
   const [splitTargetSite, setSplitTargetSite] = useState<string | null>(null);
   const [splitLabel, setSplitLabel] = useState('');
+  const [createAcctSite, setCreateAcctSite] = useState<string | null>(null);
+  const [createAcctMode, setCreateAcctMode] = useState<AccountCreateMode>('clean_new');
+  const [createAcctLabel, setCreateAcctLabel] = useState('');
+  const [createAcctNote, setCreateAcctNote] = useState('');
 
   const { isBannerVisible, dismissBanner } = useBannerPrefs();
 
@@ -135,9 +168,10 @@ export const SitesAndCookiesTab: React.FC<SitesAndCookiesTabProps> = ({
   useEffect(() => {
     if (initialSiteKey && sites.some(s => s.siteKey === initialSiteKey)) {
       setSelectedSiteKey(initialSiteKey);
+      setSelectedTrackId(initialTrackId || null);
       onConsumeInitialSite?.();
     }
-  }, [initialSiteKey, sites, onConsumeInitialSite]);
+  }, [initialSiteKey, initialTrackId, sites, onConsumeInitialSite]);
 
   const handleAfterMutation = async () => {
     await loadData();
@@ -327,12 +361,15 @@ export const SitesAndCookiesTab: React.FC<SitesAndCookiesTabProps> = ({
     if (!renameTarget || !renameTarget.label.trim()) return;
     setBusyKey(`rename:${renameTarget.siteKey}`);
     try {
-      await sidePanelApi.renameSiteTrack(renameTarget.siteKey, renameTarget.trackId, renameTarget.label.trim());
-      toast.success('轨道名称已更新');
+      await sidePanelApi.updateSiteTrack(renameTarget.siteKey, renameTarget.trackId, {
+        label: renameTarget.label.trim(),
+        accountNote: renameTarget.accountNote.trim(),
+      });
+      toast.success('账号信息已更新');
       setRenameTarget(null);
       await handleAfterMutation();
     } catch (err) {
-      toast.error(`重命名失败：${extractErrorMessage(err)}`);
+      toast.error(`更新失败：${extractErrorMessage(err)}`);
     } finally {
       setBusyKey(null);
     }
@@ -349,6 +386,58 @@ export const SitesAndCookiesTab: React.FC<SitesAndCookiesTabProps> = ({
       await handleAfterMutation();
     } catch (err) {
       toast.error(`拆分独立轨道失败：${extractErrorMessage(err)}`);
+    } finally {
+      setBusyKey(null);
+    }
+  };
+
+  const handleRotateAccount = async (siteKey: string) => {
+    setBusyKey(`rotate:${siteKey}`);
+    try {
+      const res = await sidePanelApi.rotateSiteTrack(siteKey, 'next');
+      toast.success(`${siteKey} 已轮换至账号「${res.track.label}」(${res.index}/${res.total})`);
+      await handleAfterMutation();
+    } catch (err) {
+      toast.error(`轮换账号失败：${extractErrorMessage(err)}`);
+    } finally {
+      setBusyKey(null);
+    }
+  };
+
+  const handleConfirmCreateAccount = async () => {
+    if (!createAcctSite) return;
+    setBusyKey(`create-acct:${createAcctSite}`);
+    try {
+      const created = await sidePanelApi.createSiteAccountTrack(createAcctSite, {
+        mode: createAcctMode,
+        label: createAcctLabel.trim() || undefined,
+        accountNote: createAcctNote.trim() || undefined,
+        triggerRefresh: createAcctMode === 'clean_new',
+      });
+      toast.success(
+        createAcctMode === 'clean_new'
+          ? `已保存原账号并切换至空白账号「${created.label}」，请在网页登录新账号`
+          : `已将当前登录态另存为账号「${created.label}」`,
+      );
+      setCreateAcctSite(null);
+      setCreateAcctLabel('');
+      setCreateAcctNote('');
+      await handleAfterMutation();
+    } catch (err) {
+      toast.error(`创建账号失败：${extractErrorMessage(err)}`);
+    } finally {
+      setBusyKey(null);
+    }
+  };
+
+  const handleDeleteAccount = async (siteKey: string, trackId: string, label: string) => {
+    setBusyKey(`del-acct:${trackId}`);
+    try {
+      await sidePanelApi.deleteSiteTrack(siteKey, trackId);
+      toast.success(`已移除账号轨道「${label}」`);
+      await handleAfterMutation();
+    } catch (err) {
+      toast.error(`移除账号失败：${extractErrorMessage(err)}`);
     } finally {
       setBusyKey(null);
     }
@@ -375,7 +464,13 @@ export const SitesAndCookiesTab: React.FC<SitesAndCookiesTabProps> = ({
       <CookieDetailView
         site={activeSite}
         globalSearch={globalSearch}
-        onBack={() => setSelectedSiteKey(null)}
+        initialTrackId={selectedTrackId}
+        layout={layout}
+        onOpenLocalStorage={onOpenLocalStorage}
+        onBack={() => {
+          setSelectedSiteKey(null);
+          setSelectedTrackId(null);
+        }}
         onSiteMutated={handleAfterMutation}
       />
     );
@@ -389,6 +484,10 @@ export const SitesAndCookiesTab: React.FC<SitesAndCookiesTabProps> = ({
       return (
         s.siteKey.toLowerCase().includes(query) ||
         (s.activeTrack?.label || '').toLowerCase().includes(query) ||
+        (s.activeTrack?.accountNote || '').toLowerCase().includes(query) ||
+        s.allTracks.some(
+          tr => tr.label.toLowerCase().includes(query) || (tr.accountNote || '').toLowerCase().includes(query),
+        ) ||
         (s.sourceDeviceName || '').toLowerCase().includes(query)
       );
     })
@@ -398,7 +497,7 @@ export const SitesAndCookiesTab: React.FC<SitesAndCookiesTabProps> = ({
     pendingDecisions.length > 0 && pendingDecisions.every(p => selectedPendingKeys.has(p.siteKey));
 
   return (
-    <div className="flex h-full flex-col overflow-y-auto p-3 space-y-3">
+    <div className={layout === 'wide' ? 'space-y-4' : 'flex h-full flex-col overflow-y-auto p-3 space-y-3'}>
       {/* Pending Site Decisions Queue */}
       {pendingDecisions.length > 0 ? (
         <section className="rounded-xl border border-amber-500/40 bg-amber-500/[0.07] p-3 space-y-2.5">
@@ -721,19 +820,23 @@ export const SitesAndCookiesTab: React.FC<SitesAndCookiesTabProps> = ({
           }
         />
       ) : (
-        <div className="space-y-2.5">
+        <div className={layout === 'wide' ? 'grid gap-3 xl:grid-cols-2' : 'space-y-2.5'}>
           {filteredSites.map(site => {
             const bindingMeta = getBindingMeta(site.binding.state);
             const syncMeta = getCookieSyncStatusMeta(site.syncStatus);
+            const isBlacklisted = site.binding.state === 'BLACKLISTED';
             return (
               <div
                 key={site.siteKey}
-                className="rounded-xl border border-border bg-card p-3 transition-colors hover:border-primary/40 space-y-2.5">
+                className="flex flex-col justify-between rounded-xl border border-border bg-card p-3 transition-colors hover:border-primary/40 space-y-2.5">
                 {/* Clickable Main Site Header */}
                 <div className="flex items-start justify-between gap-2">
                   <button
                     type="button"
-                    onClick={() => setSelectedSiteKey(site.siteKey)}
+                    onClick={() => {
+                      setSelectedSiteKey(site.siteKey);
+                      setSelectedTrackId(site.activeTrack?.trackId || null);
+                    }}
                     className="group flex flex-1 items-start gap-2.5 text-left min-w-0">
                     <SiteFavicon url={site.favIconUrl} siteKey={site.siteKey} />
                     <div className="min-w-0 flex-1">
@@ -743,6 +846,9 @@ export const SitesAndCookiesTab: React.FC<SitesAndCookiesTabProps> = ({
                         </span>
                         <StatusBadge tone={bindingMeta.tone}>{bindingMeta.label}</StatusBadge>
                         <StatusBadge tone={syncMeta.tone}>{syncMeta.label}</StatusBadge>
+                        {site.allTracks.length > 1 ? (
+                          <StatusBadge tone="primary">{site.allTracks.length} 账号</StatusBadge>
+                        ) : null}
                         {site.rollingTokenDamped ? (
                           <StatusBadge tone="warning">
                             <ShieldAlert className="h-3 w-3" />
@@ -757,6 +863,11 @@ export const SitesAndCookiesTab: React.FC<SitesAndCookiesTabProps> = ({
                           <GitBranch className="h-3 w-3 text-primary" />
                           {site.activeTrack?.label || '未绑定轨道'}
                         </span>
+                        {site.activeTrack?.accountNote ? (
+                          <span className="truncate max-w-[160px] text-[10px] text-muted-foreground">
+                            ({site.activeTrack.accountNote})
+                          </span>
+                        ) : null}
                         {site.activeTrack ? (
                           <span className="inline-flex items-center gap-0.5">
                             <Users className="h-3 w-3" />
@@ -787,145 +898,199 @@ export const SitesAndCookiesTab: React.FC<SitesAndCookiesTabProps> = ({
                     variant="ghost"
                     size="sm"
                     className="h-7 px-1.5 text-xs shrink-0 text-primary"
-                    onClick={() => setSelectedSiteKey(site.siteKey)}>
-                    详情
+                    onClick={() => {
+                      setSelectedSiteKey(site.siteKey);
+                      setSelectedTrackId(site.activeTrack?.trackId || null);
+                    }}>
+                    Cookies
                     <ChevronRight className="ml-0.5 h-3.5 w-3.5" />
                   </Button>
                 </div>
 
-                {/* Track Controls & Site Actions */}
-                <div className="flex flex-wrap items-center gap-1.5 pt-2 border-t border-border/60">
-                  {site.allTracks.length > 0 ? (
-                    <select
-                      aria-label={`切换 ${site.siteKey} 的同步轨道`}
-                      value={site.activeTrack?.trackId || ''}
-                      disabled={busyKey === `track:${site.siteKey}`}
-                      onChange={e => handleSwitchTrack(site.siteKey, e.target.value)}
-                      className="h-6 max-w-[165px] truncate rounded border border-input bg-background px-1.5 text-[11px] text-foreground focus:outline-none focus:ring-1 focus:ring-ring">
-                      {site.allTracks.map(tr => (
-                        <option key={tr.trackId} value={tr.trackId}>
-                          {tr.label} ({tr.memberDeviceIds.length}设备·{tr.cookieCount}条)
-                        </option>
-                      ))}
-                    </select>
-                  ) : null}
+                {/* Clean Track Controls & Overflow Action Menu */}
+                <div className="flex flex-wrap items-center justify-between gap-1.5 pt-2 border-t border-border/60">
+                  {isBlacklisted ? (
+                    <span className="inline-flex items-center gap-1 text-[11px] text-muted-foreground">
+                      <ShieldBan className="h-3.5 w-3.5 text-rose-500" />
+                      已加入黑名单，已阻断同步与多账号轮换
+                    </span>
+                  ) : (
+                    <div className="flex flex-wrap items-center gap-1.5 min-w-0">
+                      {site.allTracks.length > 0 ? (
+                        <select
+                          aria-label={`切换 ${site.siteKey} 的同步轨道`}
+                          value={site.activeTrack?.trackId || ''}
+                          disabled={busyKey === `track:${site.siteKey}`}
+                          onChange={e => handleSwitchTrack(site.siteKey, e.target.value)}
+                          className="h-6 max-w-[165px] truncate rounded border border-input bg-background px-1.5 text-[11px] text-foreground focus:outline-none focus:ring-1 focus:ring-ring">
+                          {site.allTracks.map((tr, idx) => (
+                            <option key={tr.trackId} value={tr.trackId}>
+                              #{idx + 1} {tr.label} ({tr.cookieCount}条)
+                            </option>
+                          ))}
+                        </select>
+                      ) : null}
 
-                  <Button
-                    variant="outline"
-                    size="sm"
-                    className="h-6 px-1.5 text-[11px]"
-                    onClick={() => {
-                      setSplitTargetSite(site.siteKey);
-                      setSplitLabel('');
-                    }}
-                    title="拆分为独立维护轨道">
-                    <GitBranch className="mr-1 h-3 w-3" />
-                    独立
-                  </Button>
+                      {site.allTracks.length > 1 ? (
+                        <Button
+                          variant="default"
+                          size="sm"
+                          className="h-6 px-2 text-[11px]"
+                          disabled={busyKey === `rotate:${site.siteKey}`}
+                          onClick={() => handleRotateAccount(site.siteKey)}
+                          title="按顺序一键轮换到下一个账号并刷新页面">
+                          <Repeat className="mr-1 h-3 w-3" />
+                          轮换
+                        </Button>
+                      ) : null}
 
-                  {site.activeTrack ? (
-                    <Button
-                      variant="outline"
-                      size="sm"
-                      className="h-6 px-1.5 text-[11px]"
-                      onClick={() =>
-                        setRenameTarget({
-                          siteKey: site.siteKey,
-                          trackId: site.activeTrack!.trackId,
-                          label: site.activeTrack!.label,
-                        })
-                      }
-                      title="重命名轨道">
-                      <Tag className="mr-1 h-3 w-3" />
-                      重命名
-                    </Button>
-                  ) : null}
+                      <Button
+                        variant="outline"
+                        size="sm"
+                        className="h-6 px-2 text-[11px]"
+                        onClick={() => {
+                          setCreateAcctSite(site.siteKey);
+                          setCreateAcctMode('clean_new');
+                          setCreateAcctLabel('');
+                          setCreateAcctNote('');
+                        }}
+                        title="新增多账号（清空页面登录新号 / 保存当前登录态）">
+                        <UserPlus className="mr-1 h-3 w-3" />
+                        新账号
+                      </Button>
 
-                  <Button
-                    variant="outline"
-                    size="sm"
-                    className="h-6 px-1.5 text-[11px]"
-                    disabled={busyKey === `sync:push:${site.siteKey}`}
-                    onClick={() => handleSiteSync(site.siteKey, 'push')}
-                    title="推送本机此站点变更">
-                    <CloudUpload className="mr-1 h-3 w-3" />推
-                  </Button>
+                      <Button
+                        variant="outline"
+                        size="sm"
+                        className="h-6 px-1.5 text-[11px]"
+                        disabled={busyKey === `sync:push:${site.siteKey}`}
+                        onClick={() => handleSiteSync(site.siteKey, 'push')}
+                        title="推送本机此站点变更">
+                        <CloudUpload className="mr-0.5 h-3 w-3" />推
+                      </Button>
 
-                  <Button
-                    variant="outline"
-                    size="sm"
-                    className="h-6 px-1.5 text-[11px]"
-                    disabled={busyKey === `sync:pull:${site.siteKey}`}
-                    onClick={() => handleSiteSync(site.siteKey, 'pull')}
-                    title="拉取此站点远端最新状态">
-                    <CloudDownload className="mr-1 h-3 w-3" />拉
-                  </Button>
+                      <Button
+                        variant="outline"
+                        size="sm"
+                        className="h-6 px-1.5 text-[11px]"
+                        disabled={busyKey === `sync:pull:${site.siteKey}`}
+                        onClick={() => handleSiteSync(site.siteKey, 'pull')}
+                        title="拉取此站点远端最新状态">
+                        <CloudDownload className="mr-0.5 h-3 w-3" />拉
+                      </Button>
+                    </div>
+                  )}
 
-                  <Button
-                    variant="outline"
-                    size="sm"
-                    className="h-6 px-1.5 text-[11px]"
-                    onClick={() => handleCopySiteCookies(site.siteKey, false)}
-                    title="复制 Cookie Header (name=value; ...)">
-                    <Copy className="mr-1 h-3 w-3" />
-                    Header
-                  </Button>
+                  <div className="flex items-center gap-1 shrink-0">
+                    {onOpenAccounts && !isBlacklisted ? (
+                      <Button
+                        variant="ghost"
+                        size="sm"
+                        className="h-6 px-1.5 text-[11px] text-muted-foreground hover:text-primary"
+                        onClick={() => onOpenAccounts(site.siteKey)}
+                        title="在多账号管理中心管理该站全部账号">
+                        <Users className="mr-1 h-3 w-3" />
+                        账号
+                      </Button>
+                    ) : null}
 
-                  <Button
-                    variant="outline"
-                    size="sm"
-                    className="h-6 px-1.5 text-[11px]"
-                    onClick={() => handleCopySiteCookies(site.siteKey, true)}
-                    title="复制 Cookies JSON">
-                    <FileJson className="mr-1 h-3 w-3" />
-                    JSON
-                  </Button>
-
-                  <Button
-                    variant="outline"
-                    size="sm"
-                    className="h-6 px-1.5 text-[11px]"
-                    onClick={() => handleExportSiteCookies(site.siteKey)}
-                    title="导出 Cookies JSON 文件">
-                    <Download className="h-3 w-3" />
-                  </Button>
-
-                  <Button
-                    variant="outline"
-                    size="sm"
-                    className="h-6 px-1.5 text-[11px]"
-                    onClick={() => {
-                      setImportSiteKey(site.siteKey);
-                      setImportModalOpen(true);
-                    }}
-                    title="导入 Cookies JSON">
-                    <Upload className="h-3 w-3" />
-                  </Button>
-
-                  {site.binding.state !== 'BLACKLISTED' && site.binding.state !== 'UNMANAGED' ? (
-                    <Button
-                      variant="ghost"
-                      size="sm"
-                      className="h-6 px-1.5 text-[11px] text-amber-700 hover:bg-amber-500/10 hover:text-amber-700 dark:text-amber-400 dark:hover:text-amber-300"
-                      onClick={() => setUnmanageTargetSite(site.siteKey)}
-                      title="移出本机管理或从整个同步空间移除">
-                      <Unlink className="mr-1 h-3 w-3" />
-                      移出管理
-                    </Button>
-                  ) : null}
-
-                  {site.binding.state !== 'BLACKLISTED' ? (
-                    <Button
-                      variant="ghost"
-                      size="sm"
-                      className="h-6 px-1.5 text-[11px] text-rose-600 hover:bg-rose-500/10 hover:text-rose-600"
-                      disabled={busyKey === `bl:${site.siteKey}`}
-                      onClick={() => handleQuickBlacklist(site.siteKey, 'device')}
-                      title="快捷加入本机黑名单">
-                      <Ban className="mr-1 h-3 w-3" />
-                      拉黑
-                    </Button>
-                  ) : null}
+                    <DropdownMenu modal={false}>
+                      <DropdownMenuTrigger asChild>
+                        <Button variant="outline" size="sm" className="h-6 px-1.5 text-[11px]" title="更多站点操作">
+                          <MoreHorizontal className="h-3.5 w-3.5" />
+                        </Button>
+                      </DropdownMenuTrigger>
+                      <DropdownMenuContent align="end" className="w-48">
+                        <DropdownMenuItem onClick={() => handleCopySiteCookies(site.siteKey, false)}>
+                          <Copy className="mr-2 h-3.5 w-3.5" />
+                          复制 Cookie Header
+                        </DropdownMenuItem>
+                        <DropdownMenuItem onClick={() => handleCopySiteCookies(site.siteKey, true)}>
+                          <FileJson className="mr-2 h-3.5 w-3.5" />
+                          复制 Cookies JSON
+                        </DropdownMenuItem>
+                        <DropdownMenuItem onClick={() => handleExportSiteCookies(site.siteKey)}>
+                          <Download className="mr-2 h-3.5 w-3.5" />
+                          导出 Cookies JSON
+                        </DropdownMenuItem>
+                        <DropdownMenuItem
+                          onClick={() => {
+                            setImportSiteKey(site.siteKey);
+                            setImportModalOpen(true);
+                          }}>
+                          <Upload className="mr-2 h-3.5 w-3.5" />
+                          导入 Cookies JSON
+                        </DropdownMenuItem>
+                        {onOpenLocalStorage ? (
+                          <DropdownMenuItem
+                            onClick={() =>
+                              onOpenLocalStorage(site.siteKey, site.activeTrack?.trackId, site.activeTrack?.label)
+                            }>
+                            <Database className="mr-2 h-3.5 w-3.5" />
+                            查看 LocalStorage
+                          </DropdownMenuItem>
+                        ) : null}
+                        {!isBlacklisted ? (
+                          <>
+                            <DropdownMenuSeparator />
+                            {site.activeTrack ? (
+                              <DropdownMenuItem
+                                onClick={() =>
+                                  setRenameTarget({
+                                    siteKey: site.siteKey,
+                                    trackId: site.activeTrack!.trackId,
+                                    label: site.activeTrack!.label,
+                                    accountNote: site.activeTrack!.accountNote || '',
+                                  })
+                                }>
+                                <Tag className="mr-2 h-3.5 w-3.5" />
+                                编辑账号名称与备注
+                              </DropdownMenuItem>
+                            ) : null}
+                            <DropdownMenuItem
+                              onClick={() => {
+                                setSplitTargetSite(site.siteKey);
+                                setSplitLabel('');
+                              }}>
+                              <GitBranch className="mr-2 h-3.5 w-3.5" />
+                              拆分为独立维护轨道
+                            </DropdownMenuItem>
+                            {site.activeTrack && site.allTracks.length > 1 ? (
+                              <DropdownMenuItem
+                                className="text-rose-600 focus:text-rose-600"
+                                disabled={busyKey === `del-acct:${site.activeTrack.trackId}`}
+                                onClick={() =>
+                                  handleDeleteAccount(site.siteKey, site.activeTrack!.trackId, site.activeTrack!.label)
+                                }>
+                                <Trash2 className="mr-2 h-3.5 w-3.5" />
+                                删除当前账号
+                              </DropdownMenuItem>
+                            ) : null}
+                          </>
+                        ) : null}
+                        {site.binding.state !== 'BLACKLISTED' && site.binding.state !== 'UNMANAGED' ? (
+                          <>
+                            <DropdownMenuSeparator />
+                            <DropdownMenuItem
+                              className="text-amber-700 focus:text-amber-700 dark:text-amber-400"
+                              onClick={() => setUnmanageTargetSite(site.siteKey)}>
+                              <Unlink className="mr-2 h-3.5 w-3.5" />
+                              移出同步管理
+                            </DropdownMenuItem>
+                          </>
+                        ) : null}
+                        {!isBlacklisted ? (
+                          <DropdownMenuItem
+                            className="text-rose-600 focus:text-rose-600"
+                            disabled={busyKey === `bl:${site.siteKey}`}
+                            onClick={() => handleQuickBlacklist(site.siteKey, 'device')}>
+                            <Ban className="mr-2 h-3.5 w-3.5" />
+                            加入本机黑名单
+                          </DropdownMenuItem>
+                        ) : null}
+                      </DropdownMenuContent>
+                    </DropdownMenu>
+                  </div>
                 </div>
               </div>
             );
@@ -953,12 +1118,12 @@ export const SitesAndCookiesTab: React.FC<SitesAndCookiesTabProps> = ({
         onImport={handleImportCookies}
       />
 
-      {/* Rename Track Modal */}
+      {/* Edit Account Name & Note Modal */}
       <Modal
         open={!!renameTarget}
         onClose={() => setRenameTarget(null)}
-        title={`重命名轨道 (${renameTarget?.siteKey || ''})`}
-        description="为该站点轨道设置易于辨认的别名，如「公司账号」「个人主号」。"
+        title={`编辑账号信息 (${renameTarget?.siteKey || ''})`}
+        description="设置账号别名与备注（如「公司账号」「主号 / 手机号尾号 1234」）。"
         footer={
           <>
             <Button variant="outline" size="sm" onClick={() => setRenameTarget(null)}>
@@ -969,14 +1134,36 @@ export const SitesAndCookiesTab: React.FC<SitesAndCookiesTabProps> = ({
             </Button>
           </>
         }>
-        <Input
-          value={renameTarget?.label || ''}
-          onChange={e => setRenameTarget(prev => (prev ? { ...prev, label: e.target.value } : null))}
-          placeholder="输入轨道名称"
-          onKeyDown={e => {
-            if (e.key === 'Enter') handleConfirmRename();
-          }}
-        />
+        <div className="space-y-3 text-xs">
+          <div className="space-y-1">
+            <Label htmlFor="sites-rename-label" className="text-xs">
+              账号名称 *
+            </Label>
+            <Input
+              id="sites-rename-label"
+              value={renameTarget?.label || ''}
+              onChange={e => setRenameTarget(prev => (prev ? { ...prev, label: e.target.value } : null))}
+              placeholder="输入账号名称"
+              onKeyDown={e => {
+                if (e.key === 'Enter') void handleConfirmRename();
+              }}
+            />
+          </div>
+          <div className="space-y-1">
+            <Label htmlFor="sites-rename-note" className="text-xs">
+              账号备注（可选）
+            </Label>
+            <Input
+              id="sites-rename-note"
+              value={renameTarget?.accountNote || ''}
+              onChange={e => setRenameTarget(prev => (prev ? { ...prev, accountNote: e.target.value } : null))}
+              placeholder="例如：管理员权限 / 绑定邮箱或尾号"
+              onKeyDown={e => {
+                if (e.key === 'Enter') void handleConfirmRename();
+              }}
+            />
+          </div>
+        </div>
       </Modal>
 
       {/* Split Independent Track Modal */}
@@ -1003,6 +1190,78 @@ export const SitesAndCookiesTab: React.FC<SitesAndCookiesTabProps> = ({
             if (e.key === 'Enter') handleConfirmSplit();
           }}
         />
+      </Modal>
+      {/* Create Multi-Account Track Modal */}
+      <Modal
+        open={!!createAcctSite}
+        onClose={() => setCreateAcctSite(null)}
+        title={`新增账号 (${createAcctSite || ''})`}
+        description="支持无损保存当前登录态并清空浏览器以登录新账号（不会使原账号服务端登录态失效），方便随时一键轮换。"
+        footer={
+          <>
+            <Button variant="outline" size="sm" onClick={() => setCreateAcctSite(null)}>
+              取消
+            </Button>
+            <Button
+              size="sm"
+              disabled={busyKey === `create-acct:${createAcctSite || ''}`}
+              onClick={handleConfirmCreateAccount}>
+              {createAcctMode === 'clean_new' ? '创建并清空页面去登录' : '保存当前登录态'}
+            </Button>
+          </>
+        }>
+        <div className="space-y-3 text-xs">
+          <div className="space-y-1.5">
+            <div className="flex items-start gap-2 rounded-lg border border-border p-2.5 hover:bg-muted/30">
+              <input
+                id="sites-acct-mode-clean"
+                type="radio"
+                name="create-acct-mode"
+                checked={createAcctMode === 'clean_new'}
+                onChange={() => setCreateAcctMode('clean_new')}
+                className="mt-0.5 cursor-pointer accent-primary"
+              />
+              <label htmlFor="sites-acct-mode-clean" className="min-w-0 flex-1 cursor-pointer">
+                <span className="block font-medium text-foreground">新建空白账号（清空当前页面重新登录）</span>
+                <span className="block text-[11px] text-muted-foreground">
+                  推荐：自动保护当前账号登录态，仅清空本机浏览器对应 Cookie 并刷新网页以登录第二个账号
+                </span>
+              </label>
+            </div>
+            <div className="flex items-start gap-2 rounded-lg border border-border p-2.5 hover:bg-muted/30">
+              <input
+                id="sites-acct-mode-save"
+                type="radio"
+                name="create-acct-mode"
+                checked={createAcctMode === 'save_current'}
+                onChange={() => setCreateAcctMode('save_current')}
+                className="mt-0.5 cursor-pointer accent-primary"
+              />
+              <label htmlFor="sites-acct-mode-save" className="min-w-0 flex-1 cursor-pointer">
+                <span className="block font-medium text-foreground">将当前浏览器登录态另存为新账号</span>
+                <span className="block text-[11px] text-muted-foreground">
+                  将当前网页已登录的 Cookie 复制保存为一条新的命名账号轨道
+                </span>
+              </label>
+            </div>
+          </div>
+          <Input
+            value={createAcctLabel}
+            onChange={e => setCreateAcctLabel(e.target.value)}
+            placeholder="账号名称（例如：超级管理员 / 运营号 B / 测试商户）"
+            onKeyDown={e => {
+              if (e.key === 'Enter') void handleConfirmCreateAccount();
+            }}
+          />
+          <Input
+            value={createAcctNote}
+            onChange={e => setCreateAcctNote(e.target.value)}
+            placeholder="账号备注（可选，如 角色权限 / 绑定邮箱或尾号）"
+            onKeyDown={e => {
+              if (e.key === 'Enter') void handleConfirmCreateAccount();
+            }}
+          />
+        </div>
       </Modal>
     </div>
   );

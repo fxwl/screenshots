@@ -212,25 +212,48 @@ export class ChromeBrowserAdapter implements BrowserApiAdapter {
     }
   };
 
-  async getAllCookies(filter?: { domain?: string; url?: string; storeId?: string }): Promise<BrowserCookieInput[]> {
-    return new Promise<BrowserCookieInput[]>(resolve => {
-      const details: chrome.cookies.GetAllDetails = {};
-      if (filter?.domain) details.domain = filter.domain;
-      if (filter?.url) details.url = filter.url;
-      if (filter?.storeId && filter.storeId !== 'default') details.storeId = filter.storeId;
-
+  private getAllCookiesOnce(
+    details: chrome.cookies.GetAllDetails & { partitionKey?: Record<string, unknown> },
+  ): Promise<{ cookies: BrowserCookieInput[]; error?: string }> {
+    return new Promise(resolve => {
       try {
-        chrome.cookies.getAll(details, cookies => {
-          if (chrome.runtime.lastError || !cookies) {
-            resolve([]);
+        chrome.cookies.getAll(details as chrome.cookies.GetAllDetails, cookies => {
+          const lastError = chrome.runtime.lastError;
+          if (lastError) {
+            resolve({ cookies: [], error: lastError.message || 'cookies.getAll failed' });
             return;
           }
-          resolve(cookies.map(c => toBrowserCookieInput(c as ChromeCookieWithPartition)));
+          resolve({
+            cookies: (cookies ?? []).map(c => toBrowserCookieInput(c as ChromeCookieWithPartition)),
+          });
         });
-      } catch {
-        resolve([]);
+      } catch (err) {
+        resolve({ cookies: [], error: err instanceof Error ? err.message : String(err) });
       }
     });
+  }
+
+  async getAllCookies(filter?: { domain?: string; url?: string; storeId?: string }): Promise<BrowserCookieInput[]> {
+    const details: chrome.cookies.GetAllDetails & { partitionKey?: Record<string, unknown> } = {};
+    if (filter?.domain) details.domain = filter.domain;
+    if (filter?.url) details.url = filter.url;
+    if (filter?.storeId && filter.storeId !== 'default') details.storeId = filter.storeId;
+
+    if (this.partitionKeySupported) {
+      // Chromium omits CHIPS partitioned cookies unless partitionKey: {} is explicitly provided.
+      const withPartitions = await this.getAllCookiesOnce({ ...details, partitionKey: {} });
+      if (!withPartitions.error) {
+        return withPartitions.cookies;
+      }
+      if (isPartitionKeyUnsupportedError(withPartitions.error)) {
+        this.partitionKeySupported = false;
+      } else {
+        return [];
+      }
+    }
+
+    const unpartitioned = await this.getAllCookiesOnce(details);
+    return unpartitioned.cookies;
   }
 
   private getCookieOnce(

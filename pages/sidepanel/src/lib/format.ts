@@ -341,3 +341,41 @@ export function getDeviceStateMeta(state: 'active' | 'paused' | 'removed' | 'rev
       return { label: state, tone: 'neutral' };
   }
 }
+
+/**
+ * Parse and validate an imported Cookie JSON payload (top-level array or `{ cookies: [...] }`).
+ */
+export function parseImportedCookiesJson(parsed: unknown, fallbackDomain: string): BrowserCookieInput[] {
+  const arr = Array.isArray(parsed)
+    ? parsed
+    : parsed && typeof parsed === 'object' && Array.isArray((parsed as { cookies?: unknown }).cookies)
+      ? (parsed as { cookies: unknown[] }).cookies
+      : null;
+  if (!arr || arr.length === 0) {
+    throw new Error('JSON 必须是包含 Cookie 对象的非空数组');
+  }
+  return arr.map((raw, index) => {
+    if (!raw || typeof raw !== 'object') {
+      throw new Error(`第 ${index + 1} 项不是有效的 Cookie 对象`);
+    }
+    const item = raw as Record<string, unknown>;
+    const name = String(item.name ?? '').trim();
+    if (!name) {
+      throw new Error(`第 ${index + 1} 条 Cookie 缺少有效的 name 字段`);
+    }
+    return {
+      name,
+      value: String(item.value ?? ''),
+      domain: String(item.domain ?? fallbackDomain),
+      path: String(item.path ?? '/'),
+      secure: Boolean(item.secure ?? true),
+      httpOnly: Boolean(item.httpOnly ?? false),
+      sameSite: (item.sameSite as BrowserCookieInput['sameSite']) || 'unspecified',
+      session: Boolean(item.session ?? !item.expirationDate),
+      expirationDate: typeof item.expirationDate === 'number' ? item.expirationDate : undefined,
+      hostOnly: Boolean(item.hostOnly ?? false),
+      storeId: typeof item.storeId === 'string' && item.storeId !== 'default' ? item.storeId : undefined,
+      partitionKey: (item.partitionKey as BrowserCookieInput['partitionKey']) ?? null,
+    };
+  });
+}

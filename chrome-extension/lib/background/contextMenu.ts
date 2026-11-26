@@ -2,6 +2,7 @@ export const MENU_IDS = {
   ROOT: 'sessionmesh-root',
   OPEN_SIDEPANEL: 'sessionmesh-open-sidepanel',
   ADD_MANAGED_SITE: 'sessionmesh-add-managed-site',
+  ROTATE_SITE_ACCOUNT: 'sessionmesh-rotate-site-account',
   SYNC_CURRENT_SITE: 'sessionmesh-sync-current-site',
   TOGGLE_PAUSE: 'sessionmesh-toggle-pause',
   BLACKLIST_CURRENT_SITE: 'sessionmesh-blacklist-current-site',
@@ -10,6 +11,7 @@ export const MENU_IDS = {
 
 export interface ContextMenuActionHandlers {
   onAddManagedSite: (tabUrl?: string) => Promise<void>;
+  onRotateSiteAccount: (tabUrl?: string) => Promise<void>;
   onSyncCurrentSite: (tabUrl?: string) => Promise<void>;
   onTogglePause: () => Promise<void>;
   onBlacklistCurrentSite: (tabUrl?: string) => Promise<void>;
@@ -56,6 +58,13 @@ export function setupContextMenus(): void {
         id: MENU_IDS.ADD_MANAGED_SITE,
         parentId: MENU_IDS.ROOT,
         title: '➕ 将当前网站纳入 SessionMesh 同步管理',
+        contexts: ['all'],
+      });
+
+      createMenuSafe({
+        id: MENU_IDS.ROTATE_SITE_ACCOUNT,
+        parentId: MENU_IDS.ROOT,
+        title: '🔄 轮换当前网站下一个账号',
         contexts: ['all'],
       });
 
@@ -116,6 +125,10 @@ export function registerContextMenuListener(handlers: ContextMenuActionHandlers)
       }
       case MENU_IDS.ADD_MANAGED_SITE: {
         void handlers.onAddManagedSite(tab?.url || info.pageUrl);
+        break;
+      }
+      case MENU_IDS.ROTATE_SITE_ACCOUNT: {
+        void handlers.onRotateSiteAccount(tab?.url || info.pageUrl);
         break;
       }
       case MENU_IDS.SYNC_CURRENT_SITE: {

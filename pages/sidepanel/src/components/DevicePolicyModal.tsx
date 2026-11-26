@@ -1,5 +1,5 @@
-import { extractErrorMessage } from '@src/lib/api';
-import { parseManualSiteKeysInput } from '@src/lib/format';
+import { extractErrorMessage } from '@console/lib/api';
+import { parseManualSiteKeysInput } from '@console/lib/format';
 import type { Device, PerDeviceSyncPolicy, SyncDirection } from '@sessionmesh/shared';
 import { Button, Input, Label } from '@sessionmesh/ui';
 import { Ban, Loader2, Plus, RotateCcw, Save, Sliders, X } from 'lucide-react';

@@ -21,6 +21,8 @@ import { AutoRefreshController } from '../refresh';
 import { buildPresetBlacklistEntries, RulesEngine } from '../rules';
 import {
   DEFAULT_SPACE_SETTINGS,
+  type AccountRotationResult,
+  type ApplyVerificationResult,
   type AttentionItem,
   type BlacklistEntry,
   type BrowserApiAdapter,
@@ -30,12 +32,16 @@ import {
   type ConflictRecord,
   type ConsistencyLevel,
   type CookieRecord,
+  type CreateSiteAccountOptions,
   type DeleteScope,
   type Device,
   type DeviceCheckpoint,
   type DeviceSiteBinding,
   type DeviceStatus,
+  type EnvCookieSyncResult,
+  type EnvCookieSyncRule,
   type EventBatch,
+  type ExecuteEnvSyncInput,
   type HybridLogicalClock,
   type InitialJoinReport,
   type IntegrityReport,
@@ -44,6 +50,7 @@ import {
   type PairingPayload,
   type PendingSiteDecision,
   type PerDeviceSyncPolicy,
+  type RemoteSpacePasswordVerifyResult,
   type RemoteSpaceProbeItem,
   type SafetyUndoPoint,
   type SiteDecisionAction,
@@ -57,6 +64,7 @@ import {
   type SpaceSettings,
   type SsoDomainGroup,
   type StorageBackend,
+  type UpdateSiteTrackPatch,
   type StructuredError,
   type SyncDirection,
   type SyncEvent,
@@ -99,8 +107,17 @@ import {
   findExactBrowserCookie,
   matchesCookieIdentity,
   normalizeCookieDomain,
+  resolveEffectiveHostOnly,
 } from './CookieApplyHelper';
 import { buildEchoCookieKey, EchoSuppressor } from './EchoSuppressor';
+import {
+  envRuleMatchesUrl,
+  isLocalOrSingleLabelHost,
+  parseEnvTarget,
+  selectAndMapEnvCookies,
+  type ParsedEnvTarget,
+  type SourceCookieCandidate,
+} from './EnvCookieMapper';
 import {
   backupFilePath,
   backupsDir,
@@ -128,6 +145,37 @@ const GLOBAL_NS = 'global';
 const CURRENT_SCHEMA_VERSION = 2;
 const MAX_HISTORY_EVENTS = 2000;
 const MAX_UNDO_POINTS = 20;
+const OPAQUE_SPACE_ID_RE = /^sp_[a-f0-9]{16,64}$/i;
+
+function isBlockedWebdavSelfTarget(webdavUrl: string, parsedTarget: ParsedEnvTarget): boolean {
+  const parsedWebdav = parseEnvTarget(webdavUrl);
+  if (!parsedWebdav) return false;
+  if (parsedTarget.host !== parsedWebdav.host) return false;
+  if (
+    isLocalOrSingleLabelHost(parsedWebdav.host) &&
+    parsedWebdav.port &&
+    parsedTarget.port &&
+    parsedWebdav.port !== parsedTarget.port
+  ) {
+    return false;
+  }
+  return true;
+}
+
+function sanitizeShortLabel(raw: string | undefined, maxLen = 80): string {
+  if (!raw) return '';
+  // Strip ASCII control characters (newlines, tabs, NUL, etc.) and collapse whitespace
+  const cleaned = raw
+    .split('')
+    .filter((ch) => {
+      const code = ch.charCodeAt(0);
+      return code >= 0x20 && code !== 0x7f;
+    })
+    .join('')
+    .replace(/\s+/g, ' ')
+    .trim();
+  return cleaned.length > maxLen ? cleaned.slice(0, maxLen) : cleaned;
+}
 
 interface GlobalDeviceIdentity {
   deviceId: string;
@@ -172,6 +220,7 @@ interface PersistedSpaceMeta {
   space: SyncSpace;
   rules: SpaceRuleSet;
   deviceBlacklist: BlacklistEntry[];
+  deviceEnvSyncRules?: EnvCookieSyncRule[];
   spaceMetaEtag?: string;
   globalPaused: boolean;
   lastSyncAt?: number;
@@ -188,12 +237,23 @@ interface PersistedSpaceMeta {
   dismissedCorruptedPaths?: Record<string, true>;
   dismissedApplyFailures?: Record<string, string>;
   lastSnapshotId?: string;
+  lastPushedDeviceSeq?: number;
   manifestDirty?: boolean;
   lastAutoPushAt?: number;
   autoPushBackoffUntilMs?: number;
   consecutiveTransientFailures?: number;
   appliedCookieHashes: Record<string, string>;
   appliedLsHashes: Record<string, string>;
+  pendingCleanLsBySite?: Record<string, { trackId: string; clearedOrigins: string[] }>;
+  pendingEnvLsByOrigin?: Record<
+    string,
+    {
+      items: Record<string, string>;
+      cleanTargetBeforeSync: boolean;
+      excludeKeys: string[];
+      autoReloadTarget: boolean;
+    }
+  >;
 }
 
 interface LoadedSpaceRuntime {
@@ -261,8 +321,20 @@ function defaultSpaceRules(nowMs: number): SpaceRuleSet {
     spaceBlacklist: [],
     siteOverrides: {},
     ssoGroups: [],
+    envSyncRules: [],
     updatedAt: nowMs,
   };
+}
+
+function sortSiteTracks(tracks: SiteTrack[]): SiteTrack[] {
+  return [...tracks].sort((a, b) => {
+    const ao = a.sortOrder ?? Number.MAX_SAFE_INTEGER;
+    const bo = b.sortOrder ?? Number.MAX_SAFE_INTEGER;
+    if (ao !== bo) return ao - bo;
+    const oCmp = a.originDeviceId.localeCompare(b.originDeviceId);
+    if (oCmp !== 0) return oCmp;
+    return a.trackId.localeCompare(b.trackId);
+  });
 }
 
 function normalizeOriginSafe(originOrUrl: string): string | null {
@@ -346,6 +418,8 @@ export class SyncEngine {
   private readonly deferredOnPageLeaveSites = new Set<string>();
   private readonly releasedOnPageLeaveSites = new Set<string>();
   private readonly postReloadPushMuteUntil = new Map<string, number>();
+  private readonly postTrackSwitchLeaveMuteUntil = new Map<string, number>();
+  private inAutoEnvSync = false;
 
   constructor(options: SyncEngineOptions) {
     this.storage = options.storage;
@@ -491,9 +565,11 @@ export class SyncEngine {
           spaceBlacklist: meta.rules?.spaceBlacklist ?? [],
           siteOverrides: meta.rules?.siteOverrides ?? {},
           ssoGroups: meta.rules?.ssoGroups ?? [],
+          envSyncRules: meta.rules?.envSyncRules ?? [],
           updatedAt: meta.rules?.updatedAt ?? this.now(),
         };
         meta.deviceBlacklist = meta.deviceBlacklist ?? [];
+        meta.deviceEnvSyncRules = meta.deviceEnvSyncRules ?? [];
         meta.deviceOverrides = meta.deviceOverrides ?? {};
         meta.removedTracks = meta.removedTracks ?? {};
         meta.peerDeviceEtags = meta.peerDeviceEtags ?? {};
@@ -501,6 +577,8 @@ export class SyncEngine {
         meta.corruptedPaths = meta.corruptedPaths ?? [];
         meta.appliedCookieHashes = meta.appliedCookieHashes ?? {};
         meta.appliedLsHashes = meta.appliedLsHashes ?? {};
+        meta.pendingCleanLsBySite = meta.pendingCleanLsBySite ?? {};
+        meta.pendingEnvLsByOrigin = meta.pendingEnvLsByOrigin ?? {};
         await this.storage.set(ns, 'meta', meta);
       }
 
@@ -578,12 +656,22 @@ export class SyncEngine {
       ...meta.space.settings,
       devicePolicies: { ...(meta.space.settings?.devicePolicies ?? {}) },
     };
+    meta.rules = {
+      spaceBlacklist: meta.rules?.spaceBlacklist ?? [],
+      siteOverrides: meta.rules?.siteOverrides ?? {},
+      ssoGroups: meta.rules?.ssoGroups ?? [],
+      envSyncRules: meta.rules?.envSyncRules ?? [],
+      updatedAt: meta.rules?.updatedAt ?? this.now(),
+    };
+    meta.deviceEnvSyncRules = meta.deviceEnvSyncRules ?? [];
     meta.deviceOverrides = meta.deviceOverrides ?? {};
     meta.removedTracks = meta.removedTracks ?? {};
     meta.dismissedCorruptedPaths = meta.dismissedCorruptedPaths ?? {};
     meta.dismissedApplyFailures = meta.dismissedApplyFailures ?? {};
     meta.appliedCookieHashes = meta.appliedCookieHashes ?? {};
     meta.appliedLsHashes = meta.appliedLsHashes ?? {};
+    meta.pendingCleanLsBySite = meta.pendingCleanLsBySite ?? {};
+    meta.pendingEnvLsByOrigin = meta.pendingEnvLsByOrigin ?? {};
 
     const tracks = (await this.storage.get<Record<string, SiteTrack>>(ns, 'tracks')) ?? {};
     const pendingDecisions =
@@ -626,7 +714,12 @@ export class SyncEngine {
     }
 
     const client = new WebDAVClient(entry.webdav, this.webdavClientOptions);
-    const rulesEngine = new RulesEngine(meta.space.settings, meta.rules, meta.deviceBlacklist);
+    const rulesEngine = new RulesEngine(
+      meta.space.settings,
+      meta.rules,
+      meta.deviceBlacklist,
+      meta.deviceEnvSyncRules,
+    );
     const hlcClock = new HlcClock(meta.localDevice.deviceId, storedHlc);
 
     const hasDek = Boolean(dekKeyring[meta.space.keyEpoch]);
@@ -706,6 +799,40 @@ export class SyncEngine {
       throw new Error('No active sync space configured');
     }
     return this.runtime;
+  }
+
+  private requireUnlockedRuntime(): LoadedSpaceRuntime {
+    const rt = this.requireRuntime();
+    this.getCurrentDek(rt);
+    return rt;
+  }
+
+  private async tryPushOutboundBestEffort(rt: LoadedSpaceRuntime, phase: string): Promise<void> {
+    if (
+      rt.meta.globalPaused ||
+      !this.isOnline() ||
+      rt.meta.storageFullHalted ||
+      !rt.dekKeyring[rt.meta.space.keyEpoch]
+    ) {
+      return;
+    }
+    try {
+      await this.pushOutboundInternal(rt);
+    } catch (err) {
+      const se = toStructuredError(err, phase);
+      if (se.code === 'ERR_STORAGE_FULL' || se.status === 507) {
+        rt.meta.storageFullHalted = true;
+      }
+      this.upsertRetryTask(rt, 'push_events', se.code || 'WEBDAV_PUSH_FAILED', se.message);
+      await this.logger.log({
+        spaceId: rt.spaceId,
+        level: 'warn',
+        phase,
+        code: se.code,
+        message: `Local account action succeeded, but cloud push deferred (${se.message})`,
+        timestamp: this.now(),
+      });
+    }
   }
 
   private getCurrentDek(rt: LoadedSpaceRuntime): string {
@@ -913,6 +1040,9 @@ export class SyncEngine {
     }
     if (rt.meta.space.status === 'DECRYPT_ERROR') return 'DECRYPT_ERROR';
     if (rt.meta.space.status === 'AUTH_ERROR') return 'AUTH_ERROR';
+    if (rt.meta.localDevice.state === 'removed' || rt.meta.localDevice.state === 'revoked') {
+      return 'LOCKED';
+    }
     if (rt.meta.globalPaused || rt.meta.localDevice.state === 'paused') return 'PAUSED';
     if (!this.isOnline()) return 'OFFLINE';
     if (rt.pendingOutboundEvents.length > 0) return 'PENDING';
@@ -1383,8 +1513,8 @@ export class SyncEngine {
     if (!options?.deferSyncAndPersist && resolvedCount > 0) {
       const devPolicy = this.getLocalDevicePolicy(rt);
       const canPush = devPolicy?.direction !== 'pull_only' && devPolicy?.direction !== 'disabled';
-      if (canPush && rt.pendingOutboundEvents.length > 0 && this.isOnline() && !rt.meta.storageFullHalted) {
-        await this.pushOutboundInternal(rt);
+      if (canPush && rt.pendingOutboundEvents.length > 0) {
+        await this.tryPushOutboundBestEffort(rt, 'auto_resolve_decisions');
       }
     }
 
@@ -1449,6 +1579,113 @@ export class SyncEngine {
     }
   }
 
+  async verifyRemoteSpacePassword(params: {
+    webdav: WebDAVConfig;
+    spaceId: string;
+    encryptionPassword: string;
+  }): Promise<RemoteSpacePasswordVerifyResult> {
+    await this.ensureInitialized();
+    this.registerConfigSecrets(params.webdav, params.encryptionPassword);
+
+    const trimmedSpaceId = params.spaceId.trim();
+    if (!trimmedSpaceId) {
+      throw toStructuredError(new Error('请先输入同步空间 ID'), 'verify_password');
+    }
+    if (!params.encryptionPassword || params.encryptionPassword.trim().length === 0) {
+      throw toStructuredError(new Error('请输入端到端加密主密码'), 'verify_password');
+    }
+
+    const client = new WebDAVClient(params.webdav, this.webdavClientOptions);
+    client.validateUrl();
+
+    // Verify connectivity & WebDAV credentials first so auth/network errors are never mistaken for 404
+    try {
+      await client.options('');
+    } catch (err) {
+      throw toStructuredError(err, 'verify_password', params.webdav.url);
+    }
+
+    let opaqueId: string;
+    let metaStat: WebDAVResourceStat | null = null;
+    let joinedByOpaqueId = false;
+
+    try {
+      if (OPAQUE_SPACE_ID_RE.test(trimmedSpaceId)) {
+        const directStat = await client.stat(spaceMetaPath(trimmedSpaceId));
+        if (directStat !== null) {
+          opaqueId = trimmedSpaceId;
+          metaStat = directStat;
+          joinedByOpaqueId = true;
+        } else {
+          opaqueId = await deriveOpaqueId(trimmedSpaceId, 'sp_');
+          metaStat = await client.stat(spaceMetaPath(opaqueId));
+        }
+      } else {
+        opaqueId = await deriveOpaqueId(trimmedSpaceId, 'sp_');
+        metaStat = await client.stat(spaceMetaPath(opaqueId));
+      }
+    } catch (err) {
+      throw toStructuredError(err, 'verify_password', spaceMetaPath(trimmedSpaceId));
+    }
+
+    if (metaStat === null) {
+      return { exists: false, verified: false };
+    }
+
+    const metaPath = spaceMetaPath(opaqueId);
+    const fetched = await client.getBytes(metaPath);
+
+    let aadSpaceId = trimmedSpaceId;
+    if (joinedByOpaqueId) {
+      const hintInfo = await this.readRemoteSpaceInfo(params.webdav, opaqueId);
+      if (hintInfo?.spaceId && (await deriveOpaqueId(hintInfo.spaceId, 'sp_')) === opaqueId) {
+        aadSpaceId = hintInfo.spaceId;
+      } else {
+        try {
+          const header = parseSmesHeader(fetched.bytes);
+          const suffix = `|meta|space_meta|${metaPath}`;
+          if (header.aad.endsWith(suffix)) {
+            const candidateId = header.aad.slice(0, -suffix.length);
+            if (
+              candidateId &&
+              ((await deriveOpaqueId(candidateId, 'sp_')) === opaqueId || candidateId === opaqueId)
+            ) {
+              aadSpaceId = candidateId;
+            }
+          }
+        } catch {
+          // Fall through to standard decryption error handling
+        }
+      }
+    }
+
+    const metaAad = buildSpaceMetaAad(aadSpaceId, metaPath);
+    try {
+      const descriptor = await decryptWithPassword<SpaceDescriptorPayload>(
+        fetched.bytes,
+        params.encryptionPassword,
+        metaAad,
+      );
+      if (!descriptor || descriptor.verifier !== 'SESSIONMESH_SPACE_OK') {
+        throw new Error('DECRYPT: Invalid space metadata verifier');
+      }
+      return {
+        exists: true,
+        verified: true,
+        spaceId: descriptor.spaceId || aadSpaceId,
+        spaceName: descriptor.name,
+        keyEpoch: descriptor.keyEpoch,
+      };
+    } catch {
+      return {
+        exists: true,
+        verified: false,
+        errorCode: 'DECRYPT_ERROR',
+        errorMessage: '端到端加密主密码错误，无法解密远端空间元数据，请核对后重试',
+      };
+    }
+  }
+
   async saveAndJoinSpace(params: {
     webdav: WebDAVConfig;
     spaceId: string;
@@ -1506,7 +1743,7 @@ export class SyncEngine {
     let joinedByOpaqueId = false;
 
     try {
-      if (params.spaceId.startsWith('sp_')) {
+      if (OPAQUE_SPACE_ID_RE.test(params.spaceId)) {
         const directStat = await client.stat(spaceMetaPath(params.spaceId));
         if (directStat !== null) {
           opaqueId = params.spaceId;
@@ -1770,6 +2007,8 @@ export class SyncEngine {
       corruptedPaths: [],
       appliedCookieHashes: {},
       appliedLsHashes: {},
+      pendingCleanLsBySite: {},
+      pendingEnvLsByOrigin: {},
     };
 
     const dekKeyring: Record<number, string> = {
@@ -2179,6 +2418,10 @@ export class SyncEngine {
 
   async unlockSession(encryptionPassword: string, spaceId?: string): Promise<void> {
     await this.ensureInitialized();
+    return this.enqueueOp(() => this.unlockSessionInternal(encryptionPassword, spaceId));
+  }
+
+  private async unlockSessionInternal(encryptionPassword: string, spaceId?: string): Promise<void> {
     const targetSpaceId = spaceId ?? this.activeSpaceId;
     if (!targetSpaceId || !this.spaceIndex[targetSpaceId]) {
       throw new Error('No space available to unlock');
@@ -2243,31 +2486,39 @@ export class SyncEngine {
 
   async lockSession(): Promise<void> {
     await this.ensureInitialized();
-    const rt = this.runtime;
-    if (!rt) return;
+    return this.enqueueOp(async () => {
+      const rt = this.runtime;
+      if (!rt) return;
 
-    rt.encryptionPassword = undefined;
-    rt.dekKeyring = {};
-    rt.meta.space.status = 'LOCKED';
-    if (this.keyVault) {
-      await this.keyVault.clearDek(rt.spaceId);
-    }
-    const entry = this.spaceIndex[rt.spaceId];
-    if (entry) {
-      delete entry.dekKeyring;
-    }
-    await this.persistRuntime(rt);
+      rt.encryptionPassword = undefined;
+      rt.dekKeyring = {};
+      rt.meta.space.status = 'LOCKED';
+      if (this.keyVault) {
+        await this.keyVault.clearDek(rt.spaceId);
+      }
+      const entry = this.spaceIndex[rt.spaceId];
+      if (entry) {
+        delete entry.dekKeyring;
+      }
+      await this.persistRuntime(rt);
+    });
   }
 
   async switchSpace(spaceId: string, encryptionPassword?: string): Promise<void> {
     await this.ensureInitialized();
+    if (this.runtime && this.runtime.spaceId !== spaceId) {
+      await this.changeDetector.flush();
+    }
+    return this.enqueueOp(() => this.switchSpaceInternal(spaceId, encryptionPassword));
+  }
+
+  private async switchSpaceInternal(spaceId: string, encryptionPassword?: string): Promise<void> {
     if (!this.spaceIndex[spaceId]) {
       throw new Error(`Space "${spaceId}" does not exist locally`);
     }
 
-    // Flush current space's buffered cookie changes before switching context (D-011)
+    // Persist current space before switching context (D-011)
     if (this.runtime && this.runtime.spaceId !== spaceId) {
-      await this.changeDetector.flush();
       await this.persistRuntime(this.runtime);
     }
 
@@ -2275,10 +2526,10 @@ export class SyncEngine {
     this.rollingTokenDamper.reset();
 
     const rt = await this.loadSpaceRuntime(spaceId, encryptionPassword);
+    await this.storage.set(GLOBAL_NS, 'activeSpaceId', spaceId);
     if (encryptionPassword) {
-      await this.unlockSession(encryptionPassword, spaceId);
+      await this.unlockSessionInternal(encryptionPassword, spaceId);
     } else {
-      await this.storage.set(GLOBAL_NS, 'activeSpaceId', spaceId);
       this.emitStateChange();
     }
     // Keep reference valid
@@ -2305,172 +2556,178 @@ export class SyncEngine {
 
   async renameSpace(spaceId: string, newName: string): Promise<void> {
     await this.ensureInitialized();
-    const entry = this.spaceIndex[spaceId];
-    if (!entry) throw new Error(`Space "${spaceId}" not found`);
-
     const trimmed = newName.trim();
     if (!trimmed) throw new Error('Space name cannot be empty');
 
-    const nowMs = this.now();
-    entry.name = trimmed;
-    entry.updatedAt = nowMs;
-    await this.storage.set(GLOBAL_NS, 'spaceIndex', this.spaceIndex);
+    return this.enqueueOp(async () => {
+      const entry = this.spaceIndex[spaceId];
+      if (!entry) throw new Error(`Space "${spaceId}" not found`);
 
-    if (this.runtime && this.runtime.spaceId === spaceId) {
-      const nextUpdatedAt = Math.max(nowMs, this.runtime.meta.space.updatedAt + 1);
-      this.runtime.meta.space.name = trimmed;
-      this.runtime.meta.space.updatedAt = nextUpdatedAt;
-      await this.updateRemoteSpaceMetaIfPossible(this.runtime, (desc) => ({
-        ...desc,
-        name: trimmed,
-        updatedAt: nextUpdatedAt,
-      }));
-      await this.writeRemoteSpaceInfo(this.runtime.webdav, this.runtime.meta.space.opaqueId, {
-        spaceId,
-        spaceName: trimmed,
-        updatedAt: nextUpdatedAt,
-      });
-      await this.persistRuntime(this.runtime);
-    } else {
-      const ns = spaceNs(spaceId);
-      const meta = await this.storage.get<PersistedSpaceMeta>(ns, 'meta');
-      if (meta) {
-        meta.space.name = trimmed;
-        meta.space.updatedAt = Math.max(nowMs, meta.space.updatedAt + 1);
-        await this.storage.set(ns, 'meta', meta);
+      const nowMs = this.now();
+      entry.name = trimmed;
+      entry.updatedAt = nowMs;
+      await this.storage.set(GLOBAL_NS, 'spaceIndex', this.spaceIndex);
+
+      if (this.runtime && this.runtime.spaceId === spaceId) {
+        const nextUpdatedAt = Math.max(nowMs, this.runtime.meta.space.updatedAt + 1);
+        this.runtime.meta.space.name = trimmed;
+        this.runtime.meta.space.updatedAt = nextUpdatedAt;
+        await this.updateRemoteSpaceMetaIfPossible(this.runtime, (desc) => ({
+          ...desc,
+          name: trimmed,
+          updatedAt: nextUpdatedAt,
+        }));
+        await this.writeRemoteSpaceInfo(this.runtime.webdav, this.runtime.meta.space.opaqueId, {
+          spaceId,
+          spaceName: trimmed,
+          updatedAt: nextUpdatedAt,
+        });
+        await this.persistRuntime(this.runtime);
+      } else {
+        const ns = spaceNs(spaceId);
+        const meta = await this.storage.get<PersistedSpaceMeta>(ns, 'meta');
+        if (meta) {
+          meta.space.name = trimmed;
+          meta.space.updatedAt = Math.max(nowMs, meta.space.updatedAt + 1);
+          await this.storage.set(ns, 'meta', meta);
+        }
+        await this.writeRemoteSpaceInfo(entry.webdav, entry.opaqueId, {
+          spaceId,
+          spaceName: trimmed,
+          updatedAt: nowMs,
+        });
+        this.emitStateChange();
       }
-      await this.writeRemoteSpaceInfo(entry.webdav, entry.opaqueId, {
-        spaceId,
-        spaceName: trimmed,
-        updatedAt: nowMs,
-      });
-      this.emitStateChange();
-    }
+    });
   }
 
   async rotateSpacePassword(oldPassword: string, newPassword: string): Promise<void> {
     await this.ensureInitialized();
-    const rt = this.requireRuntime();
-    this.logger.registerSecret(oldPassword);
-    this.logger.registerSecret(newPassword);
+    return this.enqueueOp(async () => {
+      const rt = this.requireRuntime();
+      this.logger.registerSecret(oldPassword);
+      this.logger.registerSecret(newPassword);
 
-    if (!newPassword || newPassword.trim().length === 0) {
-      throw new Error('New encryption password cannot be empty');
-    }
-
-    const metaPath = spaceMetaPath(rt.meta.space.opaqueId);
-    const metaAad = buildSpaceMetaAad(rt.spaceId, metaPath);
-
-    const fetched = await rt.client.getBytes(metaPath);
-    let descriptor: SpaceDescriptorPayload;
-    try {
-      descriptor = await decryptWithPassword<SpaceDescriptorPayload>(
-        fetched.bytes,
-        oldPassword,
-        metaAad,
-      );
-      if (!descriptor || descriptor.verifier !== 'SESSIONMESH_SPACE_OK') {
-        throw new Error('DECRYPT: Invalid space verifier');
+      if (!newPassword || newPassword.trim().length === 0) {
+        throw new Error('New encryption password cannot be empty');
       }
-    } catch (err) {
-      const se = toStructuredError(err, 'rotate_password', metaPath);
-      se.code = 'DECRYPT_ERROR';
-      throw se;
-    }
 
-    const newEpoch = (descriptor.keyEpoch ?? 1) + 1;
-    const newDek = await generateSpaceDekBase64();
-    const updatedKeyring: Record<number, string> = {
-      ...(descriptor.dekKeyring ?? {}),
-      [descriptor.keyEpoch]: descriptor.currentDekBase64,
-      [newEpoch]: newDek,
-    };
+      const metaPath = spaceMetaPath(rt.meta.space.opaqueId);
+      const metaAad = buildSpaceMetaAad(rt.spaceId, metaPath);
 
-    const updatedDescriptor: SpaceDescriptorPayload = {
-      ...descriptor,
-      keyEpoch: newEpoch,
-      currentDekBase64: newDek,
-      dekKeyring: updatedKeyring,
-      updatedAt: this.now(),
-    };
+      const fetched = await rt.client.getBytes(metaPath);
+      let descriptor: SpaceDescriptorPayload;
+      try {
+        descriptor = await decryptWithPassword<SpaceDescriptorPayload>(
+          fetched.bytes,
+          oldPassword,
+          metaAad,
+        );
+        if (!descriptor || descriptor.verifier !== 'SESSIONMESH_SPACE_OK') {
+          throw new Error('DECRYPT: Invalid space verifier');
+        }
+      } catch (err) {
+        const se = toStructuredError(err, 'rotate_password', metaPath);
+        se.code = 'DECRYPT_ERROR';
+        throw se;
+      }
 
-    const encrypted = await encryptWithPassword(updatedDescriptor, newPassword, metaAad, {
-      compress: true,
-      encoding: 'json',
-      iterations: this.pbkdf2Iterations,
-      keyEpoch: newEpoch,
-    });
+      const newEpoch = (descriptor.keyEpoch ?? 1) + 1;
+      const newDek = await generateSpaceDekBase64();
+      const updatedKeyring: Record<number, string> = {
+        ...(descriptor.dekKeyring ?? {}),
+        [descriptor.keyEpoch]: descriptor.currentDekBase64,
+        [newEpoch]: newDek,
+      };
 
-    const putRes = await rt.client.putBytes(metaPath, encrypted, {
-      ifMatch: normalizeEtag(fetched.etag),
-      contentType: 'application/octet-stream',
-    });
+      const updatedDescriptor: SpaceDescriptorPayload = {
+        ...descriptor,
+        keyEpoch: newEpoch,
+        currentDekBase64: newDek,
+        dekKeyring: updatedKeyring,
+        updatedAt: this.now(),
+      };
 
-    rt.encryptionPassword = newPassword;
-    rt.dekKeyring = updatedKeyring;
-    rt.meta.space.keyEpoch = newEpoch;
-    rt.meta.space.updatedAt = this.now();
-    rt.meta.spaceMetaEtag = normalizeEtag(putRes.etag);
-    rt.meta.latestError = null;
-    rt.meta.space.status = 'SYNCED';
-    rt.meta.space.status = this.computeStatus(rt);
+      const encrypted = await encryptWithPassword(updatedDescriptor, newPassword, metaAad, {
+        compress: true,
+        encoding: 'json',
+        iterations: this.pbkdf2Iterations,
+        keyEpoch: newEpoch,
+      });
 
-    if (this.keyVault && !rt.meta.space.settings.sessionLockEnabled) {
-      await this.keyVault.saveDek(rt.spaceId, newDek);
-    }
+      const putRes = await rt.client.putBytes(metaPath, encrypted, {
+        ifMatch: normalizeEtag(fetched.etag),
+        contentType: 'application/octet-stream',
+      });
 
-    await this.uploadDeviceManifest(rt);
-    await this.persistRuntime(rt);
+      rt.encryptionPassword = newPassword;
+      rt.dekKeyring = updatedKeyring;
+      rt.meta.space.keyEpoch = newEpoch;
+      rt.meta.space.updatedAt = this.now();
+      rt.meta.spaceMetaEtag = normalizeEtag(putRes.etag);
+      rt.meta.latestError = null;
+      rt.meta.space.status = 'SYNCED';
+      rt.meta.space.status = this.computeStatus(rt);
 
-    await this.logger.log({
-      spaceId: rt.spaceId,
-      level: 'info',
-      phase: 'rotate_password',
-      message: `Rotated space encryption password and DEK to keyEpoch ${newEpoch}`,
-      timestamp: this.now(),
+      if (this.keyVault && !rt.meta.space.settings.sessionLockEnabled) {
+        await this.keyVault.saveDek(rt.spaceId, newDek);
+      }
+
+      await this.uploadDeviceManifest(rt);
+      await this.persistRuntime(rt);
+
+      await this.logger.log({
+        spaceId: rt.spaceId,
+        level: 'info',
+        phase: 'rotate_password',
+        message: `Rotated space encryption password and DEK to keyEpoch ${newEpoch}`,
+        timestamp: this.now(),
+      });
     });
   }
 
   async deleteLocalSpace(spaceId: string, deleteRemote = false): Promise<void> {
     await this.ensureInitialized();
-    const entry = this.spaceIndex[spaceId];
-    if (!entry) return;
+    return this.enqueueOp(async () => {
+      const entry = this.spaceIndex[spaceId];
+      if (!entry) return;
 
-    if (deleteRemote) {
-      const client = new WebDAVClient(entry.webdav, this.webdavClientOptions);
-      try {
-        await client.delete(spaceBasePath(entry.opaqueId));
-      } catch (err) {
-        const se = toStructuredError(err, 'delete_space');
-        if (se.status !== 404) {
-          throw se;
+      if (deleteRemote) {
+        const client = new WebDAVClient(entry.webdav, this.webdavClientOptions);
+        try {
+          await client.delete(spaceBasePath(entry.opaqueId));
+        } catch (err) {
+          const se = toStructuredError(err, 'delete_space');
+          if (se.status !== 404) {
+            throw se;
+          }
         }
       }
-    }
 
-    await this.storage.clearNamespace(spaceNs(spaceId));
-    if (this.keyVault) {
-      await this.keyVault.clearDek(spaceId);
-    }
-    delete this.spaceIndex[spaceId];
-    await this.storage.set(GLOBAL_NS, 'spaceIndex', this.spaceIndex);
+      await this.storage.clearNamespace(spaceNs(spaceId));
+      if (this.keyVault) {
+        await this.keyVault.clearDek(spaceId);
+      }
+      delete this.spaceIndex[spaceId];
+      await this.storage.set(GLOBAL_NS, 'spaceIndex', this.spaceIndex);
 
-    if (this.activeSpaceId === spaceId) {
-      // Drop in-memory runtime & pending buffer BEFORE switching so switchSpace
-      // NEVER re-persists the deleted space's data back into IndexedDB!
-      this.changeDetector.clear();
-      this.runtime = null;
-      const remainingIds = Object.keys(this.spaceIndex);
-      if (remainingIds.length > 0) {
-        await this.switchSpace(remainingIds[0]);
+      if (this.activeSpaceId === spaceId) {
+        // Drop in-memory runtime & pending buffer BEFORE switching so switchSpace
+        // NEVER re-persists the deleted space's data back into IndexedDB!
+        this.changeDetector.clear();
+        this.runtime = null;
+        const remainingIds = Object.keys(this.spaceIndex);
+        if (remainingIds.length > 0) {
+          await this.switchSpaceInternal(remainingIds[0]);
+        } else {
+          this.activeSpaceId = null;
+          await this.storage.set(GLOBAL_NS, 'activeSpaceId', null);
+          this.emitStateChange();
+        }
       } else {
-        this.activeSpaceId = null;
-        await this.storage.set(GLOBAL_NS, 'activeSpaceId', null);
         this.emitStateChange();
       }
-    } else {
-      this.emitStateChange();
-    }
+    });
   }
 
   async generatePairingCode(passphrase: string): Promise<string> {
@@ -2611,6 +2868,41 @@ export class SyncEngine {
       }
       // 1. Push outbound events if direction allows (explicit sync bypasses cooldown/backoff/on_page_leave hold)
       if ((direction === 'both' || direction === 'push') && canPushBeforePull) {
+        // Reconcile live open-tab localStorage changes (CREATE/UPDATE/DELETE) before pushing so
+        // explicit "立即同步" / "当前网站上传" never misses recent SPA token mutations waiting on content-script poll!
+        if (rt.meta.space.settings.syncLocalStorage) {
+          try {
+            const openTabs = await this.browser.queryTabs();
+            const openSiteKeys = new Set<string>();
+            for (const tab of openTabs) {
+              const origin = tab.url ? normalizeOriginSafe(tab.url) : null;
+              if (!origin) continue;
+              const sk = resolveSiteKey(origin, rt.meta.rules.ssoGroups);
+              if (!sk) continue;
+              if (siteKeyFilter && sk !== siteKeyFilter) continue;
+              openSiteKeys.add(sk);
+            }
+            for (const sk of openSiteKeys) {
+              if (rt.rulesEngine.isBlacklisted(sk).blacklisted) continue;
+              const binding = rt.meta.localDevice.siteBindings[sk];
+              if (
+                !binding?.trackId ||
+                binding.state === 'BLACKLISTED' ||
+                binding.state === 'UNMANAGED' ||
+                binding.state === 'PENDING_CHOICE'
+              ) {
+                continue;
+              }
+              await this.reconcileOpenTabLocalStorage(rt, sk, binding.trackId, {
+                prequeriedTabs: openTabs,
+                allowLocalTrackSwitch: false,
+                detectDeletes: Boolean(options?.userInitiated),
+              });
+            }
+          } catch {
+            // Non-fatal: continue pushing queued events even if tab query fails
+          }
+        }
         pushedEvents = await this.pushOutboundInternal(rt, siteKeyFilter);
         if (siteKeyFilter) {
           this.deferredOnPageLeaveSites.delete(siteKeyFilter);
@@ -2820,6 +3112,18 @@ export class SyncEngine {
     await this.enqueueOp(async () => {
       const activeRt = this.runtime;
       if (!activeRt) return;
+      const openSites = await this.getOpenTabSiteKeys(activeRt);
+      if (openSites.has(siteKey)) {
+        // User stayed on the same site (same-site link navigation / reload, or another tab for
+        // this site is still open): keep buffered changes deferred until the last tab leaves/closes.
+        this.releasedOnPageLeaveSites.delete(siteKey);
+        if (activeRt.pendingOutboundEvents.some((ev) => ev.siteKey === siteKey)) {
+          this.deferredOnPageLeaveSites.add(siteKey);
+          activeRt.meta.space.status = this.computeStatus(activeRt);
+          await this.persistRuntime(activeRt);
+        }
+        return;
+      }
       this.deferredOnPageLeaveSites.delete(siteKey);
       this.releasedOnPageLeaveSites.add(siteKey);
       const hasPending =
@@ -2919,7 +3223,7 @@ export class SyncEngine {
 
         const storeScope = normalizeCookieStoreScope(cookie.storeId);
         const isHostPrefix = cookie.name.startsWith('__Host-');
-        const hostOnly = isHostPrefix ? true : cookie.hostOnly;
+        const hostOnly = resolveEffectiveHostOnly(cookie.domain, cookie.hostOnly, cookie.name);
         const normDomain = normalizeCookieDomain(cookie.domain, hostOnly);
         const path = isHostPrefix ? '/' : cookie.path || '/';
         const secure =
@@ -3038,8 +3342,19 @@ export class SyncEngine {
     if (rt.meta.globalPaused || rt.meta.localDevice.state !== 'active') return;
     if (!rt.dekKeyring[rt.meta.space.keyEpoch]) return;
 
+    const changedSourceSites = new Set<string>();
+    for (const change of changes) {
+      if (change.cause !== 'expired' && change.cause !== 'evicted') {
+        const sk = resolveSiteKey(change.cookie.domain, rt.meta.rules.ssoGroups);
+        if (sk) changedSourceSites.add(sk);
+      }
+    }
+
     const localDevPolicy = this.getLocalDevicePolicy(rt);
     if (localDevPolicy?.direction === 'disabled' || localDevPolicy?.direction === 'pull_only') {
+      if (changedSourceSites.size > 0) {
+        await this.runAutoEnvSyncForSourceSites(rt, changedSourceSites);
+      }
       return;
     }
 
@@ -3159,11 +3474,11 @@ export class SyncEngine {
         // debounced upsert flushed (e.g. user deleted the cookie within the debounce window),
         // verify it still exists in the live browser jar before resurrecting the tombstone!
         const isHostPrefixUp = cookie.name.startsWith('__Host-');
-        const effHostOnlyUp = isHostPrefixUp ? true : cookie.hostOnly;
+        const effHostOnlyUp = resolveEffectiveHostOnly(cookie.domain, cookie.hostOnly, cookie.name);
         const effPathUp = isHostPrefixUp ? '/' : cookie.path || '/';
         const upsertLogicalId = buildCookieLogicalId({
           trackId,
-          storeScope: cookie.storeId || 'default',
+          storeScope: normalizeCookieStoreScope(cookie.storeId),
           partitionKey: cookie.partitionKey,
           hostOnly: effHostOnlyUp,
           domain: normalizeCookieDomain(cookie.domain, effHostOnlyUp),
@@ -3191,11 +3506,15 @@ export class SyncEngine {
         // S-015: Distinguish explicit removal / HTTP Set-Cookie Max-Age=0 (`expired_overwrite`)
         // vs natural clock expiration (`expired`) / browser LRU eviction (`evicted`)
         const isHostPrefix = cookie.name.startsWith('__Host-');
-        const effectiveHostOnly = isHostPrefix ? true : cookie.hostOnly;
+        const effectiveHostOnly = resolveEffectiveHostOnly(
+          cookie.domain,
+          cookie.hostOnly,
+          cookie.name,
+        );
         const effectivePath = isHostPrefix ? '/' : cookie.path || '/';
         const logicalId = buildCookieLogicalId({
           trackId,
-          storeScope: cookie.storeId || 'default',
+          storeScope: normalizeCookieStoreScope(cookie.storeId),
           partitionKey: cookie.partitionKey,
           hostOnly: effectiveHostOnly,
           domain: normalizeCookieDomain(cookie.domain, effectiveHostOnly),
@@ -3233,7 +3552,7 @@ export class SyncEngine {
         }
 
         // Explicit removal or HTTP `Set-Cookie: Max-Age=0` (`expired_overwrite`) -> emit DELETE + Tombstone (S-007)
-        if (existing && !existing.deleted) {
+        if (existing && !existing.deleted && existing.syncStatus !== 'REMOTE_ONLY') {
           const reason: TombstoneReason =
             change.cause === 'expired_overwrite' ? 'logout' : 'explicit';
           await this.emitLocalCookieDelete(rt, existing, reason, reason);
@@ -3246,6 +3565,10 @@ export class SyncEngine {
       rt.meta.space.status = this.computeStatus(rt);
       await this.persistRuntime(rt);
       await this.attemptAutoPush(rt, 'cookie_auto_push');
+    }
+
+    if (changedSourceSites.size > 0) {
+      await this.runAutoEnvSyncForSourceSites(rt, changedSourceSites);
     }
   }
 
@@ -3430,9 +3753,9 @@ export class SyncEngine {
   ): Promise<CookieRecord | null> {
     const nowMs = this.now();
     const storeScope = normalizeCookieStoreScope(cookie.storeId);
-    const normDomain = normalizeCookieDomain(cookie.domain, cookie.hostOnly);
+    const hostOnly = resolveEffectiveHostOnly(cookie.domain, cookie.hostOnly, cookie.name);
+    const normDomain = normalizeCookieDomain(cookie.domain, hostOnly);
     const path = cookie.name.startsWith('__Host-') ? '/' : cookie.path || '/';
-    const hostOnly = cookie.name.startsWith('__Host-') ? true : cookie.hostOnly;
     const secure =
       cookie.name.startsWith('__Host-') ||
       cookie.name.startsWith('__Secure-') ||
@@ -3909,6 +4232,13 @@ export class SyncEngine {
     const nowMs = this.now();
     let totalPushed = 0;
 
+    // Sort eligible events in ascending deviceSeq order so chunk ranges stay monotonic
+    eligible.sort((a, b) => a.deviceSeq - b.deviceSeq);
+    const eligibleIds = new Set(eligible.map((e) => e.eventId));
+    const deferredPendingSeqs = rt.pendingOutboundEvents
+      .filter((e) => !eligibleIds.has(e.eventId))
+      .map((e) => e.deviceSeq);
+
     // Build chunks bounded by BOTH event count (<=60) AND estimated payload size (<=384 KB)
     const chunks: SyncEvent[][] = [];
     let currentChunk: SyncEvent[] = [];
@@ -3933,9 +4263,22 @@ export class SyncEngine {
       chunks.push(currentChunk);
     }
 
+    let prevCommittedSeq = rt.meta.lastPushedDeviceSeq ?? 0;
+
     for (const chunk of chunks) {
-      const fromSeq = Math.min(...chunk.map((e) => e.deviceSeq));
+      const rawFromSeq = Math.min(...chunk.map((e) => e.deviceSeq));
       const toSeq = Math.max(...chunk.map((e) => e.deviceSeq));
+      // If earlier deviceSeq numbers were locally compacted/superseded before upload (and none remain
+      // deferred in pendingOutboundEvents), include them in fromSeq so integrity checks never report
+      // false sequence gaps while still detecting genuinely missing remote batch files.
+      const hasDeferredInRange =
+        prevCommittedSeq > 0 && rawFromSeq > prevCommittedSeq + 1
+          ? deferredPendingSeqs.some((s) => s > prevCommittedSeq && s < rawFromSeq)
+          : false;
+      const fromSeq =
+        prevCommittedSeq > 0 && rawFromSeq > prevCommittedSeq + 1 && !hasDeferredInRange
+          ? prevCommittedSeq + 1
+          : rawFromSeq;
       const batchId = randomId('b');
 
       const touchedTrackIds = new Set(chunk.map((e) => e.trackId));
@@ -4003,6 +4346,8 @@ export class SyncEngine {
       rt.pendingOutboundEvents = rt.pendingOutboundEvents.filter((e) => !pushedIds.has(e.eventId));
       rt.meta.processedEventPaths[remotePath] = true;
       rt.meta.manifestDirty = true;
+      prevCommittedSeq = Math.max(prevCommittedSeq, toSeq);
+      rt.meta.lastPushedDeviceSeq = Math.max(rt.meta.lastPushedDeviceSeq ?? 0, toSeq);
       totalPushed += chunk.length;
     }
 
@@ -4108,7 +4453,12 @@ export class SyncEngine {
 
   private async uploadDeviceManifestIfOnline(rt: LoadedSpaceRuntime): Promise<void> {
     rt.meta.manifestDirty = true;
-    if (!this.isOnline() || rt.meta.storageFullHalted || !rt.dekKeyring[rt.meta.space.keyEpoch]) {
+    if (
+      rt.meta.globalPaused ||
+      !this.isOnline() ||
+      rt.meta.storageFullHalted ||
+      !rt.dekKeyring[rt.meta.space.keyEpoch]
+    ) {
       return;
     }
     try {
@@ -4336,6 +4686,17 @@ export class SyncEngine {
               if (!remainingForSite) {
                 delete rt.pendingDecisions[removedSiteKey];
               }
+              // Clear dangling sourceTrackId references on envSyncRules when a peer deletes a track
+              for (const rule of rt.meta.rules.envSyncRules ?? []) {
+                if (rule.sourceTrackId === tid) {
+                  rule.sourceTrackId = undefined;
+                }
+              }
+              for (const rule of rt.meta.deviceEnvSyncRules ?? []) {
+                if (rule.sourceTrackId === tid) {
+                  rule.sourceTrackId = undefined;
+                }
+              }
             }
           }
         }
@@ -4352,8 +4713,16 @@ export class SyncEngine {
 
         // Merge rules & settings deltas if newer
         if (manifest.rulesDelta && manifest.rulesDelta.updatedAt > rt.meta.rules.updatedAt) {
-          rt.meta.rules = manifest.rulesDelta;
-          rt.rulesEngine.update(rt.meta.space.settings, rt.meta.rules, rt.meta.deviceBlacklist);
+          rt.meta.rules = {
+            ...manifest.rulesDelta,
+            envSyncRules: manifest.rulesDelta.envSyncRules ?? [],
+          };
+          rt.rulesEngine.update(
+            rt.meta.space.settings,
+            rt.meta.rules,
+            rt.meta.deviceBlacklist,
+            rt.meta.deviceEnvSyncRules,
+          );
           this.reconcileBlacklistBindings(rt);
         }
         if (
@@ -4648,6 +5017,10 @@ export class SyncEngine {
         appliedCookies += applyRes.appliedCookies;
         failedCookies += applyRes.failedCookies;
       }
+
+      if (candidateSites.size > 0) {
+        await this.runAutoEnvSyncForSourceSites(rt, candidateSites);
+      }
     }
 
     return {
@@ -4689,6 +5062,9 @@ export class SyncEngine {
 
     rt.tracks[trackId] = {
       ...(peerIsNewer ? peerTrack : existing),
+      sortOrder: (peerIsNewer ? peerTrack.sortOrder : existing.sortOrder) ?? existing.sortOrder ?? peerTrack.sortOrder,
+      accountNote: (peerIsNewer ? peerTrack.accountNote : existing.accountNote) ?? existing.accountNote ?? peerTrack.accountNote,
+      lastUsedAt: Math.max(existing.lastUsedAt ?? 0, peerTrack.lastUsedAt ?? 0) || undefined,
       memberDeviceIds: mergedMembers,
       revision: Math.max(existing.revision ?? 0, peerTrack.revision ?? 0),
       updatedAt: Math.max(existing.updatedAt, peerTrack.updatedAt),
@@ -4699,12 +5075,14 @@ export class SyncEngine {
     rt: LoadedSpaceRuntime,
     ev: SyncEvent,
     nowMs: number,
+    options: { recordHistory?: boolean; defaultSyncStatus?: 'REMOTE_NEWER' | 'LOCAL_NEWER' } = {},
   ): boolean {
+    const applySyncStatus = options.defaultSyncStatus ?? 'REMOTE_NEWER';
     // Advance HLC monotonically on receive (S-014 clock skew resilience)
     rt.hlcClock.receive(ev.version.hlc, nowMs);
 
     // Avoid duplicating event in history
-    if (!rt.eventsHistory.some((h) => h.eventId === ev.eventId)) {
+    if (options.recordHistory !== false && !rt.eventsHistory.some((h) => h.eventId === ev.eventId)) {
       rt.eventsHistory.push({ ...ev, status: 'COMMITTED' });
     }
 
@@ -4798,7 +5176,7 @@ export class SyncEngine {
         rt.cookies[ev.objectId] = {
           ...outcome.record,
           deleted: false,
-          syncStatus: 'REMOTE_NEWER',
+          syncStatus: applySyncStatus,
         };
         delete rt.tombstones[ev.objectId];
         return true;
@@ -4880,7 +5258,7 @@ export class SyncEngine {
       rt.localStorage[ev.objectId] = {
         ...outcome.record,
         deleted: false,
-        syncStatus: 'REMOTE_NEWER',
+        syncStatus: applySyncStatus,
       };
       delete rt.tombstones[ev.objectId];
       return true;
@@ -4970,16 +5348,32 @@ export class SyncEngine {
     options: {
       cleanStale: boolean;
       triggerRefresh: boolean;
+      allowLocalTrackSwitch?: boolean;
       deleteReasonsByObject?: Map<string, string>;
     },
-  ): Promise<{ appliedCookies: number; failedCookies: number; changedAny: boolean }> {
+  ): Promise<{
+    appliedCookies: number;
+    failedCookies: number;
+    changedAny: boolean;
+    changedLocalStorage: boolean;
+  }> {
     const nowMs = this.now();
     const policy = this.getEffectivePolicyForDevice(rt, siteKey, siteKey);
-    if (policy.excluded || policy.direction === 'disabled' || policy.direction === 'push_only') {
-      return { appliedCookies: 0, failedCookies: 0, changedAny: false };
+    const isBlacklisted = rt.rulesEngine.isBlacklisted(siteKey).blacklisted;
+    if (
+      isBlacklisted ||
+      (!options.allowLocalTrackSwitch &&
+        (policy.excluded || policy.direction === 'disabled' || policy.direction === 'push_only'))
+    ) {
+      return { appliedCookies: 0, failedCookies: 0, changedAny: false, changedLocalStorage: false };
     }
+    const shouldApplyCookies = options.allowLocalTrackSwitch ? true : policy.syncCookies;
+    const shouldApplyLs = options.allowLocalTrackSwitch
+      ? rt.meta.space.settings.syncLocalStorage
+      : policy.syncLocalStorage;
     let appliedCookies = 0;
     let failedCookies = 0;
+    let changedLocalStorage = false;
     const changedVersions: string[] = [];
 
     const trackCookies = Object.values(rt.cookies).filter((c) => c.trackId === trackId);
@@ -4987,7 +5381,7 @@ export class SyncEngine {
     const deletedTrackCookies = trackCookies.filter((c) => c.deleted);
 
     // Clean Track Switch: remove stale browser cookies for siteKey not present in target track
-    if (options.cleanStale && policy.syncCookies) {
+    if (options.cleanStale && shouldApplyCookies) {
       const targetKeys = new Set(liveTrackCookies.map((c) => buildEchoCookieKey(c)));
       const browserCookies = await this.browser.getAllCookies();
       for (const bc of browserCookies) {
@@ -5008,7 +5402,7 @@ export class SyncEngine {
     }
 
     // Apply deletions (Tombstones) unless scope was remote_track_only
-    if (policy.syncCookies) {
+    if (shouldApplyCookies) {
       for (const delRec of deletedTrackCookies) {
         const delReason = options.deleteReasonsByObject?.get(delRec.logicalId) ?? delRec.deleteReason;
         if (delReason === 'remote_track_only') {
@@ -5095,13 +5489,41 @@ export class SyncEngine {
     }
 
     // Apply LocalStorage records grouped by strict Origin
-    if (policy.syncLocalStorage) {
+    if (shouldApplyLs) {
       const trackLs = Object.values(rt.localStorage).filter((l) => l.trackId === trackId);
       const byOrigin = new Map<string, LocalStorageRecord[]>();
       for (const l of trackLs) {
         const arr = byOrigin.get(l.origin) ?? [];
         arr.push(l);
         byOrigin.set(l.origin, arr);
+      }
+
+      // During Clean Track Switch (e.g. account rotation or clean_new), also include every
+      // known site origin (other tracks' LS records) and every currently open tab origin
+      // for this siteKey so stale LocalStorage from the previous account is wiped even when
+      // the target account has 0 LocalStorage records.
+      const clearedOrigins: string[] = [];
+      if (options.cleanStale) {
+        for (const rec of Object.values(rt.localStorage)) {
+          if (rec.siteKey === siteKey && !byOrigin.has(rec.origin)) {
+            byOrigin.set(rec.origin, []);
+          }
+        }
+        try {
+          const tabs = await this.browser.queryTabs();
+          for (const tab of tabs) {
+            const origin = tab.url ? normalizeOriginSafe(tab.url) : null;
+            if (
+              origin &&
+              resolveSiteKey(origin, rt.meta.rules.ssoGroups) === siteKey &&
+              !byOrigin.has(origin)
+            ) {
+              byOrigin.set(origin, []);
+            }
+          }
+        } catch {
+          // ignore tab query errors
+        }
       }
 
       for (const [origin, records] of byOrigin.entries()) {
@@ -5116,6 +5538,9 @@ export class SyncEngine {
             }
           }
           continue;
+        }
+        if (options.cleanStale) {
+          clearedOrigins.push(origin);
         }
 
         const mutations: Array<{ key: string; value?: string; deleted?: boolean }> = [];
@@ -5151,12 +5576,22 @@ export class SyncEngine {
 
         if (mutations.length > 0) {
           const res = await this.browser.applyLocalStorage(origin, mutations);
-          if (!res.applied) {
+          if (res.applied) {
+            changedLocalStorage = true;
+          } else {
             for (const rec of records) {
               if (!rec.deleted) rec.contextAvailable = false;
             }
           }
         }
+      }
+
+      if (options.cleanStale) {
+        rt.meta.pendingCleanLsBySite = rt.meta.pendingCleanLsBySite ?? {};
+        rt.meta.pendingCleanLsBySite[siteKey] = {
+          trackId,
+          clearedOrigins,
+        };
       }
     }
 
@@ -5178,7 +5613,7 @@ export class SyncEngine {
       }
     }
 
-    return { appliedCookies, failedCookies, changedAny };
+    return { appliedCookies, failedCookies, changedAny, changedLocalStorage };
   }
 
   private isTransportOrAuthError(se: StructuredError): boolean {
@@ -5282,19 +5717,41 @@ export class SyncEngine {
       const siteKey = resolveSiteKey(normOrigin, rt.meta.rules.ssoGroups);
       if (!siteKey) return;
 
-      if (!this.isSiteManagedOrRemotelyTracked(rt, siteKey)) return;
+      const hasItems = Object.keys(items).length > 0;
+      const cascadeAutoLsEnvSync = async () => {
+        // 1. If this mounted page is the TARGET of any enabled autoSync + syncLocalStorage env rule
+        // (e.g. developer opened http://localhost:3000 AFTER logging into prod), hydrate target LS/cookies!
+        await this.hydrateAutoEnvTargetsOnMount(rt, normOrigin);
+        // 2. If this mounted page is a SOURCE with items, cascade to target environments
+        if (hasItems) {
+          await this.runAutoEnvSyncForSourceSites(rt, [siteKey], { onlyWithLocalStorage: true });
+        }
+      };
+
+      if (!this.isSiteManagedOrRemotelyTracked(rt, siteKey)) {
+        await cascadeAutoLsEnvSync();
+        return;
+      }
 
       const policy = this.getEffectivePolicyForDevice(rt, normOrigin, siteKey);
       const sitePolicy = this.getEffectivePolicyForDevice(rt, siteKey, siteKey);
-      if (policy.excluded || sitePolicy.excluded || !sitePolicy.syncLocalStorage) return;
-      if (sitePolicy.direction === 'disabled') return;
+      if (policy.excluded || sitePolicy.excluded) {
+        // Still allow target-side dev env hydration when localhost preset blacklist is active!
+        await this.hydrateAutoEnvTargetsOnMount(rt, normOrigin);
+        return;
+      }
+      if (!sitePolicy.syncLocalStorage || sitePolicy.direction === 'disabled') {
+        await cascadeAutoLsEnvSync();
+        return;
+      }
 
       let binding = rt.meta.localDevice.siteBindings[siteKey];
-      if (
-        binding?.state === 'BLACKLISTED' ||
-        binding?.state === 'PENDING_CHOICE' ||
-        binding?.state === 'UNMANAGED'
-      ) {
+      if (binding?.state === 'BLACKLISTED') {
+        await this.hydrateAutoEnvTargetsOnMount(rt, normOrigin);
+        return;
+      }
+      if (binding?.state === 'PENDING_CHOICE' || binding?.state === 'UNMANAGED') {
+        await cascadeAutoLsEnvSync();
         return;
       }
 
@@ -5302,7 +5759,10 @@ export class SyncEngine {
         const remoteTracks = Object.values(rt.tracks).filter((t) => t.siteKey === siteKey);
         const itemCount = Object.keys(items).length;
         if (itemCount === 0 && remoteTracks.length === 0) return;
-        if (remoteTracks.length === 0 && sitePolicy.direction === 'pull_only') return;
+        if (remoteTracks.length === 0 && sitePolicy.direction === 'pull_only') {
+          await cascadeAutoLsEnvSync();
+          return;
+        }
 
         const decision = evaluateSiteDiscovery({
           siteKey,
@@ -5336,6 +5796,7 @@ export class SyncEngine {
           } else {
             rt.pendingDecisions[siteKey] = decision.pendingDecision;
             await this.persistRuntime(rt);
+            await cascadeAutoLsEnvSync();
             return;
           }
         }
@@ -5345,9 +5806,21 @@ export class SyncEngine {
       }
 
       const trackId = binding?.trackId;
-      if (!trackId) return;
+      if (!trackId) {
+        await cascadeAutoLsEnvSync();
+        return;
+      }
+
+      // Apply any deferred one-shot env injection or safety-undo LocalStorage snapshot before
+      // comparing or uploading local keys, so stale disk LS never overwrites the target track.
+      if (rt.meta.pendingEnvLsByOrigin?.[normOrigin]) {
+        await this.hydrateAutoEnvTargetsOnMount(rt, normOrigin);
+        return;
+      }
 
       // 1. Apply pending remote LocalStorage records & tombstones for this strict origin (D-008)
+      //    If this origin had a deferred Clean Track Switch wipe (tab was closed when track changed),
+      //    evict stale keys from the previous account BEFORE uploading local-only keys, and reload once.
       const mutationsToApply: Array<{ key: string; value?: string; deleted?: boolean }> = [];
       let stateMutated = false;
       const remoteRecords = Object.values(rt.localStorage).filter(
@@ -5355,12 +5828,40 @@ export class SyncEngine {
       );
       const handledKeys = new Set<string>();
 
+      const pendingSiteClean = rt.meta.pendingCleanLsBySite?.[siteKey];
+      const isPendingOriginClean = Boolean(
+        pendingSiteClean &&
+          pendingSiteClean.trackId === trackId &&
+          !pendingSiteClean.clearedOrigins.includes(normOrigin),
+      );
+      let effectiveItems: Record<string, string> = items;
+      if (isPendingOriginClean && pendingSiteClean) {
+        pendingSiteClean.clearedOrigins.push(normOrigin);
+        stateMutated = true;
+        const liveRemoteKeys = new Set(remoteRecords.filter((r) => !r.deleted).map((r) => r.key));
+        const filtered: Record<string, string> = Object.create(null);
+        for (const [k, v] of Object.entries(items)) {
+          if (!liveRemoteKeys.has(k)) {
+            this.echoSuppressor.registerLocalStorageMutation(normOrigin, k, 'remove', '', nowMs);
+            mutationsToApply.push({ key: k, deleted: true });
+          } else {
+            Object.defineProperty(filtered, k, {
+              value: v,
+              enumerable: true,
+              writable: true,
+              configurable: true,
+            });
+          }
+        }
+        effectiveItems = filtered;
+      }
+
       for (const rec of remoteRecords) {
         handledKeys.add(rec.key);
         if (rec.deleted) {
           if (
-            policy.direction !== 'push_only' &&
-            sitePolicy.direction !== 'push_only' &&
+            (isPendingOriginClean ||
+              (policy.direction !== 'push_only' && sitePolicy.direction !== 'push_only')) &&
             Object.prototype.hasOwnProperty.call(items, rec.key)
           ) {
             this.echoSuppressor.registerLocalStorageMutation(normOrigin, rec.key, 'remove', '', nowMs);
@@ -5374,10 +5875,13 @@ export class SyncEngine {
           const hasOwnKey = Object.prototype.hasOwnProperty.call(items, rec.key);
           const currentLsVal = hasOwnKey ? items[rec.key] : undefined;
           if (
-            policy.direction !== 'push_only' &&
-            sitePolicy.direction !== 'push_only' &&
+            (isPendingOriginClean ||
+              (policy.direction !== 'push_only' && sitePolicy.direction !== 'push_only')) &&
             (!hasOwnKey || currentLsVal !== rec.value) &&
-            (rec.syncStatus === 'REMOTE_NEWER' || rec.syncStatus === 'REMOTE_ONLY' || !hasOwnKey)
+            (isPendingOriginClean ||
+              rec.syncStatus === 'REMOTE_NEWER' ||
+              rec.syncStatus === 'REMOTE_ONLY' ||
+              !hasOwnKey)
           ) {
             this.echoSuppressor.registerLocalStorageMutation(normOrigin, rec.key, 'set', rec.value, nowMs);
             mutationsToApply.push({ key: rec.key, value: rec.value });
@@ -5394,12 +5898,16 @@ export class SyncEngine {
 
       if (mutationsToApply.length > 0) {
         await this.browser.applyLocalStorage(normOrigin, mutationsToApply);
+        if (isPendingOriginClean) {
+          this.postTrackSwitchLeaveMuteUntil.set(siteKey, this.now() + 2_500);
+          await this.reloadTabsForUserAction(rt, (tabUrl) => normalizeOriginSafe(tabUrl) === normOrigin);
+        }
       }
 
       // 2. Upload local-only keys if direction allows push
       let emittedAny = false;
       if (sitePolicy.direction !== 'pull_only') {
-        for (const [key, value] of Object.entries(items)) {
+        for (const [key, value] of Object.entries(effectiveItems)) {
           if (handledKeys.has(key)) {
             const logicalId = buildLocalStorageLogicalId(trackId, normOrigin, key);
             const existing = rt.localStorage[logicalId];
@@ -5446,12 +5954,14 @@ export class SyncEngine {
       if (emittedAny) {
         await this.attemptAutoPush(rt, 'localstorage_snapshot_push');
       }
+      await cascadeAutoLsEnvSync();
     });
   }
 
   async ingestLocalStorageMutations(
     origin: string,
     changes: Array<{ key: string; value?: string; deleted?: boolean }>,
+    options?: { isPageLeaving?: boolean },
   ): Promise<void> {
     await this.ensureInitialized();
     const normOrigin = normalizeOriginSafe(origin);
@@ -5466,26 +5976,52 @@ export class SyncEngine {
       const siteKey = resolveSiteKey(normOrigin, rt.meta.rules.ssoGroups);
       if (!siteKey) return;
 
-      if (!this.isSiteManagedOrRemotelyTracked(rt, siteKey)) return;
+      // Shield newly switched/rotated/clean_new accounts from stale pagehide LS writes
+      // emitted by the unloading page of the previous account.
+      if (options?.isPageLeaving) {
+        const leaveMuteUntil = this.postTrackSwitchLeaveMuteUntil.get(siteKey) ?? 0;
+        if (leaveMuteUntil > nowMs) {
+          return;
+        }
+      }
+
+      // Filter out echo-suppressed localStorage mutations once up front
+      const nonEchoChanges = changes.filter((ch) => {
+        const op = ch.deleted ? 'remove' : 'set';
+        const val = ch.value ?? '';
+        return !this.echoSuppressor.shouldSuppressLocalStorageEvent(normOrigin, ch.key, op, val, nowMs);
+      });
+      if (nonEchoChanges.length === 0) return;
+
+      const cascadeAutoLsEnvSync = async () => {
+        await this.runAutoEnvSyncForSourceSites(rt, [siteKey], { onlyWithLocalStorage: true });
+      };
+
+      if (!this.isSiteManagedOrRemotelyTracked(rt, siteKey)) {
+        await cascadeAutoLsEnvSync();
+        return;
+      }
 
       const policy = this.getEffectivePolicyForDevice(rt, normOrigin, siteKey);
       const sitePolicy = this.getEffectivePolicyForDevice(rt, siteKey, siteKey);
+      if (policy.excluded || sitePolicy.excluded) {
+        return;
+      }
       if (
-        policy.excluded ||
-        sitePolicy.excluded ||
         !sitePolicy.syncLocalStorage ||
         sitePolicy.direction === 'disabled' ||
         sitePolicy.direction === 'pull_only'
       ) {
+        await cascadeAutoLsEnvSync();
         return;
       }
 
       let binding = rt.meta.localDevice.siteBindings[siteKey];
-      if (
-        binding?.state === 'BLACKLISTED' ||
-        binding?.state === 'PENDING_CHOICE' ||
-        binding?.state === 'UNMANAGED'
-      ) {
+      if (binding?.state === 'BLACKLISTED') {
+        return;
+      }
+      if (binding?.state === 'PENDING_CHOICE' || binding?.state === 'UNMANAGED') {
+        await cascadeAutoLsEnvSync();
         return;
       }
 
@@ -5496,7 +6032,7 @@ export class SyncEngine {
           isBlacklisted: false,
           existingBinding: undefined,
           localCookies: [],
-          localStorageCount: changes.filter((c) => !c.deleted).length,
+          localStorageCount: nonEchoChanges.filter((c) => !c.deleted).length,
           remoteTracks,
           deviceId: rt.meta.localDevice.deviceId,
           deviceName: rt.meta.localDevice.name,
@@ -5521,11 +6057,13 @@ export class SyncEngine {
             binding = rt.meta.localDevice.siteBindings[siteKey];
             if (autoAction.type === 'use_remote_track') {
               await this.persistRuntime(rt);
+              await cascadeAutoLsEnvSync();
               return;
             }
           } else {
             rt.pendingDecisions[siteKey] = decision.pendingDecision;
             await this.persistRuntime(rt);
+            await cascadeAutoLsEnvSync();
             return;
           }
         }
@@ -5535,16 +6073,14 @@ export class SyncEngine {
       }
 
       const trackId = binding?.trackId;
-      if (!trackId) return;
+      if (!trackId) {
+        await cascadeAutoLsEnvSync();
+        return;
+      }
 
       let emittedAny = false;
-      for (const ch of changes) {
-        const op = ch.deleted ? 'remove' : 'set';
+      for (const ch of nonEchoChanges) {
         const val = ch.value ?? '';
-        if (this.echoSuppressor.shouldSuppressLocalStorageEvent(normOrigin, ch.key, op, val, nowMs)) {
-          continue;
-        }
-
         const logicalId = buildLocalStorageLogicalId(trackId, normOrigin, ch.key);
         if (ch.deleted) {
           const existing = rt.localStorage[logicalId];
@@ -5571,6 +6107,7 @@ export class SyncEngine {
         await this.persistRuntime(rt);
         await this.attemptAutoPush(rt, 'localstorage_mutation_push');
       }
+      await cascadeAutoLsEnvSync();
     });
   }
 
@@ -5767,15 +6304,13 @@ export class SyncEngine {
         // Compute which logicalIds exist locally on this device
         const localLogicalIds = new Set<string>();
         for (const c of localSiteCookies) {
+          const cHostOnly = resolveEffectiveHostOnly(c.domain, c.hostOnly, c.name);
           const lid = buildCookieLogicalId({
             trackId: targetTrackId,
-            storeScope: c.storeId || 'default',
+            storeScope: normalizeCookieStoreScope(c.storeId),
             partitionKey: c.partitionKey,
-            hostOnly: c.name.startsWith('__Host-') ? true : c.hostOnly,
-            domain: normalizeCookieDomain(
-              c.domain,
-              c.name.startsWith('__Host-') ? true : c.hostOnly,
-            ),
+            hostOnly: cHostOnly,
+            domain: normalizeCookieDomain(c.domain, cHostOnly),
             path: c.name.startsWith('__Host-') ? '/' : c.path || '/',
             name: c.name,
           });
@@ -5794,15 +6329,13 @@ export class SyncEngine {
 
         // Upsert all local cookies as causal successors on targetTrackId
         for (const c of localSiteCookies) {
+          const cHostOnly = resolveEffectiveHostOnly(c.domain, c.hostOnly, c.name);
           const lid = buildCookieLogicalId({
             trackId: targetTrackId,
-            storeScope: c.storeId || 'default',
+            storeScope: normalizeCookieStoreScope(c.storeId),
             partitionKey: c.partitionKey,
-            hostOnly: c.name.startsWith('__Host-') ? true : c.hostOnly,
-            domain: normalizeCookieDomain(
-              c.domain,
-              c.name.startsWith('__Host-') ? true : c.hostOnly,
-            ),
+            hostOnly: cHostOnly,
+            domain: normalizeCookieDomain(c.domain, cHostOnly),
             path: c.name.startsWith('__Host-') ? '/' : c.path || '/',
             name: c.name,
           });
@@ -5819,8 +6352,8 @@ export class SyncEngine {
       }
 
       if (!options?.deferSyncAndPersist) {
-        if (canPush && this.isOnline() && !rt.meta.storageFullHalted) {
-          await this.pushOutboundInternal(rt);
+        if (canPush) {
+          await this.tryPushOutboundBestEffort(rt, 'resolve_site_decision');
         }
         await this.uploadDeviceManifestIfOnline(rt);
         await this.persistRuntime(rt);
@@ -5845,8 +6378,8 @@ export class SyncEngine {
       }
 
       if (!options?.deferSyncAndPersist) {
-        if (canPush && this.isOnline() && !rt.meta.storageFullHalted) {
-          await this.pushOutboundInternal(rt);
+        if (canPush) {
+          await this.tryPushOutboundBestEffort(rt, 'resolve_site_decision_new_track');
         }
         await this.uploadDeviceManifestIfOnline(rt);
         await this.persistRuntime(rt);
@@ -5865,20 +6398,318 @@ export class SyncEngine {
     });
   }
 
+  private ensureSiteTrackSortOrders(rt: LoadedSpaceRuntime, siteKey: string): SiteTrack[] {
+    const sorted = sortSiteTracks(Object.values(rt.tracks).filter((t) => t.siteKey === siteKey));
+    sorted.forEach((tr, idx) => {
+      if (tr.sortOrder === undefined) {
+        tr.sortOrder = idx + 1;
+      }
+    });
+    return sorted;
+  }
+
+  private async reconcileSiteTrackFromLiveJar(
+    rt: LoadedSpaceRuntime,
+    siteKey: string,
+    trackId: string,
+  ): Promise<boolean> {
+    const track = rt.tracks[trackId];
+    if (!track || track.siteKey !== siteKey) return false;
+
+    const allCookies = await this.browser.getAllCookies();
+    const nowSec = this.now() / 1000;
+    let mutated = false;
+
+    for (const cookie of allCookies) {
+      if (!cookie.session && cookie.expirationDate !== undefined && cookie.expirationDate <= nowSec) {
+        continue;
+      }
+      if (!domainMatchesSiteKey(cookie.domain, siteKey, rt.meta.rules.ssoGroups)) {
+        continue;
+      }
+      if (
+        rt.meta.space.settings.filterAnalyticsNoiseCookies &&
+        isAnalyticsNoiseCookie(cookie.name)
+      ) {
+        continue;
+      }
+
+      const storeScope = normalizeCookieStoreScope(cookie.storeId);
+      const isHostPrefix = cookie.name.startsWith('__Host-');
+      const hostOnly = resolveEffectiveHostOnly(cookie.domain, cookie.hostOnly, cookie.name);
+      const normDomain = normalizeCookieDomain(cookie.domain, hostOnly);
+      const path = isHostPrefix ? '/' : cookie.path || '/';
+      const secure =
+        isHostPrefix ||
+        cookie.name.startsWith('__Secure-') ||
+        cookie.sameSite === 'no_restriction'
+          ? true
+          : cookie.secure;
+
+      const logicalId = buildCookieLogicalId({
+        trackId,
+        storeScope,
+        partitionKey: cookie.partitionKey,
+        hostOnly,
+        domain: normDomain,
+        path,
+        name: cookie.name,
+      });
+
+      const liveHash = cookieContentCanonicalHash({
+        ...cookie,
+        domain: normDomain,
+        path,
+        hostOnly,
+        secure,
+      });
+
+      const existing = rt.cookies[logicalId];
+      const lastAppliedHash = rt.meta.appliedCookieHashes[logicalId];
+      if (lastAppliedHash && lastAppliedHash === liveHash) {
+        continue;
+      }
+      if (existing && !existing.deleted && cookieContentCanonicalHash(existing) === liveHash) {
+        rt.meta.appliedCookieHashes[logicalId] = liveHash;
+        continue;
+      }
+      if (
+        !lastAppliedHash &&
+        existing &&
+        existing.sourceDevice !== rt.meta.localDevice.deviceId &&
+        (existing.syncStatus === 'REMOTE_NEWER' || existing.syncStatus === 'REMOTE_ONLY')
+      ) {
+        continue;
+      }
+
+      const emitted = await this.emitLocalCookieUpsert(
+        rt,
+        siteKey,
+        trackId,
+        cookie,
+        existing && !existing.deleted ? 'UPDATE' : 'CREATE',
+      );
+      if (emitted) {
+        rt.meta.appliedCookieHashes[logicalId] = liveHash;
+        mutated = true;
+      }
+    }
+
+    if (rt.meta.space.settings.syncLocalStorage) {
+      const lsMutated = await this.reconcileOpenTabLocalStorage(rt, siteKey, trackId, {
+        allowLocalTrackSwitch: true,
+        detectDeletes: true,
+      });
+      if (lsMutated) mutated = true;
+    }
+
+    return mutated;
+  }
+
+  private async reconcileOpenTabLocalStorage(
+    rt: LoadedSpaceRuntime,
+    siteKey: string,
+    trackId: string,
+    options?: {
+      prequeriedTabs?: Awaited<ReturnType<BrowserApiAdapter['queryTabs']>>;
+      allowLocalTrackSwitch?: boolean;
+      detectDeletes?: boolean;
+    },
+  ): Promise<boolean> {
+    if (!rt.meta.space.settings.syncLocalStorage) return false;
+    const track = rt.tracks[trackId];
+    if (!track || track.siteKey !== siteKey) return false;
+
+    const sitePolicy = this.getEffectivePolicyForDevice(rt, siteKey, siteKey);
+    if (
+      !options?.allowLocalTrackSwitch &&
+      (sitePolicy.excluded ||
+        !sitePolicy.syncLocalStorage ||
+        sitePolicy.direction === 'disabled' ||
+        sitePolicy.direction === 'pull_only')
+    ) {
+      return false;
+    }
+
+    let mutated = false;
+    try {
+      const tabs = options?.prequeriedTabs ?? (await this.browser.queryTabs());
+      const origins = new Set<string>();
+      for (const tab of tabs) {
+        const origin = tab.url ? normalizeOriginSafe(tab.url) : null;
+        if (origin && resolveSiteKey(origin, rt.meta.rules.ssoGroups) === siteKey) {
+          origins.add(origin);
+        }
+      }
+
+      for (const origin of origins) {
+        const lsState = await this.browser.getLocalStorage(origin);
+        if (!lsState.available) continue;
+
+        // 1. Capture CREATE & UPDATE
+        for (const [k, v] of Object.entries(lsState.items)) {
+          const lsLogicalId = buildLocalStorageLogicalId(trackId, origin, k);
+          const existingLs = rt.localStorage[lsLogicalId];
+          const lastAppliedLs = rt.meta.appliedLsHashes[lsLogicalId];
+          if (existingLs && !existingLs.deleted && existingLs.value === v) {
+            rt.meta.appliedLsHashes[lsLogicalId] = v;
+            continue;
+          }
+          if (
+            lastAppliedLs === undefined &&
+            existingLs &&
+            existingLs.sourceDevice !== rt.meta.localDevice.deviceId &&
+            (existingLs.syncStatus === 'REMOTE_NEWER' || existingLs.syncStatus === 'REMOTE_ONLY')
+          ) {
+            continue;
+          }
+          const emittedLs = await this.emitLocalStorageUpsert(
+            rt,
+            siteKey,
+            trackId,
+            origin,
+            k,
+            v,
+            existingLs && !existingLs.deleted ? 'UPDATE' : 'CREATE',
+          );
+          if (emittedLs) {
+            rt.meta.appliedLsHashes[lsLogicalId] = v;
+            mutated = true;
+          }
+        }
+
+        // 2. Capture DELETE for keys previously applied/created on this browser that were removed locally
+        // Only run when explicitly reconciling user-initiated push or track switch (never on passive background polls)
+        // and never cancel an unpushed CREATE/UPDATE already queued in pendingOutboundEvents.
+        if (options?.detectDeletes) {
+          const pendingUpsertIds = new Set(
+            rt.pendingOutboundEvents
+              .filter((ev) => ev.objectType === 'localStorage' && ev.operation !== 'DELETE')
+              .map((ev) => ev.objectId),
+          );
+          for (const rec of Object.values(rt.localStorage)) {
+            if (rec.trackId !== trackId || rec.origin !== origin || rec.deleted) continue;
+            if (Object.prototype.hasOwnProperty.call(lsState.items, rec.key)) continue;
+            if (rt.meta.appliedLsHashes[rec.logicalId] === undefined) continue;
+            if (pendingUpsertIds.has(rec.logicalId)) continue;
+            if (rec.syncStatus === 'REMOTE_ONLY' || rec.syncStatus === 'REMOTE_NEWER') continue;
+            await this.emitLocalStorageDelete(rt, rec, 'explicit', 'explicit');
+            mutated = true;
+          }
+        }
+      }
+    } catch {
+      // Ignore tab query errors during reconciliation
+    }
+    return mutated;
+  }
+
+  private async reloadTabsForUserAction(
+    rt: LoadedSpaceRuntime,
+    predicate: (tabUrl: string) => boolean,
+  ): Promise<number> {
+    let reloaded = 0;
+    let tabs: Awaited<ReturnType<BrowserApiAdapter['queryTabs']>> = [];
+    try {
+      tabs = await this.browser.queryTabs();
+    } catch {
+      return 0;
+    }
+
+    const BLOCKING_USER_RELOAD_REASONS = new Set([
+      'dirty_form_input',
+      'dirty_input',
+      'unsaved_form_input',
+      'unsaved_contenteditable',
+      'focused_editable',
+      'active_input_focus',
+      'active_contenteditable_focus',
+      'ime_composing',
+      'file_selected',
+      'pending_file_upload',
+      'beforeunload_registered',
+    ]);
+
+    const checkSafety = rt.meta.space.settings.refreshProtection;
+    for (const tab of tabs) {
+      if (!tab.url || !predicate(tab.url)) continue;
+      if (checkSafety) {
+        try {
+          const safety = await this.browser.checkTabSafeToReload(tab.id);
+          if (!safety.safe) {
+            const hasActiveEditBlocker = safety.reasons.some((r) =>
+              BLOCKING_USER_RELOAD_REASONS.has(r),
+            );
+            if (hasActiveEditBlocker) {
+              continue;
+            }
+          }
+        } catch {
+          // For explicit user-initiated account rotation / env sync actions, an unreachable
+          // content script probe (e.g. tab opened before extension install) should not block reload.
+        }
+      }
+      try {
+        await this.browser.reloadTab(tab.id);
+        reloaded += 1;
+      } catch {
+        // ignore closed tab
+      }
+    }
+    return reloaded;
+  }
+
+  private siteTabMatcher(rt: LoadedSpaceRuntime, siteKey: string): (tabUrl: string) => boolean {
+    return (tabUrl: string) => {
+      try {
+        const parsed = new URL(tabUrl);
+        if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') return false;
+        return (
+          domainMatchesSiteKey(parsed.hostname, siteKey, rt.meta.rules.ssoGroups) ||
+          resolveSiteKey(parsed.hostname, rt.meta.rules.ssoGroups) === siteKey
+        );
+      } catch {
+        return false;
+      }
+    };
+  }
+
   async switchSiteTrack(siteKey: string, targetTrackId: string): Promise<void> {
     await this.ensureInitialized();
+    await this.changeDetector.flush();
     return this.enqueueOp(async () => {
-      const rt = this.requireRuntime();
+      const rt = this.requireUnlockedRuntime();
+      const normSiteKey =
+        resolveSiteKey(siteKey, rt.meta.rules.ssoGroups) || normalizeDomain(siteKey) || siteKey;
+      if (rt.rulesEngine.isBlacklisted(normSiteKey).blacklisted) {
+        throw new Error(`站点 "${normSiteKey}" 处于黑名单保护中，禁止切换轨道`);
+      }
       const targetTrack = rt.tracks[targetTrackId];
-      if (!targetTrack || targetTrack.siteKey !== siteKey) {
-        throw new Error(`Track "${targetTrackId}" does not exist for site "${siteKey}"`);
+      if (!targetTrack || targetTrack.siteKey !== normSiteKey) {
+        throw new Error(`Track "${targetTrackId}" does not exist for site "${normSiteKey}"`);
       }
 
       const nowMs = this.now();
-      const prevBinding = rt.meta.localDevice.siteBindings[siteKey];
+      const prevBinding = rt.meta.localDevice.siteBindings[normSiteKey];
+
+      // Flush any live edits on the previously active track before switching away
+      let reconciledPrev = false;
+      if (
+        prevBinding?.trackId &&
+        prevBinding.trackId !== targetTrackId &&
+        prevBinding.state !== 'PENDING_CHOICE' &&
+        prevBinding.state !== 'BLACKLISTED' &&
+        prevBinding.state !== 'UNMANAGED'
+      ) {
+        reconciledPrev = await this.reconcileSiteTrackFromLiveJar(
+          rt,
+          normSiteKey,
+          prevBinding.trackId,
+        );
+      }
 
       // Save SafetyUndoPoint BEFORE Clean Track Switch!
-      await this.captureSafetyUndoPoint(rt, siteKey, `switch_track:${targetTrackId}`);
+      await this.captureSafetyUndoPoint(rt, normSiteKey, `switch_track:${targetTrackId}`);
 
       // Remove this device from old track's member list
       if (prevBinding?.trackId && prevBinding.trackId !== targetTrackId) {
@@ -5896,43 +6727,71 @@ export class SyncEngine {
         targetTrack.memberDeviceIds.push(rt.meta.localDevice.deviceId);
       }
       targetTrack.updatedAt = nowMs;
+      targetTrack.lastUsedAt = nowMs;
       targetTrack.revision = (targetTrack.revision ?? 0) + 1;
 
-      rt.meta.localDevice.siteBindings[siteKey] = {
-        siteKey,
+      rt.meta.localDevice.siteBindings[normSiteKey] = {
+        siteKey: normSiteKey,
         state: 'USER_BOUND',
         trackId: targetTrackId,
         availableTrackIds: Object.values(rt.tracks)
-          .filter((t) => t.siteKey === siteKey)
+          .filter((t) => t.siteKey === normSiteKey)
           .map((t) => t.trackId),
         hasLocalBaseline: true,
         decidedAt: nowMs,
         decidedBy: 'user',
       };
-      delete rt.pendingDecisions[siteKey];
+      delete rt.pendingDecisions[normSiteKey];
 
       // Discard stale debounced events for this site before switching tracks
       this.changeDetector.discardWhere((c) =>
-        domainMatchesSiteKey(c.domain, siteKey, rt.meta.rules.ssoGroups),
+        domainMatchesSiteKey(c.domain, normSiteKey, rt.meta.rules.ssoGroups),
       );
+      // Mute unloading-page pagehide LS writes from polluting the newly switched track
+      this.postTrackSwitchLeaveMuteUntil.set(normSiteKey, this.now() + 2_500);
 
-      // Clean Track Switch: wipe old cookies not in target track, then apply target track
-      await this.applyTrackToBrowser(rt, siteKey, targetTrackId, {
+      // Clean Track Switch: wipe old cookies/LS not in target track, then apply target track
+      const applyRes = await this.applyTrackToBrowser(rt, normSiteKey, targetTrackId, {
         cleanStale: true,
         triggerRefresh: true,
+        allowLocalTrackSwitch: true,
       });
 
+      if (!rt.meta.space.settings.autoRefresh && (applyRes.changedAny || applyRes.changedLocalStorage)) {
+        const reloaded = await this.reloadTabsForUserAction(
+          rt,
+          this.siteTabMatcher(rt, normSiteKey),
+        );
+        if (reloaded > 0) {
+          this.postReloadPushMuteUntil.set(normSiteKey, this.now() + 12_000);
+        }
+      }
+
+      const prevTrackHasPending = Boolean(
+        prevBinding?.trackId &&
+          rt.pendingOutboundEvents.some((e) => e.trackId === prevBinding.trackId),
+      );
+      if (reconciledPrev || prevTrackHasPending) {
+        await this.tryPushOutboundBestEffort(rt, 'switch_track_push');
+      }
       await this.uploadDeviceManifestIfOnline(rt);
+      await this.runAutoEnvSyncForSourceSites(rt, [normSiteKey]);
       await this.persistRuntime(rt);
     });
   }
 
   async splitSiteIndependent(siteKey: string, customLabel?: string): Promise<void> {
     await this.ensureInitialized();
+    await this.changeDetector.flush();
     return this.enqueueOp(async () => {
-      const rt = this.requireRuntime();
+      const rt = this.requireUnlockedRuntime();
+      const normSiteKey =
+        resolveSiteKey(siteKey, rt.meta.rules.ssoGroups) || normalizeDomain(siteKey) || siteKey;
+      if (rt.rulesEngine.isBlacklisted(normSiteKey).blacklisted) {
+        throw new Error(`站点 "${normSiteKey}" 处于黑名单保护中，禁止拆分轨道`);
+      }
       const nowMs = this.now();
-      const prevBinding = rt.meta.localDevice.siteBindings[siteKey];
+      const prevBinding = rt.meta.localDevice.siteBindings[normSiteKey];
 
       if (prevBinding?.trackId) {
         const oldTrack = rt.tracks[prevBinding.trackId];
@@ -5944,71 +6803,644 @@ export class SyncEngine {
         }
       }
 
+      const existingSorted = this.ensureSiteTrackSortOrders(rt, normSiteKey);
+      const nextSortOrder =
+        existingSorted.reduce((max, t) => Math.max(max, t.sortOrder ?? 0), 0) + 1;
+
       const newTrackId = randomId('trk');
       const allLocalCookies = await this.browser.getAllCookies();
       const localSiteCookies = allLocalCookies.filter(
         (c) =>
-          domainMatchesSiteKey(c.domain, siteKey, rt.meta.rules.ssoGroups) &&
+          domainMatchesSiteKey(c.domain, normSiteKey, rt.meta.rules.ssoGroups) &&
           (!rt.meta.space.settings.filterAnalyticsNoiseCookies || !isAnalyticsNoiseCookie(c.name)),
       );
 
       const newTrack: SiteTrack = {
         trackId: newTrackId,
-        siteKey,
-        label: customLabel?.trim() || `${rt.meta.localDevice.name} 独立轨道`,
+        siteKey: normSiteKey,
+        label: sanitizeShortLabel(customLabel) || `${rt.meta.localDevice.name} 独立轨道`,
         originDeviceId: rt.meta.localDevice.deviceId,
         originDeviceName: rt.meta.localDevice.name,
         cookieCount: localSiteCookies.length,
         localStorageCount: 0,
         updatedAt: nowMs,
+        sortOrder: nextSortOrder,
+        lastUsedAt: nowMs,
         memberDeviceIds: [rt.meta.localDevice.deviceId],
         revision: 1,
       };
       rt.tracks[newTrackId] = newTrack;
 
-      rt.meta.localDevice.siteBindings[siteKey] = {
-        siteKey,
+      rt.meta.localDevice.siteBindings[normSiteKey] = {
+        siteKey: normSiteKey,
         state: 'INDEPENDENT',
         trackId: newTrackId,
         availableTrackIds: Object.values(rt.tracks)
-          .filter((t) => t.siteKey === siteKey)
+          .filter((t) => t.siteKey === normSiteKey)
           .map((t) => t.trackId),
         hasLocalBaseline: true,
         localCookieCount: localSiteCookies.length,
         decidedAt: nowMs,
         decidedBy: 'user',
       };
-      delete rt.pendingDecisions[siteKey];
+      delete rt.pendingDecisions[normSiteKey];
 
       for (const c of localSiteCookies) {
-        await this.emitLocalCookieUpsert(rt, siteKey, newTrackId, c, 'CREATE');
+        await this.emitLocalCookieUpsert(rt, normSiteKey, newTrackId, c, 'CREATE');
       }
 
-      if (this.isOnline() && !rt.meta.storageFullHalted) {
-        await this.pushOutboundInternal(rt);
-      }
+      await this.tryPushOutboundBestEffort(rt, 'split_independent_push');
       await this.uploadDeviceManifestIfOnline(rt);
       await this.persistRuntime(rt);
     });
   }
 
+  async createSiteAccountTrack(
+    siteKey: string,
+    options: CreateSiteAccountOptions,
+  ): Promise<SiteTrack> {
+    await this.ensureInitialized();
+    await this.changeDetector.flush();
+    return this.enqueueOp(async () => {
+      const rt = this.requireUnlockedRuntime();
+      const normSiteKey =
+        resolveSiteKey(siteKey, rt.meta.rules.ssoGroups) || normalizeDomain(siteKey);
+      if (!normSiteKey) {
+        throw new Error('Invalid siteKey for multi-account management');
+      }
+      if (rt.rulesEngine.isBlacklisted(normSiteKey).blacklisted) {
+        throw new Error(`Site "${normSiteKey}" is blacklisted; remove it from blacklist first`);
+      }
+
+      const nowMs = this.now();
+      const nowSec = nowMs / 1000;
+      const allLocalCookies = await this.browser.getAllCookies();
+      const localSiteCookies = allLocalCookies.filter(
+        (c) =>
+          (c.session || c.expirationDate === undefined || c.expirationDate > nowSec) &&
+          domainMatchesSiteKey(c.domain, normSiteKey, rt.meta.rules.ssoGroups) &&
+          (!rt.meta.space.settings.filterAnalyticsNoiseCookies || !isAnalyticsNoiseCookie(c.name)),
+      );
+
+      let existingSorted = this.ensureSiteTrackSortOrders(rt, normSiteKey);
+      const prevBinding = rt.meta.localDevice.siteBindings[normSiteKey];
+
+      if (options.mode === 'clean_new') {
+        // 1. Preserve current active account before clearing browser jar!
+        if (
+          prevBinding?.trackId &&
+          rt.tracks[prevBinding.trackId] &&
+          prevBinding.state !== 'PENDING_CHOICE' &&
+          prevBinding.state !== 'BLACKLISTED' &&
+          prevBinding.state !== 'UNMANAGED'
+        ) {
+          await this.reconcileSiteTrackFromLiveJar(rt, normSiteKey, prevBinding.trackId);
+          const oldTrack = rt.tracks[prevBinding.trackId];
+          if (oldTrack) {
+            oldTrack.memberDeviceIds = oldTrack.memberDeviceIds.filter(
+              (id) => id !== rt.meta.localDevice.deviceId,
+            );
+            oldTrack.updatedAt = nowMs;
+          }
+        } else {
+          // Site was either untracked, UNMANAGED, or PENDING_CHOICE on this device:
+          // check live browser cookies + open-tab localStorage so existing login is NEVER silently wiped!
+          let liveLsCount = 0;
+          if (rt.meta.space.settings.syncLocalStorage) {
+            try {
+              const tabs = await this.browser.queryTabs();
+              const origins = new Set<string>();
+              for (const tab of tabs) {
+                const origin = tab.url ? normalizeOriginSafe(tab.url) : null;
+                if (origin && resolveSiteKey(origin, rt.meta.rules.ssoGroups) === normSiteKey) {
+                  origins.add(origin);
+                }
+              }
+              for (const origin of origins) {
+                const lsState = await this.browser.getLocalStorage(origin);
+                if (lsState.available) {
+                  liveLsCount += Object.keys(lsState.items).length;
+                }
+              }
+            } catch {
+              // ignore tab query errors
+            }
+          }
+
+          if (localSiteCookies.length > 0 || liveLsCount > 0) {
+            const initialOrder =
+              existingSorted.reduce((max, t) => Math.max(max, t.sortOrder ?? 0), 0) + 1;
+            const initialTrackId = randomId('trk');
+            if (rt.meta.removedTracks) delete rt.meta.removedTracks[initialTrackId];
+            const initialTrack: SiteTrack = {
+              trackId: initialTrackId,
+              siteKey: normSiteKey,
+              label: existingSorted.length === 0 ? '默认账号' : `${rt.meta.localDevice.name} 原账号`,
+              originDeviceId: rt.meta.localDevice.deviceId,
+              originDeviceName: rt.meta.localDevice.name,
+              cookieCount: localSiteCookies.length,
+              localStorageCount: liveLsCount,
+              updatedAt: nowMs,
+              sortOrder: initialOrder,
+              lastUsedAt: nowMs,
+              memberDeviceIds: [],
+              revision: 1,
+            };
+            rt.tracks[initialTrackId] = initialTrack;
+            for (const c of localSiteCookies) {
+              await this.emitLocalCookieUpsert(rt, normSiteKey, initialTrackId, c, 'CREATE');
+            }
+            await this.reconcileSiteTrackFromLiveJar(rt, normSiteKey, initialTrackId);
+            existingSorted = this.ensureSiteTrackSortOrders(rt, normSiteKey);
+          }
+        }
+
+        await this.captureSafetyUndoPoint(rt, normSiteKey, `create_clean_account:${normSiteKey}`);
+
+        const nextOrder =
+          existingSorted.reduce((max, t) => Math.max(max, t.sortOrder ?? 0), 0) + 1;
+        const newTrackId = randomId('trk');
+        if (rt.meta.removedTracks) delete rt.meta.removedTracks[newTrackId];
+
+        const newTrack: SiteTrack = {
+          trackId: newTrackId,
+          siteKey: normSiteKey,
+          label: sanitizeShortLabel(options.label) || `账号 ${existingSorted.length + 1}`,
+          accountNote: sanitizeShortLabel(options.accountNote, 160) || undefined,
+          originDeviceId: rt.meta.localDevice.deviceId,
+          originDeviceName: rt.meta.localDevice.name,
+          cookieCount: 0,
+          localStorageCount: 0,
+          updatedAt: nowMs,
+          sortOrder: nextOrder,
+          lastUsedAt: nowMs,
+          memberDeviceIds: [rt.meta.localDevice.deviceId],
+          revision: 1,
+        };
+        rt.tracks[newTrackId] = newTrack;
+
+        rt.meta.localDevice.siteBindings[normSiteKey] = {
+          siteKey: normSiteKey,
+          state: 'USER_BOUND',
+          trackId: newTrackId,
+          availableTrackIds: Object.values(rt.tracks)
+            .filter((t) => t.siteKey === normSiteKey)
+            .map((t) => t.trackId),
+          hasLocalBaseline: true,
+          localCookieCount: 0,
+          decidedAt: nowMs,
+          decidedBy: 'user',
+        };
+        delete rt.pendingDecisions[normSiteKey];
+
+        this.changeDetector.discardWhere((c) =>
+          domainMatchesSiteKey(c.domain, normSiteKey, rt.meta.rules.ssoGroups),
+        );
+        // Shield brand-new blank account from pagehide LS writes fired when reloading away from old account
+        this.postTrackSwitchLeaveMuteUntil.set(normSiteKey, this.now() + 2_500);
+
+        // Wipe browser cookies AND open-tab localStorage cleanly using EchoSuppressor
+        // (does NOT emit logout tombstones on previous account!)
+        await this.applyTrackToBrowser(rt, normSiteKey, newTrackId, {
+          cleanStale: true,
+          triggerRefresh: false,
+          allowLocalTrackSwitch: true,
+        });
+
+        if (options.triggerRefresh !== false) {
+          const reloaded = await this.reloadTabsForUserAction(
+            rt,
+            this.siteTabMatcher(rt, normSiteKey),
+          );
+          if (reloaded > 0) {
+            this.postReloadPushMuteUntil.set(normSiteKey, this.now() + 12_000);
+          }
+        }
+
+        if (rt.pendingOutboundEvents.length > 0) {
+          await this.tryPushOutboundBestEffort(rt, 'create_account_push');
+        }
+        await this.uploadDeviceManifestIfOnline(rt);
+        await this.runAutoEnvSyncForSourceSites(rt, [normSiteKey]);
+        await this.persistRuntime(rt);
+        return { ...newTrack };
+      }
+
+      // mode === 'save_current': Snapshot current browser cookies & open-tab LS into a new named account track
+      if (
+        prevBinding?.trackId &&
+        rt.tracks[prevBinding.trackId] &&
+        prevBinding.state !== 'PENDING_CHOICE' &&
+        prevBinding.state !== 'BLACKLISTED' &&
+        prevBinding.state !== 'UNMANAGED'
+      ) {
+        // Flush live open-tab localStorage onto prevBinding.trackId alongside already-flushed cookies
+        // so prevBinding.trackId never suffers Cookie/LS split-brain when save_current runs right after login!
+        await this.reconcileSiteTrackFromLiveJar(rt, normSiteKey, prevBinding.trackId);
+        const oldTrack = rt.tracks[prevBinding.trackId];
+        oldTrack.memberDeviceIds = oldTrack.memberDeviceIds.filter(
+          (id) => id !== rt.meta.localDevice.deviceId,
+        );
+        oldTrack.updatedAt = nowMs;
+      }
+
+      const nextOrder =
+        existingSorted.reduce((max, t) => Math.max(max, t.sortOrder ?? 0), 0) + 1;
+      const newTrackId = randomId('trk');
+      if (rt.meta.removedTracks) delete rt.meta.removedTracks[newTrackId];
+
+      const newTrack: SiteTrack = {
+        trackId: newTrackId,
+        siteKey: normSiteKey,
+        label: sanitizeShortLabel(options.label) || `账号 ${existingSorted.length + 1}`,
+        accountNote: sanitizeShortLabel(options.accountNote, 160) || undefined,
+        originDeviceId: rt.meta.localDevice.deviceId,
+        originDeviceName: rt.meta.localDevice.name,
+        cookieCount: localSiteCookies.length,
+        localStorageCount: 0,
+        updatedAt: nowMs,
+        sortOrder: nextOrder,
+        lastUsedAt: nowMs,
+        memberDeviceIds: [rt.meta.localDevice.deviceId],
+        revision: 1,
+      };
+      rt.tracks[newTrackId] = newTrack;
+
+      rt.meta.localDevice.siteBindings[normSiteKey] = {
+        siteKey: normSiteKey,
+        state: 'USER_BOUND',
+        trackId: newTrackId,
+        availableTrackIds: Object.values(rt.tracks)
+          .filter((t) => t.siteKey === normSiteKey)
+          .map((t) => t.trackId),
+        hasLocalBaseline: true,
+        localCookieCount: localSiteCookies.length,
+        decidedAt: nowMs,
+        decidedBy: 'user',
+      };
+      delete rt.pendingDecisions[normSiteKey];
+
+      for (const c of localSiteCookies) {
+        await this.emitLocalCookieUpsert(rt, normSiteKey, newTrackId, c, 'CREATE');
+      }
+
+      await this.reconcileSiteTrackFromLiveJar(rt, normSiteKey, newTrackId);
+
+      await this.tryPushOutboundBestEffort(rt, 'save_current_account_push');
+      await this.uploadDeviceManifestIfOnline(rt);
+      await this.runAutoEnvSyncForSourceSites(rt, [normSiteKey]);
+      await this.persistRuntime(rt);
+      return { ...rt.tracks[newTrackId] };
+    });
+  }
+
+  async rotateSiteTrack(
+    siteKey: string,
+    direction: 'next' | 'prev' = 'next',
+  ): Promise<AccountRotationResult> {
+    await this.ensureInitialized();
+    await this.changeDetector.flush();
+    return this.enqueueOp(async () => {
+      const rt = this.requireUnlockedRuntime();
+      const normSiteKey =
+        resolveSiteKey(siteKey, rt.meta.rules.ssoGroups) || normalizeDomain(siteKey) || siteKey;
+      if (rt.rulesEngine.isBlacklisted(normSiteKey).blacklisted) {
+        throw new Error(`站点 "${normSiteKey}" 处于黑名单保护中，禁止轮换账号`);
+      }
+
+      const sorted = this.ensureSiteTrackSortOrders(rt, normSiteKey);
+      if (sorted.length === 0) {
+        throw new Error(`站点 "${normSiteKey}" 暂无已保存的账号轨道`);
+      }
+
+      const nowMs = this.now();
+      const prevBinding = rt.meta.localDevice.siteBindings[normSiteKey];
+      const prevTrackId = prevBinding?.trackId;
+      const currentIdx = prevTrackId ? sorted.findIndex((t) => t.trackId === prevTrackId) : -1;
+
+      const nextIdx =
+        sorted.length === 1
+          ? 0
+          : currentIdx < 0
+            ? direction === 'prev'
+              ? sorted.length - 1
+              : 0
+            : direction === 'prev'
+              ? (currentIdx - 1 + sorted.length) % sorted.length
+              : (currentIdx + 1) % sorted.length;
+
+      const targetTrack = sorted[nextIdx];
+
+      // No-op fast path: only 1 track exists and we are already actively bound to it
+      if (
+        sorted.length === 1 &&
+        prevTrackId === targetTrack.trackId &&
+        prevBinding?.state !== 'PENDING_CHOICE' &&
+        prevBinding?.state !== 'UNMANAGED'
+      ) {
+        return {
+          siteKey: normSiteKey,
+          track: { ...targetTrack },
+          previousTrackId: prevTrackId,
+          index: 1,
+          total: 1,
+          appliedCookies: 0,
+          failedCookies: 0,
+        };
+      }
+
+      let reconciledPrev = false;
+      if (
+        prevTrackId &&
+        prevTrackId !== targetTrack.trackId &&
+        prevBinding &&
+        prevBinding.state !== 'PENDING_CHOICE' &&
+        prevBinding.state !== 'BLACKLISTED' &&
+        prevBinding.state !== 'UNMANAGED'
+      ) {
+        reconciledPrev = await this.reconcileSiteTrackFromLiveJar(rt, normSiteKey, prevTrackId);
+      }
+
+      if (prevTrackId !== targetTrack.trackId) {
+        await this.captureSafetyUndoPoint(
+          rt,
+          normSiteKey,
+          `rotate_track:${targetTrack.trackId}`,
+        );
+      }
+
+      if (prevTrackId && prevTrackId !== targetTrack.trackId) {
+        const oldTrack = rt.tracks[prevTrackId];
+        if (oldTrack) {
+          oldTrack.memberDeviceIds = oldTrack.memberDeviceIds.filter(
+            (id) => id !== rt.meta.localDevice.deviceId,
+          );
+          oldTrack.updatedAt = nowMs;
+        }
+      }
+
+      if (!targetTrack.memberDeviceIds.includes(rt.meta.localDevice.deviceId)) {
+        targetTrack.memberDeviceIds.push(rt.meta.localDevice.deviceId);
+      }
+      targetTrack.updatedAt = nowMs;
+      targetTrack.lastUsedAt = nowMs;
+      targetTrack.revision = (targetTrack.revision ?? 0) + 1;
+
+      rt.meta.localDevice.siteBindings[normSiteKey] = {
+        siteKey: normSiteKey,
+        state: 'USER_BOUND',
+        trackId: targetTrack.trackId,
+        availableTrackIds: sorted.map((t) => t.trackId),
+        hasLocalBaseline: true,
+        decidedAt: nowMs,
+        decidedBy: 'user',
+      };
+      delete rt.pendingDecisions[normSiteKey];
+
+      this.changeDetector.discardWhere((c) =>
+        domainMatchesSiteKey(c.domain, normSiteKey, rt.meta.rules.ssoGroups),
+      );
+      this.postTrackSwitchLeaveMuteUntil.set(normSiteKey, this.now() + 2_500);
+
+      const applyRes = await this.applyTrackToBrowser(rt, normSiteKey, targetTrack.trackId, {
+        cleanStale: true,
+        triggerRefresh: false,
+        allowLocalTrackSwitch: true,
+      });
+
+      const reloaded = await this.reloadTabsForUserAction(
+        rt,
+        this.siteTabMatcher(rt, normSiteKey),
+      );
+      if (reloaded > 0) {
+        this.postReloadPushMuteUntil.set(normSiteKey, this.now() + 12_000);
+      }
+
+      const prevTrackHasPending = Boolean(
+        prevTrackId && rt.pendingOutboundEvents.some((e) => e.trackId === prevTrackId),
+      );
+      if (reconciledPrev || prevTrackHasPending) {
+        await this.tryPushOutboundBestEffort(rt, 'rotate_track_push');
+      }
+      await this.uploadDeviceManifestIfOnline(rt);
+      await this.runAutoEnvSyncForSourceSites(rt, [normSiteKey]);
+      await this.persistRuntime(rt);
+
+      return {
+        siteKey: normSiteKey,
+        track: { ...targetTrack },
+        previousTrackId: prevTrackId,
+        index: nextIdx + 1,
+        total: sorted.length,
+        appliedCookies: applyRes.appliedCookies,
+        failedCookies: applyRes.failedCookies,
+      };
+    });
+  }
+
+  async deleteSiteTrack(
+    siteKey: string,
+    trackId: string,
+  ): Promise<{ deletedTrackId: string; switchedToTrack?: SiteTrack }> {
+    await this.ensureInitialized();
+    await this.changeDetector.flush();
+    return this.enqueueOp(async () => {
+      const rt = this.requireUnlockedRuntime();
+      const normSiteKey =
+        resolveSiteKey(siteKey, rt.meta.rules.ssoGroups) || normalizeDomain(siteKey) || siteKey;
+      const track = rt.tracks[trackId];
+      if (!track || track.siteKey !== normSiteKey) {
+        throw new Error(`Track "${trackId}" not found for site "${normSiteKey}"`);
+      }
+
+      const nowMs = this.now();
+
+      // Emit tombstones for live records belonging to this deleted account track
+      for (const rec of Object.values(rt.cookies)) {
+        if (rec.trackId === trackId && !rec.deleted) {
+          await this.emitLocalCookieDelete(rt, rec, 'user_delete', 'all_devices');
+        }
+      }
+      for (const rec of Object.values(rt.localStorage)) {
+        if (rec.trackId === trackId && !rec.deleted) {
+          await this.emitLocalStorageDelete(rt, rec, 'user_delete', 'all_devices');
+        }
+      }
+
+      rt.meta.removedTracks = rt.meta.removedTracks ?? {};
+      rt.meta.removedTracks[trackId] = Math.max(nowMs, track.updatedAt + 1);
+      delete rt.tracks[trackId];
+
+      // Clear dangling sourceTrackId references on envSyncRules
+      for (const rule of rt.meta.rules.envSyncRules ?? []) {
+        if (rule.sourceTrackId === trackId) {
+          rule.sourceTrackId = undefined;
+          rule.updatedAt = nowMs;
+        }
+      }
+      for (const rule of rt.meta.deviceEnvSyncRules ?? []) {
+        if (rule.sourceTrackId === trackId) {
+          rule.sourceTrackId = undefined;
+          rule.updatedAt = nowMs;
+        }
+      }
+
+      const remaining = this.ensureSiteTrackSortOrders(rt, normSiteKey);
+      let switchedToTrack: SiteTrack | undefined;
+
+      const curBinding = rt.meta.localDevice.siteBindings[normSiteKey];
+      if (curBinding?.trackId === trackId) {
+        await this.captureSafetyUndoPoint(rt, normSiteKey, `delete_track:${trackId}`);
+        if (remaining.length > 0) {
+          const nextTrack = remaining[0];
+          if (!nextTrack.memberDeviceIds.includes(rt.meta.localDevice.deviceId)) {
+            nextTrack.memberDeviceIds.push(rt.meta.localDevice.deviceId);
+          }
+          nextTrack.updatedAt = nowMs;
+          nextTrack.lastUsedAt = nowMs;
+          nextTrack.revision = (nextTrack.revision ?? 0) + 1;
+
+          rt.meta.localDevice.siteBindings[normSiteKey] = {
+            siteKey: normSiteKey,
+            state: 'USER_BOUND',
+            trackId: nextTrack.trackId,
+            availableTrackIds: remaining.map((t) => t.trackId),
+            hasLocalBaseline: true,
+            decidedAt: nowMs,
+            decidedBy: 'user',
+          };
+
+          this.changeDetector.discardWhere((c) =>
+            domainMatchesSiteKey(c.domain, normSiteKey, rt.meta.rules.ssoGroups),
+          );
+          this.postTrackSwitchLeaveMuteUntil.set(normSiteKey, this.now() + 2_500);
+          await this.applyTrackToBrowser(rt, normSiteKey, nextTrack.trackId, {
+            cleanStale: true,
+            triggerRefresh: false,
+            allowLocalTrackSwitch: true,
+          });
+          const reloaded = await this.reloadTabsForUserAction(
+            rt,
+            this.siteTabMatcher(rt, normSiteKey),
+          );
+          if (reloaded > 0) {
+            this.postReloadPushMuteUntil.set(normSiteKey, this.now() + 12_000);
+          }
+          switchedToTrack = { ...nextTrack };
+        } else {
+          rt.meta.localDevice.siteBindings[normSiteKey] = {
+            siteKey: normSiteKey,
+            state: 'UNMANAGED',
+            trackId: undefined,
+            hasLocalBaseline: false,
+            decidedAt: nowMs,
+            decidedBy: 'user',
+          };
+        }
+      } else if (curBinding) {
+        curBinding.availableTrackIds = remaining.map((t) => t.trackId);
+      }
+
+      await this.tryPushOutboundBestEffort(rt, 'delete_track_push');
+      await this.uploadDeviceManifestIfOnline(rt);
+      if (switchedToTrack) {
+        await this.runAutoEnvSyncForSourceSites(rt, [normSiteKey]);
+      }
+      await this.persistRuntime(rt);
+      return { deletedTrackId: trackId, switchedToTrack };
+    });
+  }
+
   async renameSiteTrack(siteKey: string, trackId: string, label: string): Promise<void> {
+    await this.updateSiteTrack(siteKey, trackId, { label });
+  }
+
+  async updateSiteTrack(
+    siteKey: string,
+    trackId: string,
+    patch: UpdateSiteTrackPatch,
+  ): Promise<SiteTrack> {
     await this.ensureInitialized();
     return this.enqueueOp(async () => {
-      const rt = this.requireRuntime();
+      const rt = this.requireUnlockedRuntime();
+      const normSiteKey =
+        resolveSiteKey(siteKey, rt.meta.rules.ssoGroups) || normalizeDomain(siteKey) || siteKey;
       const track = rt.tracks[trackId];
-      if (!track || track.siteKey !== siteKey) {
-        throw new Error(`Track "${trackId}" not found for site "${siteKey}"`);
+      if (!track || track.siteKey !== normSiteKey) {
+        throw new Error(`Track "${trackId}" not found for site "${normSiteKey}"`);
       }
-      const trimmed = label.trim();
-      if (!trimmed) throw new Error('Track label cannot be empty');
 
-      track.label = trimmed;
+      if (patch.label !== undefined) {
+        const trimmed = sanitizeShortLabel(patch.label);
+        if (!trimmed) throw new Error('Track label cannot be empty');
+        track.label = trimmed;
+      }
+
+      if (patch.accountNote !== undefined) {
+        const cleanedNote = sanitizeShortLabel(patch.accountNote, 160);
+        track.accountNote = cleanedNote || undefined;
+      }
+
+      if (patch.sortOrder !== undefined && Number.isFinite(patch.sortOrder)) {
+        track.sortOrder = Math.max(1, Math.floor(patch.sortOrder));
+      }
+
       track.updatedAt = this.now();
       track.revision = (track.revision ?? 0) + 1;
 
       await this.uploadDeviceManifestIfOnline(rt);
       await this.persistRuntime(rt);
+      return { ...track };
+    });
+  }
+
+  async reorderSiteTracks(siteKey: string, orderedTrackIds: string[]): Promise<SiteTrack[]> {
+    await this.ensureInitialized();
+    return this.enqueueOp(async () => {
+      const rt = this.requireUnlockedRuntime();
+      const normSiteKey =
+        resolveSiteKey(siteKey, rt.meta.rules.ssoGroups) || normalizeDomain(siteKey) || siteKey;
+      const existingSorted = this.ensureSiteTrackSortOrders(rt, normSiteKey);
+      if (existingSorted.length === 0) {
+        throw new Error(`站点 "${normSiteKey}" 暂无可排序的账号轨道`);
+      }
+
+      const byId = new Map(existingSorted.map((t) => [t.trackId, t]));
+      const finalOrder: SiteTrack[] = [];
+      const seen = new Set<string>();
+
+      for (const id of orderedTrackIds) {
+        const found = byId.get(id);
+        if (found && !seen.has(id)) {
+          seen.add(id);
+          finalOrder.push(found);
+        }
+      }
+      for (const tr of existingSorted) {
+        if (!seen.has(tr.trackId)) {
+          seen.add(tr.trackId);
+          finalOrder.push(tr);
+        }
+      }
+
+      const nowMs = this.now();
+      finalOrder.forEach((tr, idx) => {
+        const nextOrder = idx + 1;
+        if (tr.sortOrder !== nextOrder) {
+          tr.sortOrder = nextOrder;
+          tr.updatedAt = nowMs;
+          tr.revision = (tr.revision ?? 0) + 1;
+        }
+      });
+
+      const curBinding = rt.meta.localDevice.siteBindings[normSiteKey];
+      if (curBinding) {
+        curBinding.availableTrackIds = finalOrder.map((t) => t.trackId);
+      }
+
+      await this.uploadDeviceManifestIfOnline(rt);
+      await this.persistRuntime(rt);
+      return finalOrder.map((t) => ({ ...t }));
     });
   }
 
@@ -6136,7 +7568,9 @@ export class SyncEngine {
         hasLocalBaseline: false,
         decidedBy: 'auto',
       };
-      const allTracks = Object.values(rt.tracks).filter((t) => t.siteKey === siteKey);
+      const allTracks = sortSiteTracks(
+        Object.values(rt.tracks).filter((t) => t.siteKey === siteKey),
+      );
       const activeTrack = binding.trackId ? rt.tracks[binding.trackId] : undefined;
 
       const activeCookies = activeTrack
@@ -6251,6 +7685,24 @@ export class SyncEngine {
     await this.ensureInitialized();
     return this.enqueueOp(async () => {
       const rt = this.requireRuntime();
+      if (
+        this.isOnline() &&
+        rt.meta.localDevice.state === 'active' &&
+        !rt.meta.globalPaused &&
+        Boolean(rt.dekKeyring[rt.meta.space.keyEpoch])
+      ) {
+        try {
+          // Pull latest remote tracks/rules/items before local track creation to avoid duplicate tracks on concurrent managed-site adds.
+          await this.pullRemoteInternal(rt, { applyToBrowser: false });
+        } catch {
+          // Best-effort pre-pull: fall back to cached remote state when WebDAV is temporarily unreachable.
+        }
+        if (rt.meta.localDevice.state !== 'active') {
+          rt.meta.space.status = this.computeStatus(rt);
+          await this.persistRuntime(rt);
+          return { added: [], pendingDecisions: [] };
+        }
+      }
       const nowMs = this.now();
       const allLocalCookies = await this.browser.getAllCookies();
 
@@ -6503,8 +7955,8 @@ export class SyncEngine {
       const localDevPolicy = this.getLocalDevicePolicy(rt);
       const canPush =
         localDevPolicy?.direction !== 'pull_only' && localDevPolicy?.direction !== 'disabled';
-      if (canPush && this.isOnline() && !rt.meta.storageFullHalted) {
-        await this.pushOutboundInternal(rt);
+      if (canPush) {
+        await this.tryPushOutboundBestEffort(rt, 'add_managed_sites');
       }
       await this.uploadDeviceManifestIfOnline(rt);
       rt.meta.space.status = this.computeStatus(rt);
@@ -6590,8 +8042,8 @@ export class SyncEngine {
       const localDevPolicy = this.getLocalDevicePolicy(rt);
       const canPush =
         localDevPolicy?.direction !== 'pull_only' && localDevPolicy?.direction !== 'disabled';
-      if (canPush && this.isOnline() && !rt.meta.storageFullHalted) {
-        await this.pushOutboundInternal(rt);
+      if (canPush) {
+        await this.tryPushOutboundBestEffort(rt, 'remove_managed_site');
       }
       await this.uploadDeviceManifestIfOnline(rt);
       rt.meta.space.status = this.computeStatus(rt);
@@ -6886,16 +8338,20 @@ export class SyncEngine {
       .sort((a, b) => a.name.localeCompare(b.name));
   }
 
-  async upsertCookie(siteKey: string, cookie: BrowserCookieInput): Promise<CookieRecord> {
+  async upsertCookie(
+    siteKey: string,
+    cookie: BrowserCookieInput,
+    trackId?: string,
+  ): Promise<CookieRecord> {
     await this.ensureInitialized();
     return this.enqueueOp(async () => {
       const rt = this.requireRuntime();
-      const emitted = await this.upsertCookieInternal(rt, siteKey, cookie);
+      const emitted = await this.upsertCookieInternal(rt, siteKey, cookie, trackId);
 
       rt.meta.space.status = this.computeStatus(rt);
       await this.persistRuntime(rt);
-      if (rt.meta.space.settings.autoSync && this.isOnline() && !rt.meta.storageFullHalted) {
-        await this.pushOutboundInternal(rt);
+      if (rt.meta.space.settings.autoSync) {
+        await this.tryPushOutboundBestEffort(rt, 'upsert_cookie');
         rt.meta.space.status = this.computeStatus(rt);
         await this.persistRuntime(rt);
       }
@@ -6908,11 +8364,23 @@ export class SyncEngine {
     rt: LoadedSpaceRuntime,
     siteKey: string,
     cookie: BrowserCookieInput,
+    explicitTrackId?: string,
   ): Promise<CookieRecord> {
     const nowMs = this.now();
     const effectiveSiteKey = siteKey || resolveSiteKey(cookie.domain, rt.meta.rules.ssoGroups);
 
-    let trackId = rt.meta.localDevice.siteBindings[effectiveSiteKey]?.trackId;
+    const boundTrackId = rt.meta.localDevice.siteBindings[effectiveSiteKey]?.trackId;
+    let trackId: string | undefined;
+    if (explicitTrackId) {
+      const targetTrack = rt.tracks[explicitTrackId];
+      if (!targetTrack || targetTrack.siteKey !== effectiveSiteKey) {
+        throw new Error(`Track "${explicitTrackId}" not found for site "${effectiveSiteKey}"`);
+      }
+      trackId = explicitTrackId;
+    } else {
+      trackId = boundTrackId;
+    }
+
     if (!trackId) {
       const existingTracks = Object.values(rt.tracks).filter(
         (t) => t.siteKey === effectiveSiteKey,
@@ -6952,38 +8420,64 @@ export class SyncEngine {
       }
     }
 
-    // Apply to local browser with EchoSuppressor & read-back verification
-    const hash = cookieContentCanonicalHash(cookie);
-    this.changeDetector.discardCookieKey(buildEchoCookieKey(cookie));
-    this.echoSuppressor.registerCookieMutation(cookie, 'set', hash, nowMs);
-    const verification = await applyCookieWithVerification(this.browser, cookie, nowMs);
+    const isActiveBoundTrack =
+      !explicitTrackId ||
+      rt.meta.localDevice.siteBindings[effectiveSiteKey]?.trackId === trackId;
+
+    // Canonicalize cookie attributes to match Chromium's actual storage semantics
+    // (e.g. `__Host-`, `localhost`, IPv4/IPv6, and single-label hosts are ALWAYS hostOnly=true)
+    const effectiveHostOnly = resolveEffectiveHostOnly(cookie.domain, cookie.hostOnly, cookie.name);
+    const effectivePath = cookie.name.startsWith('__Host-') ? '/' : cookie.path || '/';
+    const effectiveSecure =
+      cookie.name.startsWith('__Host-') ||
+      cookie.name.startsWith('__Secure-') ||
+      cookie.sameSite === 'no_restriction'
+        ? true
+        : cookie.secure;
+    const normalizedCookie: BrowserCookieInput = {
+      ...cookie,
+      domain: normalizeCookieDomain(cookie.domain, effectiveHostOnly),
+      path: effectivePath,
+      hostOnly: effectiveHostOnly,
+      secure: effectiveSecure,
+      sameSite: cookie.sameSite || 'unspecified',
+    };
+
+    const hash = cookieContentCanonicalHash(normalizedCookie);
+    let verification: ApplyVerificationResult | undefined;
+    if (isActiveBoundTrack) {
+      // Apply to local browser with EchoSuppressor & read-back verification
+      this.changeDetector.discardCookieKey(buildEchoCookieKey(normalizedCookie));
+      this.echoSuppressor.registerCookieMutation(normalizedCookie, 'set', hash, nowMs);
+      verification = await applyCookieWithVerification(this.browser, normalizedCookie, nowMs);
+    }
 
     const emitted =
-      (await this.emitLocalCookieUpsert(rt, effectiveSiteKey, trackId, cookie, 'UPDATE')) ??
+      (await this.emitLocalCookieUpsert(rt, effectiveSiteKey, trackId, normalizedCookie, 'UPDATE')) ??
       rt.cookies[
         buildCookieLogicalId({
           trackId,
-          storeScope: cookie.storeId || 'default',
-          partitionKey: cookie.partitionKey,
-          hostOnly: cookie.name.startsWith('__Host-') ? true : cookie.hostOnly,
-          domain: normalizeCookieDomain(
-            cookie.domain,
-            cookie.name.startsWith('__Host-') ? true : cookie.hostOnly,
-          ),
-          path: cookie.name.startsWith('__Host-') ? '/' : cookie.path || '/',
-          name: cookie.name,
+          storeScope: normalizeCookieStoreScope(normalizedCookie.storeId),
+          partitionKey: normalizedCookie.partitionKey,
+          hostOnly: effectiveHostOnly,
+          domain: normalizedCookie.domain,
+          path: effectivePath,
+          name: normalizedCookie.name,
         })
       ];
 
-    emitted.applyResult = verification;
-    if (verification.accepted) {
-      if (rt.meta.dismissedApplyFailures) {
-        delete rt.meta.dismissedApplyFailures[emitted.logicalId];
+    if (verification) {
+      emitted.applyResult = verification;
+      if (verification.accepted) {
+        rt.meta.appliedCookieHashes[emitted.logicalId] = hash;
+        if (rt.meta.dismissedApplyFailures) {
+          delete rt.meta.dismissedApplyFailures[emitted.logicalId];
+        }
+      } else if (verification.expired) {
+        emitted.syncStatus = 'EXPIRED';
+      } else {
+        emitted.syncStatus = 'APPLY_FAILED';
       }
-    } else if (verification.expired) {
-      emitted.syncStatus = 'EXPIRED';
-    } else {
-      emitted.syncStatus = 'APPLY_FAILED';
     }
 
     return emitted;
@@ -7036,9 +8530,13 @@ export class SyncEngine {
       for (const lid of logicalIds) {
         const rec = rt.cookies[lid];
         if (!rec) continue;
+        const isActiveTrack =
+          rt.meta.localDevice.siteBindings[rec.siteKey]?.trackId === rec.trackId;
 
         if (scope === 'local_only') {
-          await this.removeExactBrowserCookie(rec, cookieContentCanonicalHash(rec), nowMs);
+          if (isActiveTrack) {
+            await this.removeExactBrowserCookie(rec, cookieContentCanonicalHash(rec), nowMs);
+          }
           delete rt.meta.appliedCookieHashes[lid];
           rec.syncStatus = 'REMOTE_ONLY';
           rec.updatedAt = nowMs;
@@ -7052,21 +8550,28 @@ export class SyncEngine {
         }
 
         if (scope === 'all_devices') {
-          await this.removeExactBrowserCookie(rec, cookieContentCanonicalHash(rec), nowMs);
+          if (isActiveTrack) {
+            await this.removeExactBrowserCookie(rec, cookieContentCanonicalHash(rec), nowMs);
+          }
           await this.emitLocalCookieDelete(rt, rec, 'user_delete', 'all_devices');
           pushedNeeded = true;
         }
       }
 
       await this.persistRuntime(rt);
-      if (pushedNeeded && rt.meta.space.settings.autoSync && this.isOnline() && !rt.meta.storageFullHalted) {
-        await this.pushOutboundInternal(rt);
+      if (pushedNeeded && rt.meta.space.settings.autoSync) {
+        await this.tryPushOutboundBestEffort(rt, 'delete_cookies');
+        rt.meta.space.status = this.computeStatus(rt);
         await this.persistRuntime(rt);
       }
     });
   }
 
-  async importCookiesJson(cookies: BrowserCookieInput[], siteKey?: string): Promise<number> {
+  async importCookiesJson(
+    cookies: BrowserCookieInput[],
+    siteKey?: string,
+    trackId?: string,
+  ): Promise<number> {
     await this.ensureInitialized();
     return this.enqueueOp(async () => {
       const rt = this.requireRuntime();
@@ -7074,15 +8579,15 @@ export class SyncEngine {
       for (const c of cookies) {
         const targetSite = siteKey || resolveSiteKey(c.domain, rt.meta.rules.ssoGroups);
         if (!targetSite) continue;
-        await this.upsertCookieInternal(rt, targetSite, c);
+        await this.upsertCookieInternal(rt, targetSite, c, trackId);
         count += 1;
       }
 
       if (count > 0) {
         rt.meta.space.status = this.computeStatus(rt);
         await this.persistRuntime(rt);
-        if (rt.meta.space.settings.autoSync && this.isOnline() && !rt.meta.storageFullHalted) {
-          await this.pushOutboundInternal(rt);
+        if (rt.meta.space.settings.autoSync) {
+          await this.tryPushOutboundBestEffort(rt, 'import_cookies');
           rt.meta.space.status = this.computeStatus(rt);
           await this.persistRuntime(rt);
         }
@@ -7092,14 +8597,16 @@ export class SyncEngine {
     });
   }
 
-  async exportCookiesJson(siteKey?: string): Promise<BrowserCookieInput[]> {
+  async exportCookiesJson(siteKey?: string, trackId?: string): Promise<BrowserCookieInput[]> {
     await this.ensureInitialized();
     const rt = this.runtime;
     if (!rt) return [];
 
     let records: CookieRecord[];
     if (siteKey) {
-      records = await this.getSiteCookies(siteKey);
+      records = await this.getSiteCookies(siteKey, trackId);
+    } else if (trackId) {
+      records = Object.values(rt.cookies).filter((c) => !c.deleted && c.trackId === trackId);
     } else {
       records = Object.values(rt.cookies).filter((c) => !c.deleted);
     }
@@ -7115,7 +8622,7 @@ export class SyncEngine {
       session: c.session,
       expirationDate: c.expirationDate,
       hostOnly: c.hostOnly,
-      storeId: c.storeScope,
+      storeId: c.storeScope && c.storeScope !== 'default' ? c.storeScope : undefined,
       partitionKey: c.partitionKey,
     }));
   }
@@ -7123,6 +8630,7 @@ export class SyncEngine {
   async getLocalStorageRecords(filter?: {
     siteKey?: string;
     origin?: string;
+    trackId?: string;
   }): Promise<LocalStorageRecord[]> {
     await this.ensureInitialized();
     const rt = this.runtime;
@@ -7132,6 +8640,9 @@ export class SyncEngine {
       .filter((r) => {
         if (r.deleted) return false;
         if (filter?.origin && r.origin !== filter.origin) return false;
+        if (filter?.trackId) {
+          return r.trackId === filter.trackId;
+        }
         if (filter?.siteKey) {
           const boundTrack = rt.meta.localDevice.siteBindings[filter.siteKey]?.trackId;
           if (boundTrack) return r.trackId === boundTrack;
@@ -7146,6 +8657,7 @@ export class SyncEngine {
     origin: string,
     key: string,
     value: string,
+    explicitTrackId?: string,
   ): Promise<LocalStorageRecord> {
     await this.ensureInitialized();
     const normOrigin = normalizeOriginSafe(origin);
@@ -7156,7 +8668,18 @@ export class SyncEngine {
       const nowMs = this.now();
       const siteKey = resolveSiteKey(normOrigin, rt.meta.rules.ssoGroups);
 
-      let trackId = rt.meta.localDevice.siteBindings[siteKey]?.trackId;
+      const boundTrackId = rt.meta.localDevice.siteBindings[siteKey]?.trackId;
+      let trackId: string | undefined;
+      if (explicitTrackId) {
+        const targetTrack = rt.tracks[explicitTrackId];
+        if (!targetTrack || targetTrack.siteKey !== siteKey) {
+          throw new Error(`Track "${explicitTrackId}" not found for site "${siteKey}"`);
+        }
+        trackId = explicitTrackId;
+      } else {
+        trackId = boundTrackId;
+      }
+
       if (!trackId) {
         const existingTracks = Object.values(rt.tracks).filter((t) => t.siteKey === siteKey);
         if (existingTracks.length === 1) {
@@ -7186,18 +8709,26 @@ export class SyncEngine {
         };
       }
 
-      this.echoSuppressor.registerLocalStorageMutation(normOrigin, key, 'set', value, nowMs);
-      const applyRes = await this.browser.applyLocalStorage(normOrigin, [{ key, value }]);
+      const isActiveBoundTrack =
+        !explicitTrackId || rt.meta.localDevice.siteBindings[siteKey]?.trackId === trackId;
+
+      let contextAvailable = false;
+      if (isActiveBoundTrack) {
+        this.echoSuppressor.registerLocalStorageMutation(normOrigin, key, 'set', value, nowMs);
+        const applyRes = await this.browser.applyLocalStorage(normOrigin, [{ key, value }]);
+        contextAvailable = applyRes.applied;
+      }
 
       const rec =
         (await this.emitLocalStorageUpsert(rt, siteKey, trackId, normOrigin, key, value, 'UPDATE')) ??
         rt.localStorage[buildLocalStorageLogicalId(trackId, normOrigin, key)];
 
-      rec.contextAvailable = applyRes.applied;
+      rec.contextAvailable = contextAvailable;
       await this.persistRuntime(rt);
 
-      if (rt.meta.space.settings.autoSync && this.isOnline() && !rt.meta.storageFullHalted) {
-        await this.pushOutboundInternal(rt);
+      if (rt.meta.space.settings.autoSync) {
+        await this.tryPushOutboundBestEffort(rt, 'upsert_local_storage');
+        rt.meta.space.status = this.computeStatus(rt);
         await this.persistRuntime(rt);
       }
       return { ...rec };
@@ -7233,10 +8764,14 @@ export class SyncEngine {
       for (const lid of logicalIds) {
         const rec = rt.localStorage[lid];
         if (!rec) continue;
+        const isActiveTrack =
+          rt.meta.localDevice.siteBindings[rec.siteKey]?.trackId === rec.trackId;
 
         if (scope === 'local_only') {
-          this.echoSuppressor.registerLocalStorageMutation(rec.origin, rec.key, 'remove', '', nowMs);
-          await this.browser.applyLocalStorage(rec.origin, [{ key: rec.key, deleted: true }]);
+          if (isActiveTrack) {
+            this.echoSuppressor.registerLocalStorageMutation(rec.origin, rec.key, 'remove', '', nowMs);
+            await this.browser.applyLocalStorage(rec.origin, [{ key: rec.key, deleted: true }]);
+          }
           rec.syncStatus = 'REMOTE_ONLY';
           continue;
         }
@@ -7248,16 +8783,19 @@ export class SyncEngine {
         }
 
         if (scope === 'all_devices') {
-          this.echoSuppressor.registerLocalStorageMutation(rec.origin, rec.key, 'remove', '', nowMs);
-          await this.browser.applyLocalStorage(rec.origin, [{ key: rec.key, deleted: true }]);
+          if (isActiveTrack) {
+            this.echoSuppressor.registerLocalStorageMutation(rec.origin, rec.key, 'remove', '', nowMs);
+            await this.browser.applyLocalStorage(rec.origin, [{ key: rec.key, deleted: true }]);
+          }
           await this.emitLocalStorageDelete(rt, rec, 'user_delete', 'all_devices');
           pushNeeded = true;
         }
       }
 
       await this.persistRuntime(rt);
-      if (pushNeeded && rt.meta.space.settings.autoSync && this.isOnline() && !rt.meta.storageFullHalted) {
-        await this.pushOutboundInternal(rt);
+      if (pushNeeded && rt.meta.space.settings.autoSync) {
+        await this.tryPushOutboundBestEffort(rt, 'delete_local_storage');
+        rt.meta.space.status = this.computeStatus(rt);
         await this.persistRuntime(rt);
       }
     });
@@ -7267,22 +8805,51 @@ export class SyncEngine {
   // Rules & Blacklists
   // =========================================================================
 
+  private syncRulesEngineState(rt: LoadedSpaceRuntime): void {
+    rt.rulesEngine.update(
+      rt.meta.space.settings,
+      rt.meta.rules,
+      rt.meta.deviceBlacklist,
+      rt.meta.deviceEnvSyncRules ?? [],
+    );
+  }
+
+  getCachedSsoGroups(): SsoDomainGroup[] {
+    return this.runtime?.meta.rules.ssoGroups ?? [];
+  }
+
   async getRulesAndBlacklist(): Promise<{
     spaceBlacklist: BlacklistEntry[];
     deviceBlacklist: BlacklistEntry[];
     siteOverrides: Record<string, SiteRuleOverride>;
     ssoGroups: SsoDomainGroup[];
+    envSyncRules: EnvCookieSyncRule[];
   }> {
     await this.ensureInitialized();
     const rt = this.runtime;
     if (!rt) {
-      return { spaceBlacklist: [], deviceBlacklist: [], siteOverrides: {}, ssoGroups: [] };
+      return {
+        spaceBlacklist: [],
+        deviceBlacklist: [],
+        siteOverrides: {},
+        ssoGroups: [],
+        envSyncRules: [],
+      };
     }
+    const spaceEnvRules = (rt.meta.rules.envSyncRules ?? []).map((r) => ({
+      ...r,
+      scope: 'space' as const,
+    }));
+    const deviceEnvRules = (rt.meta.deviceEnvSyncRules ?? []).map((r) => ({
+      ...r,
+      scope: 'device' as const,
+    }));
     return {
       spaceBlacklist: [...rt.meta.rules.spaceBlacklist],
       deviceBlacklist: [...rt.meta.deviceBlacklist],
       siteOverrides: { ...rt.meta.rules.siteOverrides },
       ssoGroups: [...rt.meta.rules.ssoGroups],
+      envSyncRules: [...deviceEnvRules, ...spaceEnvRules],
     };
   }
 
@@ -7363,10 +8930,18 @@ export class SyncEngine {
 
       rt.rulesEngine.update(rt.meta.space.settings, rt.meta.rules, rt.meta.deviceBlacklist);
 
-      // Clear BLACKLISTED bindings that are no longer blacklisted
+      // Restore previously bound sites (or clear stale BLACKLISTED bindings) once no longer blacklisted
       for (const [siteKey, binding] of Object.entries(rt.meta.localDevice.siteBindings)) {
         if (binding.state === 'BLACKLISTED' && !rt.rulesEngine.isBlacklisted(siteKey).blacklisted) {
-          delete rt.meta.localDevice.siteBindings[siteKey];
+          if (binding.trackId && rt.tracks[binding.trackId]) {
+            rt.meta.localDevice.siteBindings[siteKey] = {
+              ...binding,
+              state: 'USER_BOUND',
+              decidedAt: nowMs,
+            };
+          } else {
+            delete rt.meta.localDevice.siteBindings[siteKey];
+          }
         }
       }
 
@@ -7451,7 +9026,7 @@ export class SyncEngine {
       const nowMs = this.now();
       rt.meta.rules.ssoGroups = rt.meta.rules.ssoGroups.filter((g) => g.groupId !== groupId);
       rt.meta.rules.updatedAt = nowMs;
-      rt.rulesEngine.update(rt.meta.space.settings, rt.meta.rules, rt.meta.deviceBlacklist);
+      this.syncRulesEngineState(rt);
 
       await this.updateRemoteSpaceMetaIfPossible(rt, (desc) => ({
         ...desc,
@@ -7461,6 +9036,888 @@ export class SyncEngine {
       await this.uploadDeviceManifestIfOnline(rt);
       await this.persistRuntime(rt);
     });
+  }
+
+  async upsertEnvSyncRule(
+    input: Omit<EnvCookieSyncRule, 'id' | 'name' | 'createdAt' | 'updatedAt'> & {
+      id?: string;
+      name?: string;
+    },
+  ): Promise<EnvCookieSyncRule> {
+    await this.ensureInitialized();
+    return this.enqueueOp(async () => {
+      const rt = this.requireUnlockedRuntime();
+      const nowMs = this.now();
+
+      const normSource =
+        resolveSiteKey(input.sourceSiteKey, rt.meta.rules.ssoGroups) ||
+        normalizeDomain(input.sourceSiteKey);
+      if (!normSource) {
+        throw new Error('请输入有效的源环境域名（例如 example.com）');
+      }
+
+      const parsedTarget = parseEnvTarget(input.targetUrl);
+      if (!parsedTarget) {
+        throw new Error('请输入有效的目标环境地址（例如 http://localhost:3000 或 dev.example.com）');
+      }
+
+      const syncCookies = input.syncCookies ?? true;
+      const syncLocalStorage = input.syncLocalStorage ?? false;
+      if (!syncCookies && !syncLocalStorage) {
+        throw new Error('请至少开启 Cookie 或 LocalStorage 之一进行跨环境同步');
+      }
+
+      if (isBlockedWebdavSelfTarget(rt.webdav.url, parsedTarget)) {
+        throw new Error('禁止将目标环境指向当前 WebDAV 存储服务器自身域名');
+      }
+
+      const canonicalTargetUrl = parsedTarget.explicitWildcardDomain
+        ? `.${parsedTarget.host}`
+        : parsedTarget.origin;
+
+      rt.meta.rules.envSyncRules = rt.meta.rules.envSyncRules ?? [];
+      rt.meta.deviceEnvSyncRules = rt.meta.deviceEnvSyncRules ?? [];
+
+      const scope: 'space' | 'device' = input.scope === 'space' ? 'space' : 'device';
+      const rawSrcHost = normalizeDomain(input.sourceSiteKey);
+      const effectiveSourceHostFilter = input.sourceHostFilter?.trim()
+        ? normalizeDomain(input.sourceHostFilter)
+        : rawSrcHost && rawSrcHost !== normSource
+          ? rawSrcHost
+          : undefined;
+
+      const existingById = input.id
+        ? (rt.meta.rules.envSyncRules.find((r) => r.id === input.id) ??
+          rt.meta.deviceEnvSyncRules.find((r) => r.id === input.id))
+        : undefined;
+      // Deduplicate when id is omitted (e.g. clicking "注入并自动同步" repeatedly in Popup)
+      const sameScopeList =
+        scope === 'space' ? rt.meta.rules.envSyncRules : rt.meta.deviceEnvSyncRules;
+      const existingByKey = !input.id?.trim()
+        ? sameScopeList.find(
+            (r) =>
+              r.sourceSiteKey === normSource &&
+              (r.sourceHostFilter ?? '') === (effectiveSourceHostFilter ?? '') &&
+              parseEnvTarget(r.targetUrl)?.origin === parsedTarget.origin,
+          )
+        : undefined;
+      const prev = existingById ?? existingByKey;
+      const ruleId = input.id?.trim() || prev?.id || randomId('env');
+
+      const cleanInclude = input.includeCookieNames
+        ?.map((n) => n.trim())
+        .filter(Boolean);
+      const cleanExclude = input.excludeCookieNames
+        ?.map((n) => n.trim())
+        .filter(Boolean);
+
+      // Strip accidental userinfo/query/hash if caller passed a raw URL containing credentials in `name`
+      const sanitizedInputName = input.name
+        ? sanitizeShortLabel(
+            input.name.replace(/([a-z][a-z0-9+.-]*:\/\/)([^/\s@]+)@/gi, '$1'),
+          )
+        : '';
+
+      const saved: EnvCookieSyncRule = {
+        id: ruleId,
+        name:
+          sanitizedInputName ||
+          `${effectiveSourceHostFilter || normSource} → ${parsedTarget.host}${parsedTarget.port ? `:${parsedTarget.port}` : ''}`,
+        scope,
+        enabled: input.enabled ?? true,
+        sourceSiteKey: normSource,
+        sourceHostFilter: effectiveSourceHostFilter,
+        sourceTrackId: input.sourceTrackId?.trim() || undefined,
+        targetUrl: canonicalTargetUrl,
+        syncCookies,
+        syncLocalStorage,
+        adaptForHttp: input.adaptForHttp ?? true,
+        cleanTargetBeforeSync: input.cleanTargetBeforeSync ?? false,
+        autoSync: input.autoSync ?? true,
+        autoReloadTarget: input.autoReloadTarget ?? false,
+        includeCookieNames: cleanInclude && cleanInclude.length > 0 ? cleanInclude : undefined,
+        excludeCookieNames: cleanExclude && cleanExclude.length > 0 ? cleanExclude : undefined,
+        lastSyncedAt: prev?.lastSyncedAt,
+        lastSyncedCount: prev?.lastSyncedCount,
+        createdAt: prev?.createdAt ?? nowMs,
+        updatedAt: nowMs,
+      };
+
+      // Remove from both lists first (handles scope migration cleanly)
+      const prevSpaceLen = rt.meta.rules.envSyncRules.length;
+      rt.meta.rules.envSyncRules = rt.meta.rules.envSyncRules.filter((r) => r.id !== ruleId);
+      rt.meta.deviceEnvSyncRules = rt.meta.deviceEnvSyncRules.filter((r) => r.id !== ruleId);
+
+      let spaceMutated = rt.meta.rules.envSyncRules.length !== prevSpaceLen;
+      if (scope === 'space') {
+        rt.meta.rules.envSyncRules.push(saved);
+        rt.meta.rules.updatedAt = nowMs;
+        spaceMutated = true;
+      } else {
+        rt.meta.deviceEnvSyncRules.push(saved);
+      }
+
+      this.syncRulesEngineState(rt);
+
+      if (spaceMutated) {
+        await this.updateRemoteSpaceMetaIfPossible(rt, (desc) => ({
+          ...desc,
+          rules: rt.meta.rules,
+          updatedAt: nowMs,
+        }));
+        await this.uploadDeviceManifestIfOnline(rt);
+      }
+      await this.persistRuntime(rt);
+      return { ...saved };
+    });
+  }
+
+  async removeEnvSyncRule(ruleId: string, scope?: 'space' | 'device'): Promise<void> {
+    await this.ensureInitialized();
+    return this.enqueueOp(async () => {
+      const rt = this.requireUnlockedRuntime();
+      const nowMs = this.now();
+      rt.meta.rules.envSyncRules = rt.meta.rules.envSyncRules ?? [];
+      rt.meta.deviceEnvSyncRules = rt.meta.deviceEnvSyncRules ?? [];
+
+      let spaceChanged = false;
+      if (!scope || scope === 'space') {
+        const before = rt.meta.rules.envSyncRules.length;
+        rt.meta.rules.envSyncRules = rt.meta.rules.envSyncRules.filter((r) => r.id !== ruleId);
+        if (rt.meta.rules.envSyncRules.length !== before) {
+          rt.meta.rules.updatedAt = nowMs;
+          spaceChanged = true;
+        }
+      }
+      if (!scope || scope === 'device') {
+        rt.meta.deviceEnvSyncRules = rt.meta.deviceEnvSyncRules.filter((r) => r.id !== ruleId);
+      }
+
+      this.syncRulesEngineState(rt);
+
+      if (spaceChanged) {
+        await this.updateRemoteSpaceMetaIfPossible(rt, (desc) => ({
+          ...desc,
+          rules: rt.meta.rules,
+          updatedAt: nowMs,
+        }));
+        await this.uploadDeviceManifestIfOnline(rt);
+      }
+      await this.persistRuntime(rt);
+    });
+  }
+
+  async executeEnvCookieSync(input: ExecuteEnvSyncInput): Promise<EnvCookieSyncResult> {
+    await this.ensureInitialized();
+    await this.changeDetector.flush();
+    return this.enqueueOp(async () => {
+      const rt = this.requireUnlockedRuntime();
+      return this.executeEnvCookieSyncInternal(rt, input, true);
+    });
+  }
+
+  private async runAutoEnvSyncForSourceSites(
+    rt: LoadedSpaceRuntime,
+    sourceSites: Iterable<string>,
+    options?: { onlyWithLocalStorage?: boolean },
+  ): Promise<void> {
+    if (this.inAutoEnvSync || rt.meta.globalPaused) return;
+    const siteSet = new Set(sourceSites);
+    if (siteSet.size === 0) return;
+
+    const allRules = [
+      ...(rt.meta.deviceEnvSyncRules ?? []),
+      ...(rt.meta.rules.envSyncRules ?? []),
+    ];
+    const matchingRules = allRules.filter((r) => {
+      if (!r.enabled || !r.autoSync) return false;
+      if (options?.onlyWithLocalStorage && !r.syncLocalStorage) return false;
+      const normSrc =
+        resolveSiteKey(r.sourceSiteKey, rt.meta.rules.ssoGroups) ||
+        normalizeDomain(r.sourceSiteKey);
+      return siteSet.has(normSrc);
+    });
+
+    if (matchingRules.length === 0) return;
+
+    this.inAutoEnvSync = true;
+    let executedAny = false;
+    try {
+      for (const rule of matchingRules) {
+        try {
+          await this.executeEnvCookieSyncInternal(rt, { ruleId: rule.id }, false);
+          executedAny = true;
+        } catch (err) {
+          await this.logger.log({
+            spaceId: rt.spaceId,
+            level: 'warn',
+            phase: 'env_cookie_sync',
+            siteKey: rule.sourceSiteKey,
+            message: `Auto env cookie sync "${rule.name}" failed: ${err instanceof Error ? err.message : String(err)}`,
+            timestamp: this.now(),
+          });
+        }
+      }
+      if (executedAny) {
+        await this.persistRuntime(rt);
+      }
+    } finally {
+      this.inAutoEnvSync = false;
+    }
+  }
+
+  private async applyEnvLsEntriesToOpenOrigin(
+    targetOrigin: string,
+    currentItems: Record<string, string>,
+    targetEntries: Array<[string, string]>,
+    cleanTargetBeforeSync: boolean,
+    excludeSet: Set<string>,
+    nowMs: number,
+  ): Promise<{ applied: boolean; mutated: boolean }> {
+    const mutations: Array<{ key: string; value?: string; deleted?: boolean }> = [];
+    if (cleanTargetBeforeSync) {
+      const keepKeys = new Set(targetEntries.map(([k]) => k));
+      for (const existingKey of Object.keys(currentItems)) {
+        if (!keepKeys.has(existingKey) && !excludeSet.has(existingKey)) {
+          this.echoSuppressor.registerLocalStorageMutation(
+            targetOrigin,
+            existingKey,
+            'remove',
+            '',
+            nowMs,
+          );
+          mutations.push({ key: existingKey, deleted: true });
+        }
+      }
+    }
+    for (const [k, v] of targetEntries) {
+      const hasOwnKey = Object.prototype.hasOwnProperty.call(currentItems, k);
+      if (!hasOwnKey || currentItems[k] !== v) {
+        this.echoSuppressor.registerLocalStorageMutation(targetOrigin, k, 'set', v, nowMs);
+        mutations.push({ key: k, value: v });
+      }
+    }
+    if (mutations.length === 0) {
+      return { applied: true, mutated: false };
+    }
+    const lsApply = await this.browser.applyLocalStorage(targetOrigin, mutations);
+    return { applied: lsApply.applied, mutated: lsApply.applied };
+  }
+
+  private async hydrateAutoEnvTargetsOnMount(
+    rt: LoadedSpaceRuntime,
+    mountedOrigin: string,
+  ): Promise<void> {
+    if (this.inAutoEnvSync || rt.meta.globalPaused) return;
+
+    const allRules = [
+      ...(rt.meta.deviceEnvSyncRules ?? []),
+      ...(rt.meta.rules.envSyncRules ?? []),
+    ];
+    const matchingTargetRules = allRules.filter(
+      (r) =>
+        r.enabled &&
+        r.autoSync &&
+        r.syncLocalStorage &&
+        envRuleMatchesUrl(r, mountedOrigin, rt.meta.rules.ssoGroups) === 'target',
+    );
+    const pendingAdhoc = rt.meta.pendingEnvLsByOrigin?.[mountedOrigin];
+    if (matchingTargetRules.length === 0 && !pendingAdhoc) return;
+
+    this.inAutoEnvSync = true;
+    let executedAny = false;
+    try {
+      for (const rule of matchingTargetRules) {
+        try {
+          await this.executeEnvCookieSyncInternal(rt, { ruleId: rule.id }, false);
+          executedAny = true;
+        } catch (err) {
+          await this.logger.log({
+            spaceId: rt.spaceId,
+            level: 'warn',
+            phase: 'env_cookie_sync',
+            siteKey: rule.sourceSiteKey,
+            message: `Target mount hydration "${rule.name}" failed: ${err instanceof Error ? err.message : String(err)}`,
+            timestamp: this.now(),
+          });
+        }
+      }
+
+      const remainingAdhoc = rt.meta.pendingEnvLsByOrigin?.[mountedOrigin];
+      if (remainingAdhoc) {
+        delete rt.meta.pendingEnvLsByOrigin![mountedOrigin];
+        executedAny = true;
+        const targetLs = await this.browser.getLocalStorage(mountedOrigin);
+        if (targetLs.available) {
+          const entries = Object.entries(remainingAdhoc.items);
+          const applyRes = await this.applyEnvLsEntriesToOpenOrigin(
+            mountedOrigin,
+            targetLs.items,
+            entries,
+            remainingAdhoc.cleanTargetBeforeSync,
+            new Set(remainingAdhoc.excludeKeys),
+            this.now(),
+          );
+          if (applyRes.mutated && remainingAdhoc.autoReloadTarget) {
+            this.postTrackSwitchLeaveMuteUntil.set(
+              resolveSiteKey(mountedOrigin, rt.meta.rules.ssoGroups) || mountedOrigin,
+              this.now() + 2_500,
+            );
+            await this.reloadTabsForUserAction(rt, (tabUrl) => normalizeOriginSafe(tabUrl) === mountedOrigin);
+          }
+        }
+      }
+
+      if (executedAny) {
+        await this.persistRuntime(rt);
+      }
+    } finally {
+      this.inAutoEnvSync = false;
+    }
+  }
+
+  private async executeEnvCookieSyncInternal(
+    rt: LoadedSpaceRuntime,
+    input: ExecuteEnvSyncInput,
+    persistAfter: boolean,
+  ): Promise<EnvCookieSyncResult> {
+    const nowMs = this.now();
+    let matchedRule: EnvCookieSyncRule | undefined;
+
+    if (input.ruleId) {
+      matchedRule =
+        (rt.meta.deviceEnvSyncRules ?? []).find((r) => r.id === input.ruleId) ??
+        (rt.meta.rules.envSyncRules ?? []).find((r) => r.id === input.ruleId);
+      if (!matchedRule) {
+        throw new Error(`未找到环境同步规则: ${input.ruleId}`);
+      }
+    } else if (!input.adHoc) {
+      throw new Error('缺少环境同步配置参数 (ruleId 或 adHoc)');
+    }
+
+    const baseSourceSite = matchedRule ? matchedRule.sourceSiteKey : input.adHoc!.sourceSiteKey;
+    const baseSourceHostFilter = matchedRule
+      ? matchedRule.sourceHostFilter
+      : input.adHoc!.sourceHostFilter;
+    const baseSourceTrackId = matchedRule ? matchedRule.sourceTrackId : input.adHoc!.sourceTrackId;
+    const baseTargetUrl = matchedRule ? matchedRule.targetUrl : input.adHoc!.targetUrl;
+
+    const rawSource = input.reverse ? baseTargetUrl : baseSourceSite;
+    // On reverse sync, target wildcard `.domain` unless user explicitly pinned a sourceHostFilter
+    // or the source is a local/IP host, so cookies written back reach subdomains like app.example.com.
+    const reverseTargetDefault =
+      baseSourceHostFilter ||
+      (isLocalOrSingleLabelHost(normalizeDomain(baseSourceSite))
+        ? baseSourceSite
+        : `.${normalizeDomain(baseSourceSite)}`);
+    const rawTarget = input.reverse ? reverseTargetDefault : baseTargetUrl;
+    const effectiveSourceHostFilter = input.reverse
+      ? undefined
+      : baseSourceHostFilter ||
+        (() => {
+          const rawHost = normalizeDomain(baseSourceSite);
+          const resolvedKey =
+            resolveSiteKey(baseSourceSite, rt.meta.rules.ssoGroups) || rawHost;
+          return rawHost && rawHost !== resolvedKey ? rawHost : undefined;
+        })();
+    const effectiveSourceTrackId = input.reverse ? undefined : baseSourceTrackId;
+    const destReverseTrackId = input.reverse ? baseSourceTrackId : undefined;
+
+    const parsedSourceTarget = parseEnvTarget(rawSource);
+    const srcHost = parsedSourceTarget?.host || normalizeDomain(rawSource);
+    const srcSiteKey =
+      resolveSiteKey(srcHost, rt.meta.rules.ssoGroups) || normalizeDomain(srcHost);
+    if (!srcSiteKey) {
+      throw new Error(`无效的源环境域名: ${rawSource}`);
+    }
+
+    const parsedTarget: ParsedEnvTarget | null = parseEnvTarget(rawTarget);
+    if (!parsedTarget) {
+      throw new Error(`无效的目标环境地址: ${rawTarget}`);
+    }
+
+    if (isBlockedWebdavSelfTarget(rt.webdav.url, parsedTarget)) {
+      throw new Error('禁止覆盖当前 WebDAV 服务器自身域名的 Cookie');
+    }
+
+    // Block sensitive banking / password_manager / webdav_self blacklists on source (allow localhost preset;
+    // for webdav_self, allow differing local/IP dev ports via isBlockedWebdavSelfTarget just like target check)
+    const srcBl = rt.rulesEngine.isBlacklisted(srcHost || srcSiteKey);
+    if (
+      srcBl.blacklisted &&
+      srcBl.entry?.presetCategory &&
+      srcBl.entry.presetCategory !== 'localhost' &&
+      srcBl.entry.presetCategory !== 'custom' &&
+      !(
+        srcBl.entry.presetCategory === 'webdav_self' &&
+        parsedSourceTarget &&
+        !isBlockedWebdavSelfTarget(rt.webdav.url, parsedSourceTarget)
+      )
+    ) {
+      throw new Error(`源站点 "${srcSiteKey}" 属于受保护敏感黑名单 (${srcBl.entry.presetCategory})，禁止跨环境导出`);
+    }
+
+    const syncCookies = matchedRule
+      ? matchedRule.syncCookies
+      : (input.adHoc?.syncCookies ?? true);
+    const syncLocalStorage = matchedRule
+      ? matchedRule.syncLocalStorage
+      : (input.adHoc?.syncLocalStorage ?? false);
+    const adaptForHttp = matchedRule
+      ? matchedRule.adaptForHttp
+      : (input.adHoc?.adaptForHttp ?? true);
+    // Safety guard: never wipe production/source cookies during reverse sync!
+    const cleanTargetBeforeSync = input.reverse
+      ? false
+      : matchedRule
+        ? matchedRule.cleanTargetBeforeSync
+        : (input.adHoc?.cleanTargetBeforeSync ?? false);
+    const autoReloadTarget = matchedRule
+      ? matchedRule.autoReloadTarget
+      : (input.adHoc?.autoReloadTarget ?? false);
+    const includeCookieNames = matchedRule
+      ? matchedRule.includeCookieNames
+      : input.adHoc?.includeCookieNames;
+    const excludeCookieNames = matchedRule
+      ? matchedRule.excludeCookieNames
+      : input.adHoc?.excludeCookieNames;
+
+    const activeBoundTrackId = rt.meta.localDevice.siteBindings[srcSiteKey]?.trackId;
+    const validPinnedTrackId =
+      effectiveSourceTrackId && rt.tracks[effectiveSourceTrackId]
+        ? effectiveSourceTrackId
+        : undefined;
+    const isPinnedBackgroundTrack = Boolean(
+      validPinnedTrackId && validPinnedTrackId !== activeBoundTrackId,
+    );
+    const reverseDestSiteKey = input.reverse
+      ? resolveSiteKey(baseSourceSite, rt.meta.rules.ssoGroups) || normalizeDomain(baseSourceSite)
+      : '';
+    const reverseDestActiveTrackId = reverseDestSiteKey
+      ? rt.meta.localDevice.siteBindings[reverseDestSiteKey]?.trackId
+      : undefined;
+    const reverseTargetTrackId = input.reverse
+      ? destReverseTrackId && rt.tracks[destReverseTrackId]
+        ? destReverseTrackId
+        : reverseDestActiveTrackId
+      : undefined;
+    const isPinnedInactiveReverseTarget = Boolean(
+      input.reverse &&
+        reverseTargetTrackId &&
+        reverseTargetTrackId !== reverseDestActiveTrackId,
+    );
+
+    let appliedCookies = 0;
+    let failedCookies = 0;
+    let removedStaleCookies = 0;
+    let appliedLocalStorage = 0;
+    let skippedCookies = 0;
+    let actuallyMutatedTarget = false;
+    let pendingLsUpdated = false;
+    let reverseMutatedManagedState = false;
+    const errors: string[] = [];
+
+    if (syncCookies) {
+      const candidates: SourceCookieCandidate[] = [];
+
+      if (isPinnedBackgroundTrack) {
+        for (const rec of Object.values(rt.cookies)) {
+          if (rec.trackId === effectiveSourceTrackId && !rec.deleted) {
+            candidates.push({ cookie: rec, updatedAt: rec.updatedAt });
+          }
+        }
+      } else {
+        const fallbackTrackId =
+          activeBoundTrackId ??
+          Object.values(rt.tracks).find((t) => t.siteKey === srcSiteKey)?.trackId;
+        if (fallbackTrackId) {
+          for (const rec of Object.values(rt.cookies)) {
+            if (rec.trackId === fallbackTrackId && !rec.deleted) {
+              candidates.push({ cookie: rec, updatedAt: rec.updatedAt });
+            }
+          }
+        }
+
+        const allLiveCookies = await this.browser.getAllCookies();
+        for (const bc of allLiveCookies) {
+          const bcNorm = normalizeDomain(bc.domain);
+          const matchesSrc =
+            domainMatchesSiteKey(bc.domain, srcSiteKey, rt.meta.rules.ssoGroups) ||
+            (srcHost && (bcNorm === srcHost || bcNorm.endsWith(`.${srcHost}`)));
+          if (matchesSrc) {
+            candidates.push({ cookie: bc, updatedAt: nowMs + 1 });
+          }
+        }
+      }
+
+      const selection = selectAndMapEnvCookies({
+        candidates,
+        target: parsedTarget,
+        nowMs,
+        adaptForHttp,
+        filterNoise: rt.meta.space.settings.filterAnalyticsNoiseCookies,
+        sourceHostFilter: effectiveSourceHostFilter,
+        includeCookieNames,
+        excludeCookieNames,
+      });
+      skippedCookies = selection.skipped;
+
+      const excludeSet = new Set((excludeCookieNames ?? []).map((n) => n.trim()).filter(Boolean));
+
+      // Never wipe target cookies if source and target share the exact same host (same cookie jar, e.g. localhost:3000 -> localhost:8080)
+      if (cleanTargetBeforeSync && !isPinnedInactiveReverseTarget && srcHost !== parsedTarget.host) {
+        const mappedKeys = new Set(
+          selection.mapped.map(
+            (mc) =>
+              `${mc.hostOnly ? 'h' : 'd'}::${normalizeCookieDomain(mc.domain, mc.hostOnly)}::${mc.path || '/'}::${mc.name}`,
+          ),
+        );
+        const existingTargetCookies = await this.browser.getAllCookies({
+          domain: parsedTarget.host,
+        });
+        for (const tc of existingTargetCookies) {
+          // Strict host scope check: getAllCookies({ domain: 'dev.example.com' }) also returns
+          // child subdomains like 'api.dev.example.com'; never delete unrelated child-subdomain cookies!
+          const tcHost = normalizeDomain(tc.domain);
+          const inTargetScope = parsedTarget.explicitWildcardDomain
+            ? tcHost === parsedTarget.host || tcHost.endsWith(`.${parsedTarget.host}`)
+            : tcHost === parsedTarget.host;
+          if (!inTargetScope) continue;
+          if (excludeSet.has(tc.name)) continue;
+          const tcKey = `${tc.hostOnly ? 'h' : 'd'}::${normalizeCookieDomain(tc.domain, tc.hostOnly)}::${tc.path || '/'}::${tc.name}`;
+          if (!mappedKeys.has(tcKey)) {
+            try {
+              await this.removeExactBrowserCookie(tc, cookieContentCanonicalHash(tc), nowMs);
+              removedStaleCookies += 1;
+              actuallyMutatedTarget = true;
+            } catch {
+              // ignore removal error
+            }
+          }
+        }
+      }
+
+      if (isPinnedInactiveReverseTarget && reverseTargetTrackId && reverseDestSiteKey) {
+        for (const mc of selection.mapped) {
+          const existingRec = Object.values(rt.cookies).find(
+            (r) => r.trackId === reverseTargetTrackId && matchesCookieIdentity(r, mc),
+          );
+          const emitted = await this.emitLocalCookieUpsert(
+            rt,
+            reverseDestSiteKey,
+            reverseTargetTrackId,
+            mc,
+            existingRec ? 'UPDATE' : 'CREATE',
+          );
+          if (emitted) {
+            reverseMutatedManagedState = true;
+          }
+          appliedCookies += 1;
+        }
+      } else {
+        for (const mc of selection.mapped) {
+          const targetHash = cookieContentCanonicalHash(mc);
+          const url = buildCookieUrl(mc);
+          const existingInJar = await findExactBrowserCookie(this.browser, {
+            url,
+            domain: mc.domain,
+            hostOnly: mc.hostOnly,
+            path: mc.path || '/',
+            name: mc.name,
+            storeId: mc.storeId,
+            partitionKey: mc.partitionKey,
+          });
+
+          if (existingInJar && cookieContentCanonicalHash(existingInJar) === targetHash) {
+            if (input.reverse && reverseTargetTrackId && reverseDestSiteKey) {
+              const existingRec = Object.values(rt.cookies).find(
+                (r) => r.trackId === reverseTargetTrackId && matchesCookieIdentity(r, mc),
+              );
+              const emitted = await this.emitLocalCookieUpsert(
+                rt,
+                reverseDestSiteKey,
+                reverseTargetTrackId,
+                mc,
+                existingRec ? 'UPDATE' : 'CREATE',
+              );
+              if (emitted) reverseMutatedManagedState = true;
+            }
+            appliedCookies += 1;
+            continue;
+          }
+
+          this.echoSuppressor.registerCookieMutation(mc, 'set', targetHash, nowMs);
+          const verification = await applyCookieWithVerification(this.browser, mc, nowMs);
+          if (verification.accepted) {
+            if (input.reverse && reverseTargetTrackId && reverseDestSiteKey) {
+              const existingRec = Object.values(rt.cookies).find(
+                (r) => r.trackId === reverseTargetTrackId && matchesCookieIdentity(r, mc),
+              );
+              const emitted = await this.emitLocalCookieUpsert(
+                rt,
+                reverseDestSiteKey,
+                reverseTargetTrackId,
+                mc,
+                existingRec ? 'UPDATE' : 'CREATE',
+              );
+              if (emitted) reverseMutatedManagedState = true;
+            }
+            appliedCookies += 1;
+            actuallyMutatedTarget = true;
+          } else {
+            failedCookies += 1;
+            errors.push(`${mc.name}: ${verification.reason || '写入校验未通过'}`);
+          }
+        }
+      }
+    }
+
+    if (syncLocalStorage) {
+      const sourceLsMap = new Map<string, string>();
+      const includeSet =
+        includeCookieNames && includeCookieNames.length > 0
+          ? new Set(includeCookieNames.map((n) => n.trim()).filter(Boolean))
+          : null;
+      const excludeSet = new Set((excludeCookieNames ?? []).map((n) => n.trim()).filter(Boolean));
+
+      const originMatchesSourceLsFilter = (origin: string): boolean => {
+        if (origin === parsedTarget.origin) return false;
+        if (input.reverse && parsedSourceTarget?.port) {
+          return origin === parsedSourceTarget.origin;
+        }
+        if (effectiveSourceHostFilter) {
+          const origHost = normalizeDomain(origin);
+          return (
+            origHost === effectiveSourceHostFilter ||
+            origHost.endsWith(`.${effectiveSourceHostFilter}`)
+          );
+        }
+        return true;
+      };
+
+      if (isPinnedBackgroundTrack) {
+        for (const rec of Object.values(rt.localStorage)) {
+          if (
+            rec.trackId === effectiveSourceTrackId &&
+            !rec.deleted &&
+            originMatchesSourceLsFilter(rec.origin)
+          ) {
+            sourceLsMap.set(rec.key, rec.value);
+          }
+        }
+      } else {
+        const fallbackTrackId =
+          activeBoundTrackId ??
+          Object.values(rt.tracks).find((t) => t.siteKey === srcSiteKey)?.trackId;
+        if (fallbackTrackId) {
+          for (const rec of Object.values(rt.localStorage)) {
+            if (
+              rec.trackId === fallbackTrackId &&
+              !rec.deleted &&
+              originMatchesSourceLsFilter(rec.origin)
+            ) {
+              sourceLsMap.set(rec.key, rec.value);
+            }
+          }
+        }
+
+        // Overlay live localStorage from open source tabs if available
+        try {
+          const tabs = await this.browser.queryTabs();
+          const candidateOrigins = new Set<string>();
+          if (parsedSourceTarget?.origin && input.reverse && originMatchesSourceLsFilter(parsedSourceTarget.origin)) {
+            candidateOrigins.add(parsedSourceTarget.origin);
+          }
+          for (const tab of tabs) {
+            const origin = tab.url ? normalizeOriginSafe(tab.url) : null;
+            if (!origin || !originMatchesSourceLsFilter(origin)) continue;
+            if (
+              resolveSiteKey(origin, rt.meta.rules.ssoGroups) === srcSiteKey ||
+              normalizeDomain(origin) === srcHost
+            ) {
+              candidateOrigins.add(origin);
+            }
+          }
+          for (const origin of candidateOrigins) {
+            const lsState = await this.browser.getLocalStorage(origin);
+            if (lsState.available) {
+              for (const [k, v] of Object.entries(lsState.items)) {
+                sourceLsMap.set(k, v);
+              }
+            }
+          }
+        } catch {
+          // ignore live tab LS errors
+        }
+      }
+
+      const filteredEntries = Array.from(sourceLsMap.entries()).filter(([k]) => {
+        if (includeSet && !includeSet.has(k)) return false;
+        if (excludeSet.has(k)) return false;
+        return true;
+      });
+
+      const targetLsOrigins = new Set<string>();
+      try {
+        const tabs = await this.browser.queryTabs();
+        const baseTargetSiteKey =
+          resolveSiteKey(parsedTarget.host, rt.meta.rules.ssoGroups) || parsedTarget.host;
+        for (const tab of tabs) {
+          const tabOrigin = tab.url ? normalizeOriginSafe(tab.url) : null;
+          if (!tabOrigin || tabOrigin === parsedSourceTarget?.origin) continue;
+          const parsedTab = parseEnvTarget(tabOrigin);
+          if (!parsedTab) continue;
+          const hostOk = parsedTarget.explicitWildcardDomain
+            ? parsedTab.host === parsedTarget.host ||
+              parsedTab.host.endsWith(`.${parsedTarget.host}`) ||
+              (Boolean(input.reverse) &&
+                !baseSourceHostFilter &&
+                resolveSiteKey(parsedTab.host, rt.meta.rules.ssoGroups) === baseTargetSiteKey)
+            : parsedTab.host === parsedTarget.host;
+          const portOk = !parsedTarget.port || parsedTab.port === parsedTarget.port;
+          if (hostOk && portOk) {
+            targetLsOrigins.add(tabOrigin);
+          }
+        }
+      } catch {
+        // ignore tab query errors
+      }
+      if (targetLsOrigins.size === 0 && parsedTarget.origin !== parsedSourceTarget?.origin) {
+        targetLsOrigins.add(parsedTarget.origin);
+      }
+
+      const succeededLsKeys = new Set<string>();
+      if (isPinnedInactiveReverseTarget && reverseTargetTrackId && reverseDestSiteKey) {
+        const inactiveDestOrigins = new Set<string>();
+        for (const rec of Object.values(rt.localStorage)) {
+          if (
+            (rec.trackId === reverseTargetTrackId || rec.siteKey === reverseDestSiteKey) &&
+            !rec.deleted
+          ) {
+            inactiveDestOrigins.add(rec.origin);
+          }
+        }
+        if (inactiveDestOrigins.size === 0) {
+          const fallbackHost = baseSourceHostFilter || reverseDestSiteKey;
+          inactiveDestOrigins.add(
+            isLocalOrSingleLabelHost(fallbackHost)
+              ? `http://${fallbackHost}`
+              : `https://${fallbackHost}`,
+          );
+        }
+        for (const destOrigin of inactiveDestOrigins) {
+          for (const [k, v] of filteredEntries) {
+            const existingLs =
+              rt.localStorage[buildLocalStorageLogicalId(reverseTargetTrackId, destOrigin, k)];
+            const emitted = await this.emitLocalStorageUpsert(
+              rt,
+              reverseDestSiteKey,
+              reverseTargetTrackId,
+              destOrigin,
+              k,
+              v,
+              existingLs && !existingLs.deleted ? 'UPDATE' : 'CREATE',
+            );
+            if (emitted) reverseMutatedManagedState = true;
+            succeededLsKeys.add(k);
+          }
+        }
+      } else {
+        for (const targetOrigin of targetLsOrigins) {
+          const targetLs = await this.browser.getLocalStorage(targetOrigin);
+          if (!targetLs.available) {
+            if (!input.reverse && (filteredEntries.length > 0 || cleanTargetBeforeSync)) {
+              rt.meta.pendingEnvLsByOrigin = rt.meta.pendingEnvLsByOrigin ?? {};
+              rt.meta.pendingEnvLsByOrigin[targetOrigin] = {
+                items: Object.fromEntries(filteredEntries),
+                cleanTargetBeforeSync,
+                excludeKeys: Array.from(excludeSet),
+                autoReloadTarget,
+              };
+              pendingLsUpdated = true;
+            }
+            continue;
+          }
+
+          if (rt.meta.pendingEnvLsByOrigin?.[targetOrigin]) {
+            delete rt.meta.pendingEnvLsByOrigin[targetOrigin];
+            pendingLsUpdated = true;
+          }
+          const lsApplyRes = await this.applyEnvLsEntriesToOpenOrigin(
+            targetOrigin,
+            targetLs.items,
+            filteredEntries,
+            cleanTargetBeforeSync,
+            excludeSet,
+            nowMs,
+          );
+          if (lsApplyRes.mutated) {
+            actuallyMutatedTarget = true;
+          }
+          if (lsApplyRes.applied) {
+            for (const [k, v] of filteredEntries) {
+              if (input.reverse && reverseTargetTrackId && reverseDestSiteKey) {
+                const existingLs =
+                  rt.localStorage[buildLocalStorageLogicalId(reverseTargetTrackId, targetOrigin, k)];
+                const emitted = await this.emitLocalStorageUpsert(
+                  rt,
+                  reverseDestSiteKey,
+                  reverseTargetTrackId,
+                  targetOrigin,
+                  k,
+                  v,
+                  existingLs && !existingLs.deleted ? 'UPDATE' : 'CREATE',
+                );
+                if (emitted) reverseMutatedManagedState = true;
+              }
+              succeededLsKeys.add(k);
+            }
+          }
+        }
+      }
+      appliedLocalStorage = succeededLsKeys.size;
+    }
+
+    let reloadedTabs = 0;
+    if (autoReloadTarget && actuallyMutatedTarget && !isPinnedInactiveReverseTarget) {
+      reloadedTabs = await this.reloadTabsForUserAction(rt, (tabUrl) => {
+        const parsedTab = parseEnvTarget(tabUrl);
+        if (!parsedTab) return false;
+        const hostOk = parsedTarget.explicitWildcardDomain
+          ? parsedTab.host === parsedTarget.host || parsedTab.host.endsWith(`.${parsedTarget.host}`)
+          : parsedTab.host === parsedTarget.host;
+        const portOk = !parsedTarget.port || parsedTab.port === parsedTarget.port;
+        return hostOk && portOk;
+      });
+    }
+
+    if (matchedRule) {
+      matchedRule.lastSyncedAt = nowMs;
+      matchedRule.lastSyncedCount = appliedCookies + appliedLocalStorage;
+    }
+    if (reverseMutatedManagedState) {
+      rt.meta.space.status = this.computeStatus(rt);
+    }
+    if (persistAfter && (matchedRule || pendingLsUpdated || reverseMutatedManagedState)) {
+      await this.persistRuntime(rt);
+    }
+    if (reverseMutatedManagedState && rt.meta.space.settings.autoSync) {
+      await this.tryPushOutboundBestEffort(rt, 'env_reverse_sync_push');
+    }
+
+    return {
+      ruleId: matchedRule?.id,
+      sourceSiteKey: srcSiteKey,
+      targetUrl: parsedTarget.origin,
+      targetHost: parsedTarget.host,
+      appliedCookies,
+      failedCookies,
+      removedStaleCookies,
+      appliedLocalStorage,
+      skippedCookies,
+      reloadedTabs,
+      errors,
+    };
   }
 
   async importRulesJson(jsonOrObj: unknown): Promise<void> {
@@ -7480,11 +9937,33 @@ export class SyncEngine {
       if (parsed.spaceRules.ssoGroups) {
         rt.meta.rules.ssoGroups = parsed.spaceRules.ssoGroups;
       }
+      if (parsed.spaceRules.envSyncRules) {
+        const seenIds = new Set<string>();
+        rt.meta.rules.envSyncRules = parsed.spaceRules.envSyncRules.filter((r) => {
+          const pt = parseEnvTarget(r.targetUrl);
+          if (!pt || isBlockedWebdavSelfTarget(rt.webdav.url, pt) || seenIds.has(r.id)) {
+            return false;
+          }
+          seenIds.add(r.id);
+          return true;
+        });
+      }
       if (parsed.deviceBlacklist && parsed.deviceBlacklist.length > 0) {
         rt.meta.deviceBlacklist = parsed.deviceBlacklist;
       }
+      if (parsed.deviceEnvSyncRules && parsed.deviceEnvSyncRules.length > 0) {
+        const seenDevIds = new Set<string>();
+        rt.meta.deviceEnvSyncRules = parsed.deviceEnvSyncRules.filter((r) => {
+          const pt = parseEnvTarget(r.targetUrl);
+          if (!pt || isBlockedWebdavSelfTarget(rt.webdav.url, pt) || seenDevIds.has(r.id)) {
+            return false;
+          }
+          seenDevIds.add(r.id);
+          return true;
+        });
+      }
       rt.meta.rules.updatedAt = nowMs;
-      rt.rulesEngine.update(rt.meta.space.settings, rt.meta.rules, rt.meta.deviceBlacklist);
+      this.syncRulesEngineState(rt);
       this.reconcileBlacklistBindings(rt);
 
       await this.updateRemoteSpaceMetaIfPossible(rt, (desc) => ({
@@ -7703,8 +10182,9 @@ export class SyncEngine {
       }
 
       await this.persistRuntime(rt);
-      if (rt.meta.space.settings.autoSync && this.isOnline() && !rt.meta.storageFullHalted) {
-        await this.pushOutboundInternal(rt);
+      if (rt.meta.space.settings.autoSync) {
+        await this.tryPushOutboundBestEffort(rt, 'restore_historical_event');
+        rt.meta.space.status = this.computeStatus(rt);
         await this.persistRuntime(rt);
       }
     });
@@ -7803,8 +10283,9 @@ export class SyncEngine {
 
       rt.meta.space.status = this.computeStatus(rt);
       await this.persistRuntime(rt);
-      if (rt.meta.space.settings.autoSync && this.isOnline() && !rt.meta.storageFullHalted) {
-        await this.pushOutboundInternal(rt);
+      if (rt.meta.space.settings.autoSync) {
+        await this.tryPushOutboundBestEffort(rt, 'resolve_conflict');
+        rt.meta.space.status = this.computeStatus(rt);
         await this.persistRuntime(rt);
       }
     });
@@ -7844,7 +10325,44 @@ export class SyncEngine {
         oldTr.updatedAt = Math.max(nowMs, oldTr.updatedAt + 1);
       }
       if (point.previousBinding) {
-        rt.meta.localDevice.siteBindings[point.siteKey] = { ...point.previousBinding };
+        if (point.previousBinding.trackId && !rt.tracks[point.previousBinding.trackId]) {
+          // Guard against dangling trackId if the previous track was deleted before undo:
+          // if other tracks still exist for this site, move to PENDING_CHOICE so the site
+          // remains visible and the restored cookies are not overwritten; otherwise UNMANAGED.
+          const remainingTracks = Object.values(rt.tracks).filter(
+            (t) => t.siteKey === point.siteKey,
+          );
+          if (remainingTracks.length > 0) {
+            const localLsCount = Object.values(point.localStorageByOrigin).reduce(
+              (sum, obj) => sum + Object.keys(obj).length,
+              0,
+            );
+            rt.meta.localDevice.siteBindings[point.siteKey] = {
+              ...point.previousBinding,
+              state: 'PENDING_CHOICE',
+              trackId: undefined,
+              availableTrackIds: remainingTracks.map((t) => t.trackId),
+            };
+            rt.pendingDecisions[point.siteKey] = {
+              siteKey: point.siteKey,
+              reason:
+                remainingTracks.length > 1 ? 'multiple_remote_tracks' : 'both_sides_have_data',
+              hasLocalData: point.cookies.length > 0 || localLsCount > 0,
+              localCookieCount: point.cookies.length,
+              localLocalStorageCount: localLsCount,
+              remoteTracks: remainingTracks,
+              detectedAt: nowMs,
+            };
+          } else {
+            rt.meta.localDevice.siteBindings[point.siteKey] = {
+              ...point.previousBinding,
+              state: 'UNMANAGED',
+              trackId: undefined,
+            };
+          }
+        } else {
+          rt.meta.localDevice.siteBindings[point.siteKey] = { ...point.previousBinding };
+        }
         if (point.previousBinding.state === 'PENDING_CHOICE') {
           const remoteTracks = Object.values(rt.tracks).filter((t) => t.siteKey === point.siteKey);
           if (remoteTracks.length > 0) {
@@ -7896,23 +10414,61 @@ export class SyncEngine {
         await applyCookieWithVerification(this.browser, c, nowMs);
       }
 
-      // Restore snapshotted LocalStorage
-      for (const [origin, items] of Object.entries(point.localStorageByOrigin)) {
-        const currentLs = await this.browser.getLocalStorage(origin);
-        if (!currentLs.available) continue;
-        const mutations: Array<{ key: string; value?: string; deleted?: boolean }> = [];
-        for (const k of Object.keys(currentLs.items)) {
-          if (!Object.prototype.hasOwnProperty.call(items, k)) {
-            this.echoSuppressor.registerLocalStorageMutation(origin, k, 'remove', '', nowMs);
-            mutations.push({ key: k, deleted: true });
+      // Clear any deferred clean-switch marker for this site before restoring the undo point
+      if (rt.meta.pendingCleanLsBySite?.[point.siteKey]) {
+        delete rt.meta.pendingCleanLsBySite[point.siteKey];
+      }
+
+      // Restore snapshotted LocalStorage (including clearing stale LS on open & closed origins)
+      const lsTargets = new Map<string, Record<string, string>>(
+        Object.entries(point.localStorageByOrigin),
+      );
+      for (const lsRec of Object.values(rt.localStorage)) {
+        if (lsRec.siteKey === point.siteKey && !lsTargets.has(lsRec.origin)) {
+          lsTargets.set(lsRec.origin, {});
+        }
+      }
+      try {
+        const tabs = await this.browser.queryTabs();
+        for (const tab of tabs) {
+          const origin = tab.url ? normalizeOriginSafe(tab.url) : null;
+          if (
+            origin &&
+            resolveSiteKey(origin, rt.meta.rules.ssoGroups) === point.siteKey &&
+            !lsTargets.has(origin)
+          ) {
+            lsTargets.set(origin, {});
           }
         }
-        for (const [k, v] of Object.entries(items)) {
-          this.echoSuppressor.registerLocalStorageMutation(origin, k, 'set', v, nowMs);
-          mutations.push({ key: k, value: v });
+      } catch {
+        // ignore tab query errors
+      }
+      let changedOpenLs = false;
+      for (const [origin, items] of lsTargets.entries()) {
+        const currentLs = await this.browser.getLocalStorage(origin);
+        if (!currentLs.available) {
+          rt.meta.pendingEnvLsByOrigin = rt.meta.pendingEnvLsByOrigin ?? {};
+          rt.meta.pendingEnvLsByOrigin[origin] = {
+            items: { ...items },
+            cleanTargetBeforeSync: true,
+            excludeKeys: [],
+            autoReloadTarget: true,
+          };
+          continue;
         }
-        if (mutations.length > 0) {
-          await this.browser.applyLocalStorage(origin, mutations);
+        if (rt.meta.pendingEnvLsByOrigin?.[origin]) {
+          delete rt.meta.pendingEnvLsByOrigin[origin];
+        }
+        const applyRes = await this.applyEnvLsEntriesToOpenOrigin(
+          origin,
+          currentLs.items,
+          Object.entries(items),
+          true,
+          new Set(),
+          nowMs,
+        );
+        if (applyRes.mutated) {
+          changedOpenLs = true;
         }
       }
 
@@ -7920,13 +10476,23 @@ export class SyncEngine {
 
       const sitePolicy = this.getEffectivePolicyForDevice(rt, point.siteKey, point.siteKey);
       const versionDigest = await sha256Hex(`undo:${point.undoId}:${nowMs}`);
-      await this.autoRefresh.notifyAppliedChanges({
+      const refreshRes = await this.autoRefresh.notifyAppliedChanges({
         siteKey: point.siteKey,
         versionDigest,
         autoRefreshEnabled: sitePolicy.autoRefresh && rt.meta.space.settings.autoRefresh,
         refreshProtectionEnabled: rt.meta.space.settings.refreshProtection,
         immediate: this.refreshCoalesceMs <= 0,
       });
+      if (
+        !(sitePolicy.autoRefresh && rt.meta.space.settings.autoRefresh) &&
+        refreshRes.reloadedTabIds.length === 0 &&
+        (changedOpenLs || point.cookies.length > 0 || currentCookies.some((c) => domainMatchesSiteKey(c.domain, point.siteKey, rt.meta.rules.ssoGroups)))
+      ) {
+        const reloaded = await this.reloadTabsForUserAction(rt, this.siteTabMatcher(rt, point.siteKey));
+        if (reloaded > 0) {
+          this.postReloadPushMuteUntil.set(point.siteKey, this.now() + 12_000);
+        }
+      }
 
       rt.meta.space.status = this.computeStatus(rt);
       await this.uploadDeviceManifestIfOnline(rt);
@@ -7953,152 +10519,181 @@ export class SyncEngine {
 
   async checkIntegrity(): Promise<IntegrityReport> {
     await this.ensureInitialized();
-    const rt = this.requireRuntime();
-    const checkedAt = this.now();
-    const corruptedPaths: string[] = [];
-    const missingSeqGaps: string[] = [];
-    const details: string[] = [];
+    return this.enqueueOp(async () => {
+      const rt = this.requireRuntime();
+      const checkedAt = this.now();
+      const corruptedPaths: string[] = [];
+      const missingSeqGaps: string[] = [];
+      const details: string[] = [];
 
-    // 1. Check space.enc
-    let spaceMetadataOk = false;
-    const metaPath = spaceMetaPath(rt.meta.space.opaqueId);
-    try {
-      const fetched = await rt.client.getBytes(metaPath);
-      if (!isSmesEnvelope(fetched.bytes)) {
-        throw new Error('Invalid SMES header');
-      }
-      if (rt.encryptionPassword) {
-        const desc = await decryptWithPassword<SpaceDescriptorPayload>(
-          fetched.bytes,
-          rt.encryptionPassword,
-          buildSpaceMetaAad(rt.spaceId, metaPath),
-        );
-        if (desc.verifier !== 'SESSIONMESH_SPACE_OK') {
-          throw new Error('Space verifier mismatch');
-        }
-      }
-      spaceMetadataOk = true;
-    } catch (err) {
-      corruptedPaths.push(metaPath);
-      details.push(`Space metadata error: ${err instanceof Error ? err.message : String(err)}`);
-    }
-
-    // 2. Check devices/*.enc
-    let deviceFilesCount = 0;
-    const devIds: string[] = [];
-    try {
-      const stats = await rt.client.propfind(devicesDir(rt.meta.space.opaqueId), 1);
-      for (const s of stats) {
-        if (s.isCollection) continue;
-        const name = s.name || extractFilename(s.path);
-        if (!name.endsWith('.enc')) continue;
-        deviceFilesCount += 1;
-        const devId = name.slice(0, -4);
-        devIds.push(devId);
-        const p = deviceFilePath(rt.meta.space.opaqueId, devId);
-        try {
-          const fetched = await rt.client.getBytes(p);
-          const { header } = await decryptWithDek(fetched.bytes, rt.dekKeyring, `${rt.spaceId}|`);
-          if (header.aad !== buildFileAad(rt.spaceId, header.keyEpoch, 'device', p)) {
-            throw new Error('AAD mismatch');
-          }
-        } catch (err) {
-          corruptedPaths.push(p);
-          details.push(`Corrupted device file ${p}: ${err instanceof Error ? err.message : String(err)}`);
-        }
-      }
-    } catch (err) {
-      details.push(`Failed listing devices: ${err instanceof Error ? err.message : String(err)}`);
-    }
-
-    // 3. Check events/{devId}/*.enc & sequence gaps
-    let eventFilesCount = 0;
-    for (const devId of devIds) {
-      const dir = deviceEventsDir(rt.meta.space.opaqueId, devId);
+      // 1. Check space.enc
+      let spaceMetadataOk = false;
+      const metaPath = spaceMetaPath(rt.meta.space.opaqueId);
       try {
-        const stats = await rt.client.propfind(dir, 1);
-        const files = stats
-          .filter((s) => !s.isCollection && (s.name || extractFilename(s.path)).endsWith('.enc'))
-          .sort((a, b) => {
-            const na = a.name || extractFilename(a.path);
-            const nb = b.name || extractFilename(b.path);
-            return parseEventFilenameSeq(na) - parseEventFilenameSeq(nb);
-          });
+        const fetched = await rt.client.getBytes(metaPath);
+        if (!isSmesEnvelope(fetched.bytes)) {
+          throw new Error('Invalid SMES header');
+        }
+        if (rt.encryptionPassword) {
+          const desc = await decryptWithPassword<SpaceDescriptorPayload>(
+            fetched.bytes,
+            rt.encryptionPassword,
+            buildSpaceMetaAad(rt.spaceId, metaPath),
+          );
+          if (desc.verifier !== 'SESSIONMESH_SPACE_OK') {
+            throw new Error('Space verifier mismatch');
+          }
+        }
+        spaceMetadataOk = true;
+      } catch (err) {
+        corruptedPaths.push(metaPath);
+        details.push(`Space metadata error: ${err instanceof Error ? err.message : String(err)}`);
+      }
 
-        let prevToSeq = 0;
-        for (const s of files) {
+      // 2. Check devices/*.enc
+      let deviceFilesCount = 0;
+      const devIds: string[] = [];
+      try {
+        const stats = await rt.client.propfind(devicesDir(rt.meta.space.opaqueId), 1);
+        for (const s of stats) {
+          if (s.isCollection) continue;
           const name = s.name || extractFilename(s.path);
-          const p = `${dir}/${name}`;
-          eventFilesCount += 1;
+          if (!name.endsWith('.enc')) continue;
+          deviceFilesCount += 1;
+          const devId = name.slice(0, -4);
+          devIds.push(devId);
+          const p = deviceFilePath(rt.meta.space.opaqueId, devId);
           try {
             const fetched = await rt.client.getBytes(p);
-            const { data: batch, header } = await decryptWithDek<EventBatch>(
-              fetched.bytes,
-              rt.dekKeyring,
-              `${rt.spaceId}|`,
-            );
-            if (header.aad !== buildFileAad(rt.spaceId, header.keyEpoch, 'event_batch', p)) {
+            const { header } = await decryptWithDek(fetched.bytes, rt.dekKeyring, `${rt.spaceId}|`);
+            if (header.aad !== buildFileAad(rt.spaceId, header.keyEpoch, 'device', p)) {
               throw new Error('AAD mismatch');
             }
-            if (prevToSeq > 0 && batch.fromSeq > prevToSeq + 1) {
-              missingSeqGaps.push(`${devId}:${prevToSeq + 1}..${batch.fromSeq - 1}`);
-            }
-            prevToSeq = Math.max(prevToSeq, batch.toSeq);
           } catch (err) {
             corruptedPaths.push(p);
-            details.push(`Corrupted event batch ${p}: ${err instanceof Error ? err.message : String(err)}`);
+            details.push(`Corrupted device file ${p}: ${err instanceof Error ? err.message : String(err)}`);
+          }
+        }
+      } catch (err) {
+        details.push(`Failed listing devices: ${err instanceof Error ? err.message : String(err)}`);
+      }
+
+      // 3. Check events/{devId}/*.enc & sequence gaps
+      let eventFilesCount = 0;
+      for (const devId of devIds) {
+        const dir = deviceEventsDir(rt.meta.space.opaqueId, devId);
+        try {
+          const stats = await rt.client.propfind(dir, 1);
+          const files = stats
+            .filter((s) => !s.isCollection && (s.name || extractFilename(s.path)).endsWith('.enc'))
+            .sort((a, b) => {
+              const na = a.name || extractFilename(a.path);
+              const nb = b.name || extractFilename(b.path);
+              return parseEventFilenameSeq(na) - parseEventFilenameSeq(nb);
+            });
+
+          let prevToSeq = 0;
+          for (const s of files) {
+            const name = s.name || extractFilename(s.path);
+            const p = `${dir}/${name}`;
+            eventFilesCount += 1;
+            try {
+              const fetched = await rt.client.getBytes(p);
+              const { data: batch, header } = await decryptWithDek<EventBatch>(
+                fetched.bytes,
+                rt.dekKeyring,
+                `${rt.spaceId}|`,
+              );
+              if (header.aad !== buildFileAad(rt.spaceId, header.keyEpoch, 'event_batch', p)) {
+                throw new Error('AAD mismatch');
+              }
+              if (prevToSeq > 0 && batch.fromSeq > prevToSeq + 1) {
+                const isLocalDeferredOnly =
+                  devId === rt.meta.localDevice.deviceId &&
+                  rt.pendingOutboundEvents.some(
+                    (pe) => pe.deviceSeq > prevToSeq && pe.deviceSeq < batch.fromSeq,
+                  );
+                if (!isLocalDeferredOnly) {
+                  missingSeqGaps.push(`${devId}:${prevToSeq + 1}..${batch.fromSeq - 1}`);
+                }
+              }
+              prevToSeq = Math.max(prevToSeq, batch.toSeq);
+            } catch (err) {
+              corruptedPaths.push(p);
+              details.push(`Corrupted event batch ${p}: ${err instanceof Error ? err.message : String(err)}`);
+            }
+          }
+        } catch {
+          // Device may have no event files yet
+        }
+      }
+
+      // 4. Check snapshots/*.enc
+      let snapshotFilesCount = 0;
+      try {
+        const stats = await rt.client.propfind(snapshotsDir(rt.meta.space.opaqueId), 1);
+        for (const s of stats) {
+          if (s.isCollection) continue;
+          const name = s.name || extractFilename(s.path);
+          if (!name.endsWith('.enc')) continue;
+          snapshotFilesCount += 1;
+          const p = snapshotFilePath(rt.meta.space.opaqueId, name);
+          try {
+            const fetched = await rt.client.getBytes(p);
+            const { header } = await decryptWithDek(fetched.bytes, rt.dekKeyring, `${rt.spaceId}|`);
+            if (header.aad !== buildFileAad(rt.spaceId, header.keyEpoch, 'snapshot', p)) {
+              throw new Error('AAD mismatch');
+            }
+          } catch (err) {
+            corruptedPaths.push(p);
+            details.push(`Corrupted snapshot ${p}: ${err instanceof Error ? err.message : String(err)}`);
           }
         }
       } catch {
-        // Device may have no event files yet
+        // Snapshots dir might be empty
       }
-    }
 
-    // 4. Check snapshots/*.enc
-    let snapshotFilesCount = 0;
-    try {
-      const stats = await rt.client.propfind(snapshotsDir(rt.meta.space.opaqueId), 1);
-      for (const s of stats) {
-        if (s.isCollection) continue;
-        const name = s.name || extractFilename(s.path);
-        if (!name.endsWith('.enc')) continue;
-        snapshotFilesCount += 1;
-        const p = snapshotFilePath(rt.meta.space.opaqueId, name);
-        try {
-          const fetched = await rt.client.getBytes(p);
-          const { header } = await decryptWithDek(fetched.bytes, rt.dekKeyring, `${rt.spaceId}|`);
-          if (header.aad !== buildFileAad(rt.spaceId, header.keyEpoch, 'snapshot', p)) {
-            throw new Error('AAD mismatch');
-          }
-        } catch (err) {
-          corruptedPaths.push(p);
-          details.push(`Corrupted snapshot ${p}: ${err instanceof Error ? err.message : String(err)}`);
-        }
-      }
-    } catch {
-      // Snapshots dir might be empty
-    }
+      rt.meta.corruptedPaths = [...corruptedPaths];
+      await this.persistRuntime(rt);
 
-    rt.meta.corruptedPaths = [...corruptedPaths];
-    await this.persistRuntime(rt);
-
-    return {
-      checkedAt,
-      ok: spaceMetadataOk && corruptedPaths.length === 0 && missingSeqGaps.length === 0,
-      spaceMetadataOk,
-      deviceFilesCount,
-      eventFilesCount,
-      snapshotFilesCount,
-      corruptedPaths,
-      missingSeqGaps,
-      details,
-    };
+      return {
+        checkedAt,
+        ok: spaceMetadataOk && corruptedPaths.length === 0 && missingSeqGaps.length === 0,
+        spaceMetadataOk,
+        deviceFilesCount,
+        eventFilesCount,
+        snapshotFilesCount,
+        corruptedPaths,
+        missingSeqGaps,
+        details,
+      };
+    });
   }
 
   async rebuildIndex(): Promise<void> {
     await this.ensureInitialized();
     return this.enqueueOp(async () => {
       const rt = this.requireRuntime();
+      const nowMs = this.now();
+      const localDevId = rt.meta.localDevice.deviceId;
+      const boundTrackIds = new Set(
+        Object.values(rt.meta.localDevice.siteBindings)
+          .map((b) => b.trackId)
+          .filter((id): id is string => Boolean(id)),
+      );
+      const pendingTrackIds = new Set(rt.pendingOutboundEvents.map((ev) => ev.trackId));
+      const preservedLocalTracks = Object.values(rt.tracks)
+        .filter(
+          (tr) =>
+            boundTrackIds.has(tr.trackId) ||
+            pendingTrackIds.has(tr.trackId) ||
+            tr.memberDeviceIds.includes(localDevId),
+        )
+        .map((tr) => ({ ...tr, memberDeviceIds: [...tr.memberDeviceIds] }));
+      const pendingEventsSnapshot = [...rt.pendingOutboundEvents].sort(
+        (a, b) => a.deviceSeq - b.deviceSeq,
+      );
+
       rt.meta.peerDeviceEtags = {};
       rt.meta.processedEventPaths = {};
       rt.meta.corruptedPaths = [];
@@ -8113,8 +10708,21 @@ export class SyncEngine {
 
       // Replay our own remote events as well so nothing is lost on rebuild
       await this.replayDeviceEvents(rt, rt.meta.localDevice.deviceId);
+
+      // Re-integrate unpushed local tracks & pending outbound mutations before pulling remote
+      for (const tr of preservedLocalTracks) {
+        this.mergeRemoteTrack(rt, tr.trackId, tr);
+      }
+      for (const ev of pendingEventsSnapshot) {
+        this.integrateRemoteEvent(rt, ev, nowMs, {
+          recordHistory: false,
+          defaultSyncStatus: 'LOCAL_NEWER',
+        });
+      }
+
       await this.pullRemoteInternal(rt, { applyToBrowser: true });
 
+      rt.meta.localDevice.pendingEvents = rt.pendingOutboundEvents.length;
       rt.meta.space.status = this.computeStatus(rt);
       await this.persistRuntime(rt);
     });
@@ -8134,7 +10742,8 @@ export class SyncEngine {
       .sort((a, b) => {
         const na = a.name || extractFilename(a.path);
         const nb = b.name || extractFilename(b.path);
-        return parseEventFilenameSeq(na) - parseEventFilenameSeq(nb);
+        const seqDiff = parseEventFilenameSeq(na) - parseEventFilenameSeq(nb);
+        return seqDiff !== 0 ? seqDiff : na.localeCompare(nb);
       });
 
     const nowMs = this.now();
@@ -8143,11 +10752,14 @@ export class SyncEngine {
       const p = `${dir}/${name}`;
       try {
         const fetched = await rt.client.getBytes(p);
-        const { data: batch } = await decryptWithDek<EventBatch>(
+        const { data: batch, header } = await decryptWithDek<EventBatch>(
           fetched.bytes,
           rt.dekKeyring,
           `${rt.spaceId}|`,
         );
+        if (header.aad !== buildFileAad(rt.spaceId, header.keyEpoch, 'event_batch', p)) {
+          throw new Error(`AAD mismatch on ${p}`);
+        }
         if (batch.tracksDelta) {
           for (const tr of batch.tracksDelta) {
             this.mergeRemoteTrack(rt, tr.trackId, tr);
@@ -8194,8 +10806,8 @@ export class SyncEngine {
         Object.assign(rt.localStorage, snap.localStorage ?? {});
         Object.assign(rt.tombstones, snap.tombstones ?? {});
         if (snap.rules && snap.rules.updatedAt > rt.meta.rules.updatedAt) {
-          rt.meta.rules = snap.rules;
-          rt.rulesEngine.update(rt.meta.space.settings, rt.meta.rules, rt.meta.deviceBlacklist);
+          rt.meta.rules = { ...snap.rules, envSyncRules: snap.rules.envSyncRules ?? [] };
+          this.syncRulesEngineState(rt);
         }
         rt.meta.localDevice.checkpoint.processedVectorClock = mergeVectorClocks(
           rt.meta.localDevice.checkpoint.processedVectorClock,
@@ -8427,13 +11039,26 @@ export class SyncEngine {
         await this.captureSafetyUndoPoint(rt, siteKey, `restore_backup:${cleanId}`);
       }
 
-      // Restore tracks & rules
+      // Restore tracks & rules (clearing removedTracks tombstones and bumping timestamps/revisions
+      // so peer devices accept the resurrected tracks instead of re-deleting them!)
+      const restoreNow = this.now();
       for (const [tid, tr] of Object.entries(backup.tracks ?? {})) {
-        rt.tracks[tid] = { ...tr };
+        if (rt.meta.removedTracks) {
+          delete rt.meta.removedTracks[tid];
+        }
+        rt.tracks[tid] = {
+          ...tr,
+          updatedAt: Math.max(restoreNow, tr.updatedAt + 1),
+          revision: (tr.revision ?? 0) + 1,
+        };
       }
       if (backup.rules) {
-        rt.meta.rules = { ...backup.rules, updatedAt: this.now() };
-        rt.rulesEngine.update(rt.meta.space.settings, rt.meta.rules, rt.meta.deviceBlacklist);
+        rt.meta.rules = {
+          ...backup.rules,
+          envSyncRules: backup.rules.envSyncRules ?? [],
+          updatedAt: restoreNow,
+        };
+        this.syncRulesEngineState(rt);
       }
 
       // Emit new causal successor RESTORE events for all live cookies in the backup
@@ -8461,7 +11086,7 @@ export class SyncEngine {
             session: c.session,
             expirationDate: c.expirationDate,
             hostOnly: c.hostOnly,
-            storeId: c.storeScope,
+            storeId: c.storeScope && c.storeScope !== 'default' ? c.storeScope : undefined,
             partitionKey: c.partitionKey,
           },
           'RESTORE',

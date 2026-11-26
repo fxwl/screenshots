@@ -73,10 +73,9 @@ import { CapabilityReportView } from './CapabilityReportView';
 interface WebDAVTabProps {
   status: SyncStatusSummary;
   onRefreshStatus: () => Promise<void>;
-  onOpenWizard: () => void;
 }
 
-export function WebDAVTab({ status, onRefreshStatus, onOpenWizard }: WebDAVTabProps) {
+export function WebDAVTab({ status, onRefreshStatus }: WebDAVTabProps) {
   const { isBannerVisible, dismissBanner } = useUiBannerPrefs();
   // Cached non-sensitive meta & re-test drawer
   const [lastReport, setLastReport] = useState<CapabilityReport | null>(null);
@@ -336,9 +335,6 @@ export function WebDAVTab({ status, onRefreshStatus, onOpenWizard }: WebDAVTabPr
               <Button type="button" variant="outline" size="sm" onClick={() => setTestPanelOpen(prev => !prev)}>
                 <ShieldCheck className="mr-1.5 h-4 w-4" />
                 {testPanelOpen ? '收起检测表单' : '重新测试 19 项能力'}
-              </Button>
-              <Button type="button" variant="secondary" size="sm" onClick={onOpenWizard}>
-                重新配置连接向导
               </Button>
             </div>
           </div>

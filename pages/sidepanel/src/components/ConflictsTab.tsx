@@ -1,5 +1,5 @@
-import { extractErrorMessage, sidePanelApi } from '@src/lib/api';
-import { useBannerPrefs } from '@src/lib/bannerPrefs';
+import { extractErrorMessage, sidePanelApi } from '@console/lib/api';
+import { useBannerPrefs } from '@console/lib/bannerPrefs';
 import {
   copyToClipboard,
   formatCookieExpiry,
@@ -7,7 +7,7 @@ import {
   formatRelativeTime,
   getSameSiteLabel,
   shortId,
-} from '@src/lib/format';
+} from '@console/lib/format';
 import type { ConflictRecord, CookieRecord, LocalStorageRecord } from '@sessionmesh/shared';
 import { Button } from '@sessionmesh/ui';
 import {
@@ -33,6 +33,7 @@ export interface ConflictsTabProps {
   globalSearch: string;
   onStatusChanged: () => Promise<void> | void;
   refreshSignal: number;
+  layout?: 'compact' | 'wide';
 }
 
 function isCookieRecord(rec: CookieRecord | LocalStorageRecord): rec is CookieRecord {
@@ -171,7 +172,12 @@ const RecordSideCard: React.FC<{
   );
 };
 
-export const ConflictsTab: React.FC<ConflictsTabProps> = ({ globalSearch, onStatusChanged, refreshSignal }) => {
+export const ConflictsTab: React.FC<ConflictsTabProps> = ({
+  globalSearch,
+  onStatusChanged,
+  refreshSignal,
+  layout = 'compact',
+}) => {
   const [conflicts, setConflicts] = useState<ConflictRecord[]>([]);
   const [loading, setLoading] = useState(true);
   const [filterMode, setFilterMode] = useState<'unresolved' | 'all'>('unresolved');
@@ -231,9 +237,14 @@ export const ConflictsTab: React.FC<ConflictsTabProps> = ({ globalSearch, onStat
   });
 
   return (
-    <div className="flex h-full flex-col">
+    <div className={layout === 'wide' ? 'space-y-4' : 'flex h-full flex-col'}>
       {/* Header Toolbar */}
-      <div className="shrink-0 border-b border-border bg-card/50 px-3 py-2 flex items-center justify-between gap-2">
+      <div
+        className={
+          layout === 'wide'
+            ? 'flex items-center justify-between gap-2 rounded-xl border border-border bg-card px-4 py-2.5'
+            : 'shrink-0 border-b border-border bg-card/50 px-3 py-2 flex items-center justify-between gap-2'
+        }>
         <div className="flex items-center gap-1">
           <button
             type="button"
@@ -263,7 +274,7 @@ export const ConflictsTab: React.FC<ConflictsTabProps> = ({ globalSearch, onStat
       </div>
 
       {/* Body */}
-      <div className="flex-1 overflow-y-auto p-3 space-y-3">
+      <div className={layout === 'wide' ? 'space-y-3' : 'flex-1 overflow-y-auto p-3 space-y-3'}>
         {isBannerVisible('conflicts_hlc_notice', 'general') ? (
           <div className="rounded-xl border border-border bg-muted/30 p-2.5 text-[11px] text-muted-foreground flex items-start justify-between gap-2">
             <div className="flex items-start gap-2 min-w-0">

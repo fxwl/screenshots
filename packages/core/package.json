@@ -1,6 +1,6 @@
 {
   "name": "@sessionmesh/core",
-  "version": "1.0.1",
+  "version": "1.1.0",
   "description": "SessionMesh core engine: WebDAV, E2E Crypto, Causal Versioning, SiteTrack, Rules, Sync & Refresh",
   "private": true,
   "sideEffects": false,

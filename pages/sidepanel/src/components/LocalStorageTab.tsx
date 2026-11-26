@@ -1,4 +1,4 @@
-import { extractErrorMessage, sidePanelApi } from '@src/lib/api';
+import { extractErrorMessage, sidePanelApi } from '@console/lib/api';
 import {
   copyToClipboard,
   downloadJsonFile,
@@ -6,7 +6,7 @@ import {
   formatRelativeTime,
   getCookieSyncStatusMeta,
   shortId,
-} from '@src/lib/format';
+} from '@console/lib/format';
 import type { DeleteScope, LocalStorageRecord } from '@sessionmesh/shared';
 import { Button, Input, Label } from '@sessionmesh/ui';
 import {
@@ -25,6 +25,7 @@ import {
   RefreshCw,
   Trash2,
   Upload,
+  X,
 } from 'lucide-react';
 import type React from 'react';
 import { useCallback, useEffect, useMemo, useState } from 'react';
@@ -40,6 +41,11 @@ export interface LocalStorageTabProps {
   globalSearch: string;
   onStatusChanged: () => Promise<void> | void;
   refreshSignal: number;
+  layout?: 'compact' | 'wide';
+  filterSiteKey?: string | null;
+  filterTrackId?: string | null;
+  filterTrackLabel?: string | null;
+  onClearFilter?: () => void;
 }
 
 interface OriginTrackGroup {
@@ -51,7 +57,16 @@ interface OriginTrackGroup {
   items: LocalStorageRecord[];
 }
 
-export const LocalStorageTab: React.FC<LocalStorageTabProps> = ({ globalSearch, onStatusChanged, refreshSignal }) => {
+export const LocalStorageTab: React.FC<LocalStorageTabProps> = ({
+  globalSearch,
+  onStatusChanged,
+  refreshSignal,
+  layout = 'compact',
+  filterSiteKey,
+  filterTrackId,
+  filterTrackLabel,
+  onClearFilter,
+}) => {
   const [records, setRecords] = useState<LocalStorageRecord[]>([]);
   const [loading, setLoading] = useState(true);
   const [selectedIds, setSelectedIds] = useState<Set<string>>(new Set());
@@ -76,7 +91,10 @@ export const LocalStorageTab: React.FC<LocalStorageTabProps> = ({ globalSearch, 
   const loadRecords = useCallback(async () => {
     setLoading(true);
     try {
-      const list = await sidePanelApi.getLocalStorageRecords();
+      const list = await sidePanelApi.getLocalStorageRecords({
+        siteKey: filterSiteKey || undefined,
+        trackId: filterTrackId || undefined,
+      });
       setRecords(list || []);
       setSelectedIds(prev => {
         const valid = new Set((list || []).map(r => r.logicalId));
@@ -87,7 +105,7 @@ export const LocalStorageTab: React.FC<LocalStorageTabProps> = ({ globalSearch, 
     } finally {
       setLoading(false);
     }
-  }, []);
+  }, [filterSiteKey, filterTrackId]);
 
   useEffect(() => {
     loadRecords();
@@ -185,11 +203,13 @@ export const LocalStorageTab: React.FC<LocalStorageTabProps> = ({ globalSearch, 
     setSaving(true);
     setFormError(null);
     try {
-      const saved = await sidePanelApi.upsertLocalStorageItem(origin, key, formValue);
+      const saved = await sidePanelApi.upsertLocalStorageItem(origin, key, formValue, filterTrackId || undefined);
       toast.success(
-        saved.contextAvailable
-          ? `已保存并写入页面 LocalStorage：${key}`
-          : `已保存 ${key}（页面未打开，已缓存待上下文可用后自动写入）`,
+        filterTrackId
+          ? `已保存 ${key} 至指定账号轨道`
+          : saved.contextAvailable
+            ? `已保存并写入页面 LocalStorage：${key}`
+            : `已保存 ${key}（页面未打开，已缓存待上下文可用后自动写入）`,
       );
       setEditorOpen(false);
       await loadRecords();
@@ -285,7 +305,7 @@ export const LocalStorageTab: React.FC<LocalStorageTabProps> = ({ globalSearch, 
     }
 
     for (const item of entries) {
-      await sidePanelApi.upsertLocalStorageItem(item.origin, item.key, item.value);
+      await sidePanelApi.upsertLocalStorageItem(item.origin, item.key, item.value, filterTrackId || undefined);
     }
     toast.success(`已导入 ${entries.length} 条 LocalStorage 记录`);
     await loadRecords();
@@ -304,9 +324,44 @@ export const LocalStorageTab: React.FC<LocalStorageTabProps> = ({ globalSearch, 
   const selectedRecords = records.filter(r => selectedIds.has(r.logicalId));
 
   return (
-    <div className="flex h-full flex-col">
+    <div className={layout === 'wide' ? 'space-y-4' : 'flex h-full flex-col'}>
+      {/* Active Account/Site Filter Banner */}
+      {filterSiteKey || filterTrackId ? (
+        <div
+          className={
+            layout === 'wide'
+              ? 'flex flex-wrap items-center justify-between gap-2 rounded-xl border border-primary/35 bg-primary/[0.06] px-4 py-2.5 text-xs'
+              : 'shrink-0 flex flex-wrap items-center justify-between gap-2 border-b border-primary/30 bg-primary/[0.06] px-3 py-2 text-xs'
+          }>
+          <div className="flex flex-wrap items-center gap-1.5 min-w-0">
+            <GitBranch className="h-3.5 w-3.5 text-primary shrink-0" />
+            <span className="font-medium text-foreground">
+              当前仅显示
+              {filterSiteKey ? ` ${filterSiteKey}` : ''}
+              {filterTrackLabel
+                ? ` · 账号「${filterTrackLabel}」`
+                : filterTrackId
+                  ? ` · 轨道 ${shortId(filterTrackId, 14)}`
+                  : ''}
+              的 LocalStorage
+            </span>
+          </div>
+          {onClearFilter ? (
+            <Button variant="outline" size="sm" className="h-6 px-2 text-[11px]" onClick={onClearFilter}>
+              <X className="mr-1 h-3 w-3" />
+              显示全部
+            </Button>
+          ) : null}
+        </div>
+      ) : null}
+
       {/* Top Toolbar */}
-      <div className="shrink-0 border-b border-border bg-card/50 px-3 py-2 flex flex-wrap items-center justify-between gap-2">
+      <div
+        className={
+          layout === 'wide'
+            ? 'flex flex-wrap items-center justify-between gap-2 rounded-xl border border-border bg-card px-4 py-2.5'
+            : 'shrink-0 border-b border-border bg-card/50 px-3 py-2 flex flex-wrap items-center justify-between gap-2'
+        }>
         <div className="flex items-center gap-2 text-xs">
           <span className="font-medium text-foreground">
             {groups.length} 个 Origin · {filteredRecords.length} 条键值
@@ -359,7 +414,7 @@ export const LocalStorageTab: React.FC<LocalStorageTabProps> = ({ globalSearch, 
       </div>
 
       {/* Grouped Origin + Track List */}
-      <div className="flex-1 overflow-y-auto p-3 space-y-3">
+      <div className={layout === 'wide' ? 'space-y-3' : 'flex-1 overflow-y-auto p-3 space-y-3'}>
         {loading && records.length === 0 ? (
           <div className="flex items-center justify-center py-12 text-xs text-muted-foreground">
             <Loader2 className="mr-2 h-4 w-4 animate-spin" />

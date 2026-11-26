@@ -1,3 +1,4 @@
+import { AccountsManagerTab } from '@src/components/AccountsManagerTab';
 import { AttentionBanner } from '@src/components/AttentionBanner';
 import { ConflictsTab } from '@src/components/ConflictsTab';
 import { DevicesTab } from '@src/components/DevicesTab';
@@ -14,6 +15,7 @@ import {
   AlertTriangle,
   Cookie,
   Database,
+  ExternalLink,
   GitMerge,
   History,
   Laptop,
@@ -21,6 +23,7 @@ import {
   Lock,
   Settings,
   Shield,
+  Users,
   X,
 } from 'lucide-react';
 import type React from 'react';
@@ -53,7 +56,10 @@ function readInitialQuery(): { tab: SidePanelTabId; siteKey: string | null } {
 const SidePanel: React.FC = () => {
   const initial = readInitialQuery();
   const [activeTab, setActiveTab] = useState<SidePanelTabId>(initial.tab);
+  const [sitesSubView, setSitesSubView] = useState<'sites' | 'accounts'>('sites');
   const [initialSiteKey, setInitialSiteKey] = useState<string | null>(initial.siteKey);
+  const [accountSiteFilter, setAccountSiteFilter] = useState<string | null>(null);
+  const [lsFilter, setLsFilter] = useState<{ siteKey?: string; trackId?: string; trackLabel?: string } | null>(null);
   const [searchQuery, setSearchQuery] = useState('');
   const [syncing, setSyncing] = useState(false);
   const [refreshSignal, setRefreshSignal] = useState(0);
@@ -75,10 +81,15 @@ const SidePanel: React.FC = () => {
       if (message && typeof message === 'object') {
         const msg = message as { type?: string; tab?: string; siteKey?: string };
         if (msg.type === 'OPEN_SIDEPANEL_TAB') {
-          if (msg.tab && VALID_TABS.has(msg.tab)) {
+          if (msg.tab === 'accounts') {
+            setActiveTab('sites');
+            setSitesSubView('accounts');
+            if (msg.siteKey) setAccountSiteFilter(msg.siteKey);
+          } else if (msg.tab && VALID_TABS.has(msg.tab)) {
             setActiveTab(msg.tab as SidePanelTabId);
+            if (msg.tab === 'sites') setSitesSubView('sites');
           }
-          if (msg.siteKey) {
+          if (msg.siteKey && msg.tab !== 'accounts') {
             setInitialSiteKey(msg.siteKey);
           }
         }
@@ -133,12 +144,23 @@ const SidePanel: React.FC = () => {
     }
   };
 
-  const handleOpenOptions = () => {
-    if (typeof chrome !== 'undefined' && chrome.runtime?.openOptionsPage) {
+  const handleOpenOptions = (targetTab?: string, subTab?: string) => {
+    const params = new URLSearchParams();
+    if (targetTab) params.set('tab', targetTab);
+    if (subTab) params.set('sub', subTab);
+    const qs = params.toString() ? `?${params.toString()}` : '';
+    if (typeof chrome !== 'undefined' && chrome.runtime?.getURL && chrome.tabs?.create) {
+      chrome.tabs.create({ url: chrome.runtime.getURL(`options/index.html${qs}`) });
+    } else if (typeof chrome !== 'undefined' && chrome.runtime?.openOptionsPage) {
       chrome.runtime.openOptionsPage();
     } else {
-      window.open('/options/index.html', '_blank');
+      window.open(`/options/index.html${qs}`, '_blank');
     }
+  };
+
+  const handleOpenLocalStorageForAccount = (siteKey: string, trackId?: string, trackLabel?: string) => {
+    setLsFilter({ siteKey, trackId, trackLabel });
+    setActiveTab('localstorage');
   };
 
   const pendingDecisionsCount = status?.pendingDecisionsCount ?? 0;
@@ -209,6 +231,22 @@ const SidePanel: React.FC = () => {
         onRefreshAll={handleRefreshAll}
         syncing={syncing}
         onSyncNow={handleSyncNow}
+        onOpenOptions={() =>
+          handleOpenOptions(
+            activeTab === 'sites'
+              ? sitesSubView === 'accounts'
+                ? 'accounts'
+                : 'sites'
+              : activeTab === 'localstorage'
+                ? 'sites'
+                : activeTab === 'rules'
+                  ? 'rules'
+                  : activeTab === 'devices'
+                    ? 'devices_spaces'
+                    : 'history_conflicts',
+            activeTab === 'localstorage' ? 'localstorage' : activeTab === 'history' ? 'history' : undefined,
+          )
+        }
       />
 
       {/* Unified Actionable Attention Center */}
@@ -218,9 +256,10 @@ const SidePanel: React.FC = () => {
           onRefreshAll={handleRefreshAll}
           onNavigateTab={(tab, siteKey) => {
             setActiveTab(tab);
+            if (tab === 'sites') setSitesSubView('sites');
             if (siteKey) setInitialSiteKey(siteKey);
           }}
-          onOpenOptions={handleOpenOptions}
+          onOpenOptions={() => handleOpenOptions('storage_settings')}
         />
       ) : null}
 
@@ -282,7 +321,7 @@ const SidePanel: React.FC = () => {
               </CardDescription>
             </CardHeader>
             <CardContent className="p-4 pt-2">
-              <Button className="w-full" size="sm" onClick={handleOpenOptions}>
+              <Button className="w-full" size="sm" onClick={() => handleOpenOptions()}>
                 <Settings className="mr-1.5 h-4 w-4" />
                 打开首次配置向导
               </Button>
@@ -358,18 +397,76 @@ const SidePanel: React.FC = () => {
           {/* Active Tab Content */}
           <main className="min-h-0 flex-1 overflow-hidden">
             {activeTab === 'sites' ? (
-              <SitesAndCookiesTab
-                globalSearch={searchQuery}
-                initialSiteKey={initialSiteKey}
-                onConsumeInitialSite={() => setInitialSiteKey(null)}
-                onStatusChanged={handleRefreshAll}
-                refreshSignal={combinedRefreshSignal}
-              />
+              <div className="flex h-full flex-col">
+                <div className="shrink-0 flex items-center justify-between gap-2 border-b border-border bg-card/50 px-3 py-1.5">
+                  <div className="inline-flex items-center gap-1">
+                    <button
+                      type="button"
+                      onClick={() => setSitesSubView('sites')}
+                      className={`inline-flex items-center gap-1 rounded-full px-2.5 py-0.5 text-[11px] font-medium transition-colors ${
+                        sitesSubView === 'sites'
+                          ? 'bg-primary text-primary-foreground'
+                          : 'bg-muted text-muted-foreground hover:text-foreground'
+                      }`}>
+                      <Cookie className="h-3 w-3" />
+                      网站与 Cookies
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => setSitesSubView('accounts')}
+                      className={`inline-flex items-center gap-1 rounded-full px-2.5 py-0.5 text-[11px] font-medium transition-colors ${
+                        sitesSubView === 'accounts'
+                          ? 'bg-primary text-primary-foreground'
+                          : 'bg-muted text-muted-foreground hover:text-foreground'
+                      }`}>
+                      <Users className="h-3 w-3" />
+                      多账号管理
+                    </button>
+                  </div>
+                  <button
+                    type="button"
+                    onClick={() => handleOpenOptions(sitesSubView === 'accounts' ? 'accounts' : 'sites')}
+                    className="inline-flex items-center gap-0.5 text-[10px] text-muted-foreground hover:text-primary"
+                    title="在宽屏综合管理后台中打开">
+                    宽屏打开
+                    <ExternalLink className="h-2.5 w-2.5" />
+                  </button>
+                </div>
+                <div className="min-h-0 flex-1 overflow-hidden">
+                  {sitesSubView === 'sites' ? (
+                    <SitesAndCookiesTab
+                      globalSearch={searchQuery}
+                      initialSiteKey={initialSiteKey}
+                      onConsumeInitialSite={() => setInitialSiteKey(null)}
+                      onStatusChanged={handleRefreshAll}
+                      refreshSignal={combinedRefreshSignal}
+                      onOpenAccounts={siteKey => {
+                        if (siteKey) setAccountSiteFilter(siteKey);
+                        setSitesSubView('accounts');
+                      }}
+                      onOpenLocalStorage={handleOpenLocalStorageForAccount}
+                    />
+                  ) : (
+                    <AccountsManagerTab
+                      globalSearch={searchQuery}
+                      initialSiteFilter={accountSiteFilter}
+                      onConsumeInitialSiteFilter={() => setAccountSiteFilter(null)}
+                      onStatusChanged={handleRefreshAll}
+                      refreshSignal={combinedRefreshSignal}
+                      onOpenLocalStorage={handleOpenLocalStorageForAccount}
+                    />
+                  )}
+                </div>
+              </div>
             ) : null}
 
             {activeTab === 'localstorage' ? (
               <LocalStorageTab
                 globalSearch={searchQuery}
+                filterSiteKey={lsFilter?.siteKey}
+                filterTrackId={lsFilter?.trackId}
+                filterTrackLabel={lsFilter?.trackLabel}
+                onClearFilter={() => setLsFilter(null)}
                 onStatusChanged={handleRefreshAll}
                 refreshSignal={combinedRefreshSignal}
               />

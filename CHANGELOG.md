@@ -2,6 +2,32 @@
 
 All notable changes to **SessionMesh** will be documented in this file.
 
+## [1.1.0] - 2026-11-26
+
+### Added
+
+- **Multi-Account Management & Deterministic Rotation**:
+  - New **Accounts Manager** view integrated into both the Options Control Center and Side Panel, alongside quick account creation and one-click rotation in the Toolbar Popup and Context Menu.
+  - Supports **Clean New Account** (`clean_new`, automatically archiving the existing session without invalidating server cookies—including pure-`localStorage` SPAs) and **Save Current Session** (`save_current`, decoupled Cookie + `localStorage` snapshots).
+  - Deterministic forward/backward account rotation, custom account ordering, editable labels & account notes, safe deletion with peer sync, atomic SSO domain-group rotation, and inactive-track Cookie/`localStorage` editing & export without disturbing the active browser session.
+- **Dev & Prod Environment Cookie & `localStorage` Sync (`EnvCookieMapper`)**:
+  - Mirror production/staging Cookies and `localStorage` to `localhost`, `127.0.0.1`, IPv6/custom ports, or HTTPS dev domains on demand or via live auto-cascade rules.
+  - Automatically rewrites `Domain`, adapts `Secure`/`SameSite`/`__Host-`/`__Secure-` flags for HTTP local debugging, clears CHIPS `partitionKey` across HTTPS targets, supports pinned background account tracks, deferred target-tab `localStorage` hydration, and safe reverse Dev → Prod write-back.
+- **Immediate E2E Password Verification**:
+  - Verifies the Master Encryption Password directly during onboarding/space join without mutating remote WebDAV state.
+
+### Changed
+
+- **Unified Control Center & UI Refactor**:
+  - Consolidated Options Control Center sections (`Sites`, `Accounts`, `Rules & Env Sync`, `Devices & Spaces`, `History & Conflicts`, `Storage & Settings`) and refreshed Popup & Side Panel workflows.
+
+### Fixed & Hardened
+
+- **Sync Engine & Edge-Case Hardening**:
+  - Improved multi-tab `localStorage` echo suppression, deferred offline-origin `localStorage` cleanup and undo restoration, multi-tab `on_page_leave` flush handling, localhost/IP `hostOnly` cookie normalization, cloud backup track resurrection, strict session-lock mutation guards, and global pause zero-network isolation.
+- **Expanded Automated Test Coverage**:
+  - Grew the Vitest acceptance suite from 132 to **175 passing tests** across 9 test files, adding 24 multi-account & environment-sync tests and 16 chaos/fault-injection/real-HTTP WebDAV E2E tests.
+
 ## [1.0.1] - 2026-11-24
 
 ### Changed

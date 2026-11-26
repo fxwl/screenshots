@@ -1,4 +1,4 @@
-import { extractErrorMessage, sidePanelApi } from '@src/lib/api';
+import { extractErrorMessage, sidePanelApi } from '@console/lib/api';
 import type { AttentionItem } from '@sessionmesh/shared';
 import { Button } from '@sessionmesh/ui';
 import {

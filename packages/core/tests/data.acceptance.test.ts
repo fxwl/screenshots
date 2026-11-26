@@ -470,6 +470,26 @@ describe('Data Management, Security & System Acceptance Suite (D-001 .. D-017)',
     const statusB = await devB.engine.getStatusSummary();
     expect(statusB.device?.state).toBe('removed');
     expect(statusB.device?.name).toBe('Old Laptop');
+    expect(statusB.status).toBe('LOCKED');
+
+    // A permanently revoked active peer C also transitions to LOCKED and halts all sync
+    const devC = await h.createDevice('Device-C');
+    const joinC = await devC.engine.saveAndJoinSpace({
+      webdav,
+      spaceId: SPACE_ID,
+      spaceName: SPACE_NAME,
+      encryptionPassword: ENC_PASS,
+      deviceName: 'Device-C',
+    });
+    await devA.engine.setDeviceState(joinC.deviceId, 'revoked');
+    await devA.browser.simulateUserCookieSet({ domain: '.devmgmt.io', name: 'k', value: 'v3-after-revoke' });
+    await devA.engine.flushPendingLocalChanges();
+    await devA.engine.syncNow();
+    await devC.engine.syncNow();
+    const statusCRevoked = await devC.engine.getStatusSummary();
+    expect(statusCRevoked.device?.state).toBe('revoked');
+    expect(statusCRevoked.status).toBe('LOCKED');
+    expect(devC.browser.findJarCookie('k', 'devmgmt.io')?.value).toBe('v2-after-remove');
   });
 
   it('D-014: Wrong encryption password causes DECRYPT_ERROR with ZERO damage to remote or local data + Password/DEK rotation', async () => {

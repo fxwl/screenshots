@@ -243,6 +243,7 @@ export class WebDAVClient {
         method,
         headers,
         body: bodyToSend,
+        cache: 'no-store',
         signal: controller?.signal,
       });
       return response;

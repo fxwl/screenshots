@@ -1,5 +1,5 @@
-import { extractErrorMessage, sidePanelApi } from '@src/lib/api';
-import { useBannerPrefs } from '@src/lib/bannerPrefs';
+import { extractErrorMessage, sidePanelApi } from '@console/lib/api';
+import { useBannerPrefs } from '@console/lib/bannerPrefs';
 import {
   copyToClipboard,
   downloadJsonFile,
@@ -8,7 +8,7 @@ import {
   getBindingMeta,
   getOperationMeta,
   shortId,
-} from '@src/lib/format';
+} from '@console/lib/format';
 import type { EventOperation, LogEntry, SafetyUndoPoint, SyncEvent } from '@sessionmesh/shared';
 import { Button } from '@sessionmesh/ui';
 import {
@@ -39,6 +39,7 @@ export interface HistoryAndUndoTabProps {
   globalSearch: string;
   onStatusChanged: () => Promise<void> | void;
   refreshSignal: number;
+  layout?: 'compact' | 'wide';
 }
 
 type HistorySubView = 'undo' | 'events' | 'logs';
@@ -56,6 +57,7 @@ export const HistoryAndUndoTab: React.FC<HistoryAndUndoTabProps> = ({
   globalSearch,
   onStatusChanged,
   refreshSignal,
+  layout = 'compact',
 }) => {
   const [subView, setSubView] = useState<HistorySubView>('undo');
   const [undoPoints, setUndoPoints] = useState<SafetyUndoPoint[]>([]);
@@ -182,9 +184,14 @@ export const HistoryAndUndoTab: React.FC<HistoryAndUndoTabProps> = ({
   }, [logs, logLevelFilter, query]);
 
   return (
-    <div className="flex h-full flex-col">
+    <div className={layout === 'wide' ? 'space-y-4' : 'flex h-full flex-col'}>
       {/* 3 Sub-view Navigation */}
-      <div className="shrink-0 border-b border-border bg-card/50 px-3 py-2 flex flex-wrap items-center justify-between gap-2">
+      <div
+        className={
+          layout === 'wide'
+            ? 'flex flex-wrap items-center justify-between gap-2 rounded-xl border border-border bg-card px-4 py-2.5'
+            : 'shrink-0 border-b border-border bg-card/50 px-3 py-2 flex flex-wrap items-center justify-between gap-2'
+        }>
         <div className="flex items-center gap-1">
           <button
             type="button"
@@ -227,7 +234,7 @@ export const HistoryAndUndoTab: React.FC<HistoryAndUndoTabProps> = ({
       </div>
 
       {/* Sub-view Body */}
-      <div className="flex-1 overflow-y-auto p-3 space-y-3">
+      <div className={layout === 'wide' ? 'space-y-3' : 'flex-1 overflow-y-auto p-3 space-y-3'}>
         {loading && undoPoints.length === 0 && events.length === 0 && logs.length === 0 ? (
           <div className="flex items-center justify-center py-12 text-xs text-muted-foreground">
             <Loader2 className="mr-2 h-4 w-4 animate-spin" />

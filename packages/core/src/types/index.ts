@@ -86,6 +86,16 @@ export interface RemoteSpaceProbeItem {
   updatedAt?: number;
 }
 
+export interface RemoteSpacePasswordVerifyResult {
+  exists: boolean;
+  verified: boolean;
+  spaceId?: string;
+  spaceName?: string;
+  keyEpoch?: number;
+  errorCode?: string;
+  errorMessage?: string;
+}
+
 export type DeleteScope = 'local_only' | 'remote_track_only' | 'all_devices';
 
 export type CapabilityState = 'supported' | 'unsupported' | 'unverified';
@@ -186,6 +196,34 @@ export interface SiteTrack {
   updatedAt: number;
   memberDeviceIds: string[];
   revision?: number;
+  sortOrder?: number;
+  lastUsedAt?: number;
+  accountNote?: string;
+}
+
+export type AccountCreateMode = 'clean_new' | 'save_current';
+
+export interface CreateSiteAccountOptions {
+  label?: string;
+  accountNote?: string;
+  mode: AccountCreateMode;
+  triggerRefresh?: boolean;
+}
+
+export interface UpdateSiteTrackPatch {
+  label?: string;
+  accountNote?: string;
+  sortOrder?: number;
+}
+
+export interface AccountRotationResult {
+  siteKey: string;
+  track: SiteTrack;
+  previousTrackId?: string;
+  index: number;
+  total: number;
+  appliedCookies: number;
+  failedCookies: number;
 }
 
 export interface DeviceSiteBinding {
@@ -393,10 +431,66 @@ export interface SsoDomainGroup {
   domains: string[];
 }
 
+export interface EnvCookieSyncRule {
+  id: string;
+  name: string;
+  scope: 'space' | 'device';
+  enabled: boolean;
+  sourceSiteKey: string;
+  sourceHostFilter?: string;
+  sourceTrackId?: string;
+  targetUrl: string;
+  syncCookies: boolean;
+  syncLocalStorage: boolean;
+  adaptForHttp: boolean;
+  cleanTargetBeforeSync: boolean;
+  autoSync: boolean;
+  autoReloadTarget: boolean;
+  includeCookieNames?: string[];
+  excludeCookieNames?: string[];
+  lastSyncedAt?: number;
+  lastSyncedCount?: number;
+  createdAt: number;
+  updatedAt: number;
+}
+
+export interface ExecuteEnvSyncInput {
+  ruleId?: string;
+  reverse?: boolean;
+  adHoc?: {
+    sourceSiteKey: string;
+    sourceHostFilter?: string;
+    sourceTrackId?: string;
+    targetUrl: string;
+    syncCookies?: boolean;
+    syncLocalStorage?: boolean;
+    adaptForHttp?: boolean;
+    cleanTargetBeforeSync?: boolean;
+    autoReloadTarget?: boolean;
+    includeCookieNames?: string[];
+    excludeCookieNames?: string[];
+  };
+}
+
+export interface EnvCookieSyncResult {
+  ruleId?: string;
+  sourceSiteKey: string;
+  targetUrl: string;
+  targetHost: string;
+  appliedCookies: number;
+  failedCookies: number;
+  removedStaleCookies: number;
+  appliedLocalStorage: number;
+  skippedCookies: number;
+  reloadedTabs: number;
+  errors: string[];
+}
+
 export interface SpaceRuleSet {
   spaceBlacklist: BlacklistEntry[];
   siteOverrides: Record<string, SiteRuleOverride>;
   ssoGroups: SsoDomainGroup[];
+  envSyncRules?: EnvCookieSyncRule[];
   updatedAt: number;
 }
 

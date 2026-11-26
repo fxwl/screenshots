@@ -1,5 +1,6 @@
 import {
   DEFAULT_SPACE_SETTINGS,
+  envRuleMatchesUrl,
   resolveSiteKey,
   RulesEngine,
   SyncEngine,
@@ -334,12 +335,17 @@ async function buildCurrentSiteSnapshot(engine: SyncEngine, activeUrl?: string):
     }
   }
 
+  const matchingEnvRules = (rulesSnapshot?.envSyncRules ?? []).filter(
+    r => envRuleMatchesUrl(r, url, rulesSnapshot?.ssoGroups) !== null,
+  );
+
   return {
     siteKey,
     origin,
     url,
     favIconUrl,
     summary,
+    matchingEnvRules,
   };
 }
 
@@ -379,22 +385,29 @@ async function handleSiteVisited(url?: string, tabId?: number): Promise<void> {
 
 async function handleSitePageLeft(urlOrSiteKey?: string): Promise<void> {
   if (!urlOrSiteKey) return;
-  const siteKey = isSyncableHttpUrl(urlOrSiteKey)
-    ? resolveSiteKey(urlOrSiteKey)
-    : resolveSiteKey(`https://${urlOrSiteKey}`);
-  if (!siteKey) return;
-
-  const now = Date.now();
-  const prev = recentSiteLeaves.get(siteKey);
-  if (prev && now - prev < SITE_LEAVE_DEDUPE_MS) {
-    return;
-  }
-  recentSiteLeaves.set(siteKey, now);
+  const cachedGroups = engineInstance?.getCachedSsoGroups();
+  const initialSiteKey = isSyncableHttpUrl(urlOrSiteKey)
+    ? resolveSiteKey(urlOrSiteKey, cachedGroups)
+    : resolveSiteKey(`https://${urlOrSiteKey}`, cachedGroups);
+  if (!initialSiteKey) return;
 
   try {
     // Allow 150ms for any final in-flight Set-Cookie / pagehide IPC to arrive before flushing
     await new Promise(resolve => setTimeout(resolve, 150));
     const engine = await ensureEngineReady();
+    const ssoGroups = engine.getCachedSsoGroups();
+    const siteKey = isSyncableHttpUrl(urlOrSiteKey)
+      ? resolveSiteKey(urlOrSiteKey, ssoGroups)
+      : resolveSiteKey(`https://${urlOrSiteKey}`, ssoGroups);
+    if (!siteKey) return;
+
+    const now = Date.now();
+    const prev = recentSiteLeaves.get(siteKey);
+    if (prev && now - prev < SITE_LEAVE_DEDUPE_MS) {
+      return;
+    }
+    recentSiteLeaves.set(siteKey, now);
+
     await engine.onSitePageLeft(urlOrSiteKey);
     await broadcastUiStateNow();
   } catch (err) {
@@ -410,8 +423,10 @@ async function handleTabNavigationChange(tabId: number, nextUrl: string | undefi
     forgetTabUrl(tabId);
   }
 
-  const prevSiteKey = prevUrl && isSyncableHttpUrl(prevUrl) ? resolveSiteKey(prevUrl) : '';
-  const nextSiteKey = nextUrl && isSyncableHttpUrl(nextUrl) ? resolveSiteKey(nextUrl) : '';
+  const ssoGroups =
+    engineInstance?.getCachedSsoGroups() ?? (await ensureEngineReady().catch(() => null))?.getCachedSsoGroups() ?? [];
+  const prevSiteKey = prevUrl && isSyncableHttpUrl(prevUrl) ? resolveSiteKey(prevUrl, ssoGroups) : '';
+  const nextSiteKey = nextUrl && isSyncableHttpUrl(nextUrl) ? resolveSiteKey(nextUrl, ssoGroups) : '';
 
   if (prevSiteKey && prevSiteKey !== nextSiteKey) {
     void handleSitePageLeft(prevUrl);
@@ -459,6 +474,13 @@ async function executeCommand(cmd: SessionMeshCommand): Promise<unknown> {
 
     case 'PROBE_REMOTE_SPACES':
       return engine.probeRemoteSpaces(cmd.config);
+
+    case 'VERIFY_SPACE_PASSWORD':
+      return engine.verifyRemoteSpacePassword({
+        webdav: cmd.webdav,
+        spaceId: cmd.spaceId,
+        encryptionPassword: cmd.encryptionPassword,
+      });
 
     case 'SAVE_AND_JOIN_SPACE': {
       if (cmd.settingsPatch?.sessionLockEnabled !== undefined) {
@@ -671,11 +693,44 @@ async function executeCommand(cmd: SessionMeshCommand): Promise<unknown> {
       return { renamed: true };
     }
 
+    case 'UPDATE_SITE_TRACK': {
+      const updated = await engine.updateSiteTrack(cmd.siteKey, cmd.trackId, cmd.patch);
+      await broadcastUiStateNow();
+      return updated;
+    }
+
+    case 'REORDER_SITE_TRACKS': {
+      const tracks = await engine.reorderSiteTracks(cmd.siteKey, cmd.orderedTrackIds);
+      await broadcastUiStateNow();
+      return tracks;
+    }
+
+    case 'CREATE_SITE_ACCOUNT_TRACK': {
+      const created = await engine.createSiteAccountTrack(cmd.siteKey, cmd.options);
+      scheduleFlushAlarm();
+      await broadcastUiStateNow();
+      return created;
+    }
+
+    case 'ROTATE_SITE_TRACK': {
+      const rotated = await engine.rotateSiteTrack(cmd.siteKey, cmd.direction);
+      scheduleFlushAlarm();
+      await broadcastUiStateNow();
+      return rotated;
+    }
+
+    case 'DELETE_SITE_TRACK': {
+      const res = await engine.deleteSiteTrack(cmd.siteKey, cmd.trackId);
+      scheduleFlushAlarm();
+      await broadcastUiStateNow();
+      return res;
+    }
+
     case 'GET_SITE_COOKIES':
       return engine.getSiteCookies(cmd.siteKey, cmd.trackId);
 
     case 'UPSERT_COOKIE': {
-      const record = await engine.upsertCookie(cmd.siteKey, cmd.cookie);
+      const record = await engine.upsertCookie(cmd.siteKey, cmd.cookie, cmd.trackId);
       scheduleFlushAlarm();
       await broadcastUiStateNow();
       return record;
@@ -695,23 +750,24 @@ async function executeCommand(cmd: SessionMeshCommand): Promise<unknown> {
     }
 
     case 'IMPORT_COOKIES_JSON': {
-      const count = await engine.importCookiesJson(cmd.cookies, cmd.siteKey);
+      const count = await engine.importCookiesJson(cmd.cookies, cmd.siteKey, cmd.trackId);
       scheduleFlushAlarm();
       await broadcastUiStateNow();
       return count;
     }
 
     case 'EXPORT_COOKIES_JSON':
-      return engine.exportCookiesJson(cmd.siteKey);
+      return engine.exportCookiesJson(cmd.siteKey, cmd.trackId);
 
     case 'GET_LOCAL_STORAGE_RECORDS':
       return engine.getLocalStorageRecords({
         siteKey: cmd.siteKey,
         origin: cmd.origin,
+        trackId: cmd.trackId,
       });
 
     case 'UPSERT_LOCAL_STORAGE_ITEM': {
-      const record = await engine.upsertLocalStorageItem(cmd.origin, cmd.key, cmd.value);
+      const record = await engine.upsertLocalStorageItem(cmd.origin, cmd.key, cmd.value, cmd.trackId);
       scheduleFlushAlarm();
       await broadcastUiStateNow();
       return record;
@@ -767,6 +823,24 @@ async function executeCommand(cmd: SessionMeshCommand): Promise<unknown> {
       await engine.removeSsoGroup(cmd.groupId);
       await broadcastUiStateNow();
       return { removed: true };
+    }
+
+    case 'UPSERT_ENV_SYNC_RULE': {
+      const saved = await engine.upsertEnvSyncRule(cmd.rule);
+      await broadcastUiStateNow();
+      return saved;
+    }
+
+    case 'REMOVE_ENV_SYNC_RULE': {
+      await engine.removeEnvSyncRule(cmd.ruleId, cmd.scope);
+      await broadcastUiStateNow();
+      return { removed: true };
+    }
+
+    case 'EXECUTE_ENV_SYNC': {
+      const res = await engine.executeEnvCookieSync(cmd.input);
+      await broadcastUiStateNow();
+      return res;
     }
 
     case 'IMPORT_RULES_JSON': {
@@ -874,10 +948,18 @@ async function executeCommand(cmd: SessionMeshCommand): Promise<unknown> {
 
     case 'CONTENT_PAGE_LEAVING': {
       if (cmd.changes.length > 0) {
-        await engine.ingestLocalStorageMutations(cmd.origin, cmd.changes);
+        await engine.ingestLocalStorageMutations(cmd.origin, cmd.changes, { isPageLeaving: true });
       }
-      await engine.onSitePageLeft(cmd.origin);
-      await broadcastUiStateNow();
+      // Delay briefly so Chromium updates/closes the unloading tab before checking if any tab for this site remains open;
+      // keeps same-site navigations deferred in on_page_leave mode without blocking real cross-site leave/close dedupe.
+      setTimeout(() => {
+        void ensureEngineReady()
+          .then(async eng => {
+            await eng.onSitePageLeft(cmd.origin);
+            await broadcastUiStateNow();
+          })
+          .catch(() => undefined);
+      }, 180);
       return { acknowledged: true };
     }
 
@@ -908,10 +990,25 @@ registerContextMenuListener({
       console.warn('SessionMesh contextMenu addManagedSite failed:', err);
     }
   },
+  onRotateSiteAccount: async tabUrl => {
+    if (!isSyncableHttpUrl(tabUrl)) return;
+    try {
+      const engine = await ensureEngineReady();
+      const rules = await engine.getRulesAndBlacklist().catch(() => null);
+      const siteKey = resolveSiteKey(tabUrl!, rules?.ssoGroups);
+      if (!siteKey) return;
+      await engine.rotateSiteTrack(siteKey, 'next');
+      scheduleFlushAlarm();
+      await broadcastUiStateNow();
+    } catch (err) {
+      console.warn('SessionMesh contextMenu rotateSiteAccount failed:', err);
+    }
+  },
   onSyncCurrentSite: async tabUrl => {
     try {
       const engine = await ensureEngineReady();
-      const siteKey = isSyncableHttpUrl(tabUrl) ? resolveSiteKey(tabUrl!) : undefined;
+      const ssoGroups = engine.getCachedSsoGroups();
+      const siteKey = isSyncableHttpUrl(tabUrl) ? resolveSiteKey(tabUrl!, ssoGroups) : undefined;
       await engine.syncNow(siteKey ? { siteKey, userInitiated: true } : { userInitiated: true });
       await broadcastUiStateNow();
     } catch (err) {
@@ -932,7 +1029,7 @@ registerContextMenuListener({
     if (!isSyncableHttpUrl(tabUrl)) return;
     try {
       const engine = await ensureEngineReady();
-      const siteKey = resolveSiteKey(tabUrl!);
+      const siteKey = resolveSiteKey(tabUrl!, engine.getCachedSsoGroups());
       if (!siteKey) return;
       await engine.addBlacklistEntry({
         pattern: `*.${siteKey}`,

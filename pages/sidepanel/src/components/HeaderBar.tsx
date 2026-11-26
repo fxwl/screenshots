@@ -1,6 +1,6 @@
-import { extractErrorMessage, sidePanelApi } from '@src/lib/api';
-import { useBannerPrefs } from '@src/lib/bannerPrefs';
-import { formatRelativeTime, getDeviceStatusMeta } from '@src/lib/format';
+import { extractErrorMessage, sidePanelApi } from '@console/lib/api';
+import { useBannerPrefs } from '@console/lib/bannerPrefs';
+import { formatRelativeTime, getDeviceStatusMeta } from '@console/lib/format';
 import { useTheme } from '@sessionmesh/shared';
 import type { SyncStatusSummary, SyncTimingMode } from '@sessionmesh/shared';
 import { Button, Input, Label, Switch, ThemeDropdown } from '@sessionmesh/ui';
@@ -31,6 +31,7 @@ export interface HeaderBarProps {
   onRefreshAll: () => Promise<void> | void;
   syncing: boolean;
   onSyncNow: () => Promise<void>;
+  onOpenOptions?: () => void;
 }
 
 export const HeaderBar: React.FC<HeaderBarProps> = ({
@@ -41,6 +42,7 @@ export const HeaderBar: React.FC<HeaderBarProps> = ({
   onRefreshAll,
   syncing,
   onSyncNow,
+  onOpenOptions,
 }) => {
   const { setTheme } = useTheme();
   const {
@@ -61,6 +63,10 @@ export const HeaderBar: React.FC<HeaderBarProps> = ({
   const isPaused = status?.status === 'PAUSED';
 
   const handleOpenSettings = () => {
+    if (onOpenOptions) {
+      onOpenOptions();
+      return;
+    }
     if (typeof chrome !== 'undefined' && chrome.runtime?.openOptionsPage) {
       chrome.runtime.openOptionsPage();
     } else {

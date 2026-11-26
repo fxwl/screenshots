@@ -1,4 +1,5 @@
 import type { BrowserCookieChangeEvent, PartitionKeyInfo } from '../types';
+import { normalizeCookieStoreScope } from '../version';
 
 interface SuppressionEntry {
   op: 'set' | 'remove';
@@ -16,11 +17,12 @@ export function buildEchoCookieKey(cookie: {
   hostOnly?: boolean;
   partitionKey?: PartitionKeyInfo | null;
   storeId?: string;
+  storeScope?: string;
 }): string {
   const normDomain = cookie.domain.toLowerCase().replace(/^\./, '');
   const pk = cookie.partitionKey?.topLevelSite ?? '';
   const path = cookie.path || '/';
-  const store = cookie.storeId || '0';
+  const store = normalizeCookieStoreScope(cookie.storeId ?? cookie.storeScope);
   return `c::${store}::${pk}::${normDomain}::${path}::${cookie.name}`;
 }
 
@@ -44,6 +46,7 @@ export class EchoSuppressor {
       hostOnly?: boolean;
       partitionKey?: PartitionKeyInfo | null;
       storeId?: string;
+      storeScope?: string;
     },
     op: 'set' | 'remove',
     contentHash: string,
@@ -121,13 +124,16 @@ export class EchoSuppressor {
     op: 'set' | 'remove',
     valueHash: string,
     nowMs: number,
-    ttlMs = this.defaultTtlMs,
+    ttlMs = 4_000,
   ): void {
     this.entries.set(buildEchoLsKey(origin, key), {
       op,
       contentHash: valueHash,
       expiresAt: nowMs + ttlMs,
-      remainingHits: 1,
+      // Multiple open tabs on the same origin can each fire a native `storage` event for one write.
+      // Keep matching `(op, valueHash)` echoes suppressed for the short TTL window; any differing
+      // user mutation (different value or opposite op) clears the entry and passes through immediately.
+      remainingHits: Number.MAX_SAFE_INTEGER,
     });
   }
 
@@ -147,12 +153,10 @@ export class EchoSuppressor {
       return false;
     }
     if (entry.op === op && (op === 'remove' || entry.contentHash === valueHash)) {
-      entry.remainingHits -= 1;
-      if (entry.remainingHits <= 0) {
-        this.entries.delete(mapKey);
-      }
       return true;
     }
+    // Divergent real user mutation arrived -> clear old suppression immediately
+    this.entries.delete(mapKey);
     return false;
   }
 

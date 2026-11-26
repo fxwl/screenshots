@@ -5,6 +5,7 @@ import { defineConfig, loadEnv } from 'vite';
 
 const rootDir = resolve(__dirname);
 const srcDir = resolve(rootDir, 'src');
+const consoleDir = resolve(rootDir, '..', 'sidepanel', 'src');
 
 const isDev = process.env.__DEV__ === 'true';
 const isProduction = !isDev;
@@ -14,6 +15,7 @@ export default defineConfig({
   resolve: {
     alias: {
       '@src': srcDir,
+      '@console': consoleDir,
     },
   },
   base: '',
