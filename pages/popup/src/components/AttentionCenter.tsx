@@ -7,12 +7,16 @@ import {
   Check,
   ChevronDown,
   ChevronUp,
+  Clock,
   CloudUpload,
+  ExternalLink,
+  FolderKey,
   Info,
   Loader2,
   PanelRightOpen,
   RefreshCw,
   Settings,
+  Sliders,
   Trash2,
   Unlock,
   Wrench,
@@ -30,7 +34,7 @@ export interface AttentionCenterProps {
   currentSiteKey?: string | null;
   onRefresh: () => Promise<void>;
   onOpenOptions: () => void;
-  onOpenSidePanelTab: (tab: 'sites' | 'conflicts' | 'history') => void;
+  onOpenSidePanelTab: (tab: 'sites' | 'conflicts' | 'history' | 'rules') => void;
 }
 
 export function AttentionCenter({
@@ -595,6 +599,86 @@ export function AttentionCenter({
                       onClick={() => void handleDismiss(item.id, '已关闭暂缓刷新提醒')}
                       className="h-6 px-2 text-[11px]">
                       稍后手动刷新
+                    </Button>
+                  </div>
+                ) : null}
+
+                {item.kind === 'cookie_expiring' ? (
+                  <div className="flex flex-wrap items-center gap-1.5 pt-0.5">
+                    {item.siteKey ? (
+                      <Button
+                        type="button"
+                        size="sm"
+                        disabled={isItemBusy}
+                        onClick={() => {
+                          const targetUrl = `https://${item.siteKey}`;
+                          if (typeof chrome !== 'undefined' && chrome.tabs?.create) {
+                            chrome.tabs.create({ url: targetUrl });
+                          } else {
+                            window.open(targetUrl, '_blank');
+                          }
+                        }}
+                        className="h-6 px-2 text-[11px]">
+                        <ExternalLink className="mr-1 h-3 w-3" />
+                        打开站点续期
+                      </Button>
+                    ) : null}
+                    <Button
+                      type="button"
+                      size="sm"
+                      variant="outline"
+                      disabled={isItemBusy}
+                      onClick={() => void handleDismiss(item.id, '已忽略该过期提醒')}
+                      className="h-6 px-2 text-[11px]">
+                      <X className="mr-1 h-3 w-3" />
+                      忽略提醒
+                    </Button>
+                  </div>
+                ) : null}
+
+                {item.kind === 'local_dir_permission_needed' ? (
+                  <div className="flex flex-wrap items-center gap-1.5 pt-0.5">
+                    <Button type="button" size="sm" onClick={onOpenOptions} className="h-6 px-2 text-[11px]">
+                      <FolderKey className="mr-1 h-3 w-3" />
+                      前往控制中心恢复目录授权
+                    </Button>
+                  </div>
+                ) : null}
+
+                {item.kind === 'indexeddb_quota_exceeded' ? (
+                  <div className="flex flex-wrap items-center gap-1.5 pt-0.5">
+                    <Button
+                      type="button"
+                      size="sm"
+                      onClick={() => onOpenSidePanelTab('rules')}
+                      className="h-6 px-2 text-[11px]">
+                      <Sliders className="mr-1 h-3 w-3" />
+                      调整同步规则
+                    </Button>
+                    <Button
+                      type="button"
+                      size="sm"
+                      variant="outline"
+                      disabled={isItemBusy}
+                      onClick={() => void handleDismiss(item.id, '已关闭该提示')}
+                      className="h-6 px-2 text-[11px]">
+                      <X className="mr-1 h-3 w-3" />
+                      忽略关闭
+                    </Button>
+                  </div>
+                ) : null}
+
+                {item.kind === 'ephemeral_track_expired' ? (
+                  <div className="flex flex-wrap items-center gap-1.5 pt-0.5">
+                    <Button
+                      type="button"
+                      size="sm"
+                      variant="outline"
+                      disabled={isItemBusy}
+                      onClick={() => void handleDismiss(item.id, '已关闭临时账号过期清理通知')}
+                      className="h-6 px-2 text-[11px]">
+                      <Clock className="mr-1 h-3 w-3" />
+                      知道了
                     </Button>
                   </div>
                 ) : null}

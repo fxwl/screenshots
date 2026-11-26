@@ -1,11 +1,15 @@
 import {
   base64ToBytes,
+  bytesToBase64,
   bytesToHex,
+  clampSharedCookiesExpiry,
   decodePairingCode as cryptoDecodePairingCode,
+  decodeSessionShare,
   decryptWithDek,
   decryptWithPassword,
   deriveOpaqueId,
   encodePairingCode as cryptoEncodePairingCode,
+  encodeSessionShare,
   encryptWithDek,
   encryptWithPassword,
   generateRandomBytes,
@@ -13,16 +17,27 @@ import {
   isSmesEnvelope,
   parseSmesHeader,
   sha256Hex,
+  toSessionSharePreview,
 } from '../crypto';
 import { bytesToUtf8, utf8ToBytes } from '../crypto/encoding';
-import { DiagnosticLogger, toStructuredError } from '../diagnostics';
+import { DiagnosticLogger, evaluateSiteExpiryHealth, toStructuredError } from '../diagnostics';
+import { buildDebugExportResult } from '../export';
 import { domainMatchesSiteKey, isAnalyticsNoiseCookie, normalizeDomain, resolveSiteKey } from '../psl';
 import { AutoRefreshController } from '../refresh';
-import { buildPresetBlacklistEntries, RulesEngine } from '../rules';
+import { buildPresetBlacklistEntries, DEFAULT_INDEXEDDB_MAX_TOTAL_BYTES, RulesEngine } from '../rules';
+import {
+  createRemoteStorageAdapter,
+  decodeArchiveBackup,
+  encodeArchiveBackup,
+  normalizeStorageProviderConfig,
+  sanitizeStorageProviderConfig,
+  type StorageAdapterOptions,
+} from '../storage-providers';
 import {
   DEFAULT_SPACE_SETTINGS,
   type AccountRotationResult,
   type ApplyVerificationResult,
+  type ArchiveBackupPayload,
   type AttentionItem,
   type BlacklistEntry,
   type BrowserApiAdapter,
@@ -32,7 +47,11 @@ import {
   type ConflictRecord,
   type ConsistencyLevel,
   type CookieRecord,
+  type CreateSessionShareRequest,
+  type CreateSessionShareResult,
   type CreateSiteAccountOptions,
+  type DebugExportRequest,
+  type DebugExportResult,
   type DeleteScope,
   type Device,
   type DeviceCheckpoint,
@@ -43,16 +62,30 @@ import {
   type EventBatch,
   type ExecuteEnvSyncInput,
   type HybridLogicalClock,
+  type ImportArchiveBackupMode,
+  type ImportArchiveBackupResult,
+  type ImportSessionShareRequest,
+  type ImportSessionShareResult,
+  type IndexedDbMutation,
+  type IndexedDbRecord,
+  type IndexedDbTargetRule,
   type InitialJoinReport,
+  type InspectedIndexedDbDatabase,
   type IntegrityReport,
   type LocalStorageRecord,
   type LogEntry,
   type PairingPayload,
   type PendingSiteDecision,
   type PerDeviceSyncPolicy,
+  type RemoteObjectStat,
   type RemoteSpacePasswordVerifyResult,
   type RemoteSpaceProbeItem,
+  type RemoteStorageAdapter,
   type SafetyUndoPoint,
+  type SanitizedStorageProviderConfig,
+  type SessionSharePayload,
+  type SessionSharePreview,
+  type SessionStorageRecord,
   type SiteDecisionAction,
   type SiteRuleOverride,
   type SiteSummaryView,
@@ -64,6 +97,7 @@ import {
   type SpaceSettings,
   type SsoDomainGroup,
   type StorageBackend,
+  type StorageProviderConfig,
   type UpdateSiteTrackPatch,
   type StructuredError,
   type SyncDirection,
@@ -81,7 +115,9 @@ import {
 import {
   applyUserSiteDecision,
   buildCookieLogicalId,
+  buildIndexedDbLogicalId,
   buildLocalStorageLogicalId,
+  buildSessionStorageLogicalId,
   compareVectorClocks,
   createNextCausalVersion,
   evaluateSiteDiscovery,
@@ -93,12 +129,7 @@ import {
   resolveItemMerge,
   updateTombstoneReclaimability,
 } from '../version';
-import {
-  normalizeEtag,
-  WebDAVCapabilityDetector,
-  WebDAVClient,
-  type WebDAVClientOptions,
-} from '../webdav';
+import { normalizeEtag, type WebDAVClientOptions } from '../webdav';
 import { ChangeDetector, type CoalescedCookieChange } from './ChangeDetector';
 import {
   applyCookieWithVerification,
@@ -164,17 +195,87 @@ function isBlockedWebdavSelfTarget(webdavUrl: string, parsedTarget: ParsedEnvTar
 
 function sanitizeShortLabel(raw: string | undefined, maxLen = 80): string {
   if (!raw) return '';
-  // Strip ASCII control characters (newlines, tabs, NUL, etc.) and collapse whitespace
-  const cleaned = raw
-    .split('')
-    .filter((ch) => {
-      const code = ch.charCodeAt(0);
-      return code >= 0x20 && code !== 0x7f;
-    })
-    .join('')
-    .replace(/\s+/g, ' ')
-    .trim();
-  return cleaned.length > maxLen ? cleaned.slice(0, maxLen) : cleaned;
+  // Iterate by Unicode code points so 4-byte emoji never split surrogate pairs; drop controls & unpaired surrogates
+  const filtered: string[] = [];
+  for (const ch of raw) {
+    const cp = ch.codePointAt(0);
+    if (cp === undefined) continue;
+    if (cp < 0x20 || cp === 0x7f || (cp >= 0xd800 && cp <= 0xdfff)) continue;
+    filtered.push(ch);
+  }
+  const cleaned = filtered.join('').replace(/\s+/g, ' ').trim();
+  const codePoints = Array.from(cleaned);
+  return codePoints.length > maxLen ? codePoints.slice(0, maxLen).join('') : cleaned;
+}
+
+function sanitizeTrackColor(raw?: string | null): string | undefined {
+  if (!raw) return undefined;
+  const trimmed = raw.trim();
+  if (!trimmed) return undefined;
+  const normalized = trimmed.startsWith('#') ? trimmed : `#${trimmed}`;
+  if (/^#[0-9a-fA-F]{6}$/.test(normalized)) {
+    return normalized.toLowerCase();
+  }
+  if (/^#[0-9a-fA-F]{3}$/.test(normalized)) {
+    const r = normalized[1];
+    const g = normalized[2];
+    const b = normalized[3];
+    return `#${r}${r}${g}${g}${b}${b}`.toLowerCase();
+  }
+  throw new Error(`无效的轨道标签颜色格式: "${raw}"，请使用 #RRGGBB 十六进制色值`);
+}
+
+function sanitizeTrackBadgeText(raw?: string | null): string | undefined {
+  if (!raw) return undefined;
+  const cleaned = sanitizeShortLabel(raw, 4);
+  return cleaned || undefined;
+}
+
+function extractWebdavConfigFromStorage(storage: StorageProviderConfig): WebDAVConfig | undefined {
+  if (storage.provider !== 'webdav') return undefined;
+  const { provider: _provider, ...rest } = storage;
+  return { ...rest };
+}
+
+function resolveEntryStorage(entry: LocalSpaceIndexEntry): StorageProviderConfig {
+  const resolved = normalizeStorageProviderConfig(entry.storage, entry.webdav);
+  if (!resolved) {
+    throw new Error(`Space "${entry.spaceId}" missing storage provider configuration`);
+  }
+  return resolved;
+}
+
+function getBlockedSelfUrlForStorage(storage: StorageProviderConfig): string {
+  if (storage.provider === 'webdav') return storage.url;
+  if (storage.provider === 's3') return storage.endpoint;
+  return '';
+}
+
+function getRootPathForSpace(storage: StorageProviderConfig): string {
+  if (storage.provider === 'webdav') return storage.rootPath || '/SessionMesh';
+  return storage.rootPrefix || '/SessionMesh';
+}
+
+function extractGistIdFromAdapter(adapter: RemoteStorageAdapter): string | undefined {
+  if ('getGistId' in adapter && typeof (adapter as { getGistId?: unknown }).getGistId === 'function') {
+    return (adapter as { getGistId: () => string | undefined }).getGistId();
+  }
+  return undefined;
+}
+
+function matchesSessionStorageAllowlist(key: string, allowlist?: string[]): boolean {
+  if (!allowlist || allowlist.length === 0) return true;
+  for (const rawRule of allowlist) {
+    const rule = rawRule.trim();
+    if (!rule) continue;
+    if (rule.endsWith('*')) {
+      const prefix = rule.slice(0, -1);
+      if (key.startsWith(prefix)) return true;
+    } else if (key === rule || key.startsWith(rule)) {
+      return true;
+    }
+  }
+  return false;
 }
 
 interface GlobalDeviceIdentity {
@@ -188,7 +289,8 @@ interface LocalSpaceIndexEntry {
   spaceId: string;
   opaqueId: string;
   name: string;
-  webdav: WebDAVConfig;
+  webdav?: WebDAVConfig;
+  storage?: StorageProviderConfig;
   status: DeviceStatus;
   consistencyLevel?: ConsistencyLevel;
   keyEpoch: number;
@@ -244,7 +346,11 @@ interface PersistedSpaceMeta {
   consecutiveTransientFailures?: number;
   appliedCookieHashes: Record<string, string>;
   appliedLsHashes: Record<string, string>;
+  appliedSsHashes?: Record<string, string>;
+  appliedIdbHashes?: Record<string, string>;
   pendingCleanLsBySite?: Record<string, { trackId: string; clearedOrigins: string[] }>;
+  pendingCleanSsBySite?: Record<string, { trackId: string; clearedOrigins: string[] }>;
+  pendingCleanIdbBySite?: Record<string, { trackId: string; clearedOrigins: string[] }>;
   pendingEnvLsByOrigin?: Record<
     string,
     {
@@ -254,17 +360,48 @@ interface PersistedSpaceMeta {
       autoReloadTarget: boolean;
     }
   >;
+  pendingEnvSsByOrigin?: Record<
+    string,
+    {
+      items: Record<string, string>;
+      cleanTargetBeforeSync: boolean;
+      excludeKeys: string[];
+      autoReloadTarget: boolean;
+    }
+  >;
+  quotaExceededOrigins?: Record<
+    string,
+    {
+      siteKey: string;
+      totalBytes: number;
+      maxBytes: number;
+      detectedAt: number;
+    }
+  >;
+  dismissedQuotaOrigins?: Record<string, number>;
+  dismissedExpiryAlerts?: Record<string, string>;
+  dismissedEphemeralExpiredAlerts?: Record<string, true>;
+  expiredEphemeralNotifications?: Array<{
+    id: string;
+    siteKey: string;
+    trackId: string;
+    label: string;
+    expiredAt: number;
+  }>;
 }
 
 interface LoadedSpaceRuntime {
   spaceId: string;
-  webdav: WebDAVConfig;
-  client: WebDAVClient;
+  storage: StorageProviderConfig;
+  webdav?: WebDAVConfig;
+  client: RemoteStorageAdapter;
   meta: PersistedSpaceMeta;
   tracks: Record<string, SiteTrack>;
   pendingDecisions: Record<string, PendingSiteDecision>;
   cookies: Record<string, CookieRecord>;
   localStorage: Record<string, LocalStorageRecord>;
+  sessionStorage: Record<string, SessionStorageRecord>;
+  indexedDb: Record<string, IndexedDbRecord>;
   tombstones: Record<string, Tombstone>;
   pendingOutboundEvents: SyncEvent[];
   retryTasks: SyncTask[];
@@ -281,6 +418,7 @@ export interface SyncEngineOptions {
   storage: StorageBackend;
   browser: BrowserApiAdapter;
   webdavClientOptions?: WebDAVClientOptions;
+  storageAdapterOptions?: StorageAdapterOptions;
   debounceMs?: number;
   refreshCoalesceMs?: number;
   pbkdf2Iterations?: number;
@@ -375,6 +513,8 @@ function formatDeferredReloadReasons(reasons: string[]): string {
     if (r === 'active_contenteditable_focus') return '正在编辑富文本区域';
     if (r === 'ime_composing') return '正在使用输入法候选输入';
     if (r === 'file_selected' || r === 'pending_file_upload') return '已选择待上传文件';
+    if (r === 'media_playing') return '页面正在播放音视频';
+    if (r === 'user_actively_viewing') return '正在浏览或交互当前页面';
     if (r === 'beforeunload_registered') return '页面开启了离开保护';
     if (r === 'safety_probe_unavailable' || r === 'probe_unreachable') {
       return '页面安全检测暂不可达';
@@ -389,6 +529,7 @@ export class SyncEngine {
   private readonly storage: StorageBackend;
   private readonly browser: BrowserApiAdapter;
   private readonly webdavClientOptions?: WebDAVClientOptions;
+  private readonly storageAdapterOptions?: StorageAdapterOptions;
   private readonly debounceMs: number;
   private readonly refreshCoalesceMs: number;
   private readonly pbkdf2Iterations: number;
@@ -419,12 +560,15 @@ export class SyncEngine {
   private readonly releasedOnPageLeaveSites = new Set<string>();
   private readonly postReloadPushMuteUntil = new Map<string, number>();
   private readonly postTrackSwitchLeaveMuteUntil = new Map<string, number>();
+  private readonly localDirPermissionNeededBySpace = new Map<string, boolean>();
+  private readonly lastTestedConsistencyByEndpoint = new Map<string, ConsistencyLevel>();
   private inAutoEnvSync = false;
 
   constructor(options: SyncEngineOptions) {
     this.storage = options.storage;
     this.browser = options.browser;
     this.webdavClientOptions = options.webdavClientOptions;
+    this.storageAdapterOptions = options.storageAdapterOptions;
     this.debounceMs = options.debounceMs ?? 1500;
     this.refreshCoalesceMs = options.refreshCoalesceMs ?? 800;
     this.pbkdf2Iterations = options.pbkdf2Iterations ?? 200_000;
@@ -577,8 +721,16 @@ export class SyncEngine {
         meta.corruptedPaths = meta.corruptedPaths ?? [];
         meta.appliedCookieHashes = meta.appliedCookieHashes ?? {};
         meta.appliedLsHashes = meta.appliedLsHashes ?? {};
+        meta.appliedSsHashes = meta.appliedSsHashes ?? {};
+        meta.appliedIdbHashes = meta.appliedIdbHashes ?? {};
         meta.pendingCleanLsBySite = meta.pendingCleanLsBySite ?? {};
+        meta.pendingCleanSsBySite = meta.pendingCleanSsBySite ?? {};
+        meta.pendingCleanIdbBySite = meta.pendingCleanIdbBySite ?? {};
         meta.pendingEnvLsByOrigin = meta.pendingEnvLsByOrigin ?? {};
+        meta.pendingEnvSsByOrigin = meta.pendingEnvSsByOrigin ?? {};
+        meta.quotaExceededOrigins = meta.quotaExceededOrigins ?? {};
+        meta.dismissedQuotaOrigins = meta.dismissedQuotaOrigins ?? {};
+        meta.dismissedExpiryAlerts = meta.dismissedExpiryAlerts ?? {};
         await this.storage.set(ns, 'meta', meta);
       }
 
@@ -605,6 +757,8 @@ export class SyncEngine {
         ['tracks', {}],
         ['pendingDecisions', {}],
         ['localStorage', {}],
+        ['sessionStorage', {}],
+        ['indexedDb', {}],
         ['tombstones', {}],
         ['pendingOutboundEvents', []],
         ['retryTasks', []],
@@ -631,9 +785,48 @@ export class SyncEngine {
     }
   }
 
-  private registerConfigSecrets(webdav: WebDAVConfig, password?: string): void {
-    this.logger.registerSecret(webdav.password);
-    this.logger.registerSecret(webdav.bearerToken);
+  private createStorageAdapter(config: StorageProviderConfig): RemoteStorageAdapter {
+    const normalized = normalizeStorageProviderConfig(config);
+    if (!normalized) {
+      throw new Error('Storage provider configuration is missing');
+    }
+    return createRemoteStorageAdapter(normalized, {
+      fetchImpl: this.storageAdapterOptions?.fetchImpl ?? this.webdavClientOptions?.fetchImpl,
+      resolveDirectoryHandle: this.storageAdapterOptions?.resolveDirectoryHandle,
+    });
+  }
+
+  private async syncAdapterMetadataIfNeeded(rt: LoadedSpaceRuntime): Promise<void> {
+    if (rt.storage.provider !== 'github_gist') return;
+    const resolvedGistId = extractGistIdFromAdapter(rt.client);
+    if (resolvedGistId && rt.storage.gistId !== resolvedGistId) {
+      rt.storage = { ...rt.storage, gistId: resolvedGistId };
+      const entry = this.spaceIndex[rt.spaceId];
+      if (entry) {
+        entry.storage = { ...rt.storage };
+        await this.storage.set(GLOBAL_NS, 'spaceIndex', this.spaceIndex);
+      }
+    }
+  }
+
+  private registerConfigSecrets(config?: StorageProviderConfig | WebDAVConfig | null, password?: string): void {
+    if (config) {
+      const normalized = normalizeStorageProviderConfig(
+        'provider' in config ? (config as StorageProviderConfig) : undefined,
+        'provider' in config ? undefined : (config as WebDAVConfig),
+      );
+      if (normalized) {
+        if (normalized.provider === 'webdav') {
+          this.logger.registerSecret(normalized.password);
+          this.logger.registerSecret(normalized.bearerToken);
+        } else if (normalized.provider === 's3') {
+          this.logger.registerSecret(normalized.secretAccessKey);
+          this.logger.registerSecret(normalized.sessionToken);
+        } else if (normalized.provider === 'github_gist') {
+          this.logger.registerSecret(normalized.personalAccessToken);
+        }
+      }
+    }
     this.logger.registerSecret(password);
   }
 
@@ -643,7 +836,9 @@ export class SyncEngine {
       throw new Error(`Space not found: ${spaceId}`);
     }
 
-    this.registerConfigSecrets(entry.webdav, encryptionPassword);
+    const storage = resolveEntryStorage(entry);
+    const webdav = extractWebdavConfigFromStorage(storage);
+    this.registerConfigSecrets(storage, encryptionPassword);
 
     const ns = spaceNs(spaceId);
     const meta = await this.storage.get<PersistedSpaceMeta>(ns, 'meta');
@@ -651,10 +846,15 @@ export class SyncEngine {
       throw new Error(`Space metadata missing for space: ${spaceId}`);
     }
 
+    meta.space.provider = meta.space.provider ?? storage.provider;
     meta.space.settings = {
       ...DEFAULT_SPACE_SETTINGS,
       ...meta.space.settings,
       devicePolicies: { ...(meta.space.settings?.devicePolicies ?? {}) },
+      expiryWarning: {
+        ...DEFAULT_SPACE_SETTINGS.expiryWarning!,
+        ...(meta.space.settings?.expiryWarning ?? {}),
+      },
     };
     meta.rules = {
       spaceBlacklist: meta.rules?.spaceBlacklist ?? [],
@@ -670,8 +870,18 @@ export class SyncEngine {
     meta.dismissedApplyFailures = meta.dismissedApplyFailures ?? {};
     meta.appliedCookieHashes = meta.appliedCookieHashes ?? {};
     meta.appliedLsHashes = meta.appliedLsHashes ?? {};
+    meta.appliedSsHashes = meta.appliedSsHashes ?? {};
+    meta.appliedIdbHashes = meta.appliedIdbHashes ?? {};
     meta.pendingCleanLsBySite = meta.pendingCleanLsBySite ?? {};
+    meta.pendingCleanSsBySite = meta.pendingCleanSsBySite ?? {};
+    meta.pendingCleanIdbBySite = meta.pendingCleanIdbBySite ?? {};
     meta.pendingEnvLsByOrigin = meta.pendingEnvLsByOrigin ?? {};
+    meta.pendingEnvSsByOrigin = meta.pendingEnvSsByOrigin ?? {};
+    meta.quotaExceededOrigins = meta.quotaExceededOrigins ?? {};
+    meta.dismissedQuotaOrigins = meta.dismissedQuotaOrigins ?? {};
+    meta.dismissedExpiryAlerts = meta.dismissedExpiryAlerts ?? {};
+    meta.dismissedEphemeralExpiredAlerts = meta.dismissedEphemeralExpiredAlerts ?? {};
+    meta.expiredEphemeralNotifications = meta.expiredEphemeralNotifications ?? [];
 
     const tracks = (await this.storage.get<Record<string, SiteTrack>>(ns, 'tracks')) ?? {};
     const pendingDecisions =
@@ -691,6 +901,10 @@ export class SyncEngine {
     }
     const localStorage =
       (await this.storage.get<Record<string, LocalStorageRecord>>(ns, 'localStorage')) ?? {};
+    const sessionStorage =
+      (await this.storage.get<Record<string, SessionStorageRecord>>(ns, 'sessionStorage')) ?? {};
+    const indexedDb =
+      (await this.storage.get<Record<string, IndexedDbRecord>>(ns, 'indexedDb')) ?? {};
     const tombstones = (await this.storage.get<Record<string, Tombstone>>(ns, 'tombstones')) ?? {};
     const pendingOutboundEvents =
       (await this.storage.get<SyncEvent[]>(ns, 'pendingOutboundEvents')) ?? [];
@@ -713,7 +927,7 @@ export class SyncEngine {
       }
     }
 
-    const client = new WebDAVClient(entry.webdav, this.webdavClientOptions);
+    const client = this.createStorageAdapter(storage);
     const rulesEngine = new RulesEngine(
       meta.space.settings,
       meta.rules,
@@ -731,13 +945,16 @@ export class SyncEngine {
 
     const rt: LoadedSpaceRuntime = {
       spaceId,
-      webdav: entry.webdav,
+      storage,
+      webdav,
       client,
       meta,
       tracks,
       pendingDecisions,
       cookies,
       localStorage,
+      sessionStorage,
+      indexedDb,
       tombstones,
       pendingOutboundEvents: this.compactPendingOutboundEvents(pendingOutboundEvents),
       retryTasks,
@@ -750,6 +967,14 @@ export class SyncEngine {
       encryptionPassword,
     };
 
+    if (
+      rt.storage.provider === 'local_directory' &&
+      (meta.latestError?.code === 'ERR_LOCAL_DIR_PERMISSION' ||
+        meta.latestError?.code === 'ERR_LOCAL_DIR_MISSING')
+    ) {
+      this.localDirPermissionNeededBySpace.set(spaceId, true);
+    }
+
     this.runtime = rt;
     this.activeSpaceId = spaceId;
     return rt;
@@ -757,6 +982,13 @@ export class SyncEngine {
 
   private async persistRuntime(rt: LoadedSpaceRuntime): Promise<void> {
     const ns = spaceNs(rt.spaceId);
+
+    if (rt.storage.provider === 'github_gist') {
+      const resolvedGistId = extractGistIdFromAdapter(rt.client);
+      if (resolvedGistId && rt.storage.gistId !== resolvedGistId) {
+        rt.storage = { ...rt.storage, gistId: resolvedGistId };
+      }
+    }
 
     // Update device counters before persisting
     rt.meta.localDevice.pendingEvents = rt.pendingOutboundEvents.length;
@@ -767,6 +999,8 @@ export class SyncEngine {
     await this.storage.set(ns, 'pendingDecisions', rt.pendingDecisions);
     await this.storage.set(ns, 'cookies', rt.cookies);
     await this.storage.set(ns, 'localStorage', rt.localStorage);
+    await this.storage.set(ns, 'sessionStorage', rt.sessionStorage);
+    await this.storage.set(ns, 'indexedDb', rt.indexedDb);
     await this.storage.set(ns, 'tombstones', rt.tombstones);
     await this.storage.set(ns, 'pendingOutboundEvents', rt.pendingOutboundEvents);
     await this.storage.set(ns, 'retryTasks', rt.retryTasks);
@@ -782,6 +1016,8 @@ export class SyncEngine {
       entry.keyEpoch = rt.meta.space.keyEpoch;
       entry.updatedAt = this.now();
       entry.deviceName = rt.meta.localDevice.name;
+      entry.storage = { ...rt.storage };
+      entry.webdav = extractWebdavConfigFromStorage(rt.storage);
       if (rt.meta.space.settings.sessionLockEnabled) {
         delete entry.dekKeyring;
       } else if (Object.keys(rt.dekKeyring).length > 0) {
@@ -1034,6 +1270,61 @@ export class SyncEngine {
     }
   }
 
+  private isLocalOnlyTrack(rt: LoadedSpaceRuntime, trackId?: string): boolean {
+    if (!trackId) return false;
+    return Boolean(rt.tracks[trackId]?.ephemeral?.localOnly);
+  }
+
+  private evaluateSiteExpiryMap(
+    rt: LoadedSpaceRuntime,
+    nowMs: number,
+  ): Map<string, ReturnType<typeof evaluateSiteExpiryHealth>> {
+    const out = new Map<string, ReturnType<typeof evaluateSiteExpiryHealth>>();
+    const settings = rt.meta.space.settings.expiryWarning;
+    if (settings?.enabled === false) {
+      return out;
+    }
+
+    const bySiteCookies = new Map<string, CookieRecord[]>();
+    for (const c of Object.values(rt.cookies)) {
+      if (c.deleted) continue;
+      if (c.syncStatus === 'EXPIRED' && !rt.meta.appliedCookieHashes[c.logicalId]) continue;
+      const list = bySiteCookies.get(c.siteKey);
+      if (list) list.push(c);
+      else bySiteCookies.set(c.siteKey, [c]);
+    }
+
+    for (const [siteKey, binding] of Object.entries(rt.meta.localDevice.siteBindings)) {
+      if (
+        !binding ||
+        binding.state === 'UNMANAGED' ||
+        binding.state === 'BLACKLISTED' ||
+        binding.state === 'PENDING_CHOICE'
+      ) {
+        continue;
+      }
+      const policy = this.getEffectivePolicyForDevice(rt, siteKey, siteKey);
+      if (policy.excluded || policy.direction === 'disabled') {
+        continue;
+      }
+      const siteCookies = bySiteCookies.get(siteKey) ?? [];
+      if (siteCookies.length === 0) continue;
+
+      const health = evaluateSiteExpiryHealth({
+        siteKey,
+        cookies: siteCookies,
+        tracks: rt.tracks,
+        activeTrackId: binding.trackId,
+        watchedCookieNames: policy.watchedCookieNames,
+        settings,
+        nowMs,
+      });
+      out.set(siteKey, health);
+    }
+
+    return out;
+  }
+
   private computeStatus(rt: LoadedSpaceRuntime): DeviceStatus {
     if (!rt.dekKeyring[rt.meta.space.keyEpoch]) {
       return rt.meta.space.status === 'DECRYPT_ERROR' ? 'DECRYPT_ERROR' : 'LOCKED';
@@ -1046,12 +1337,22 @@ export class SyncEngine {
     if (rt.meta.globalPaused || rt.meta.localDevice.state === 'paused') return 'PAUSED';
     if (!this.isOnline()) return 'OFFLINE';
     if (rt.pendingOutboundEvents.length > 0) return 'PENDING';
+    const hasLocalDirPermIssue =
+      rt.storage.provider === 'local_directory' &&
+      (this.localDirPermissionNeededBySpace.get(rt.spaceId) === true ||
+        rt.meta.latestError?.code === 'ERR_LOCAL_DIR_PERMISSION' ||
+        rt.meta.latestError?.code === 'ERR_LOCAL_DIR_MISSING');
+    const hasActiveQuotaExceeded = Object.entries(rt.meta.quotaExceededOrigins ?? {}).some(
+      ([origin, info]) => (rt.meta.dismissedQuotaOrigins?.[origin] ?? 0) < info.detectedAt,
+    );
     const hasActionableLatestError =
       Boolean(rt.meta.latestError) &&
       (!this.isTransientRetryableError(rt.meta.latestError) ||
         (rt.meta.consecutiveTransientFailures ?? 0) >= this.transientErrorAlertThreshold);
     if (
       rt.meta.storageFullHalted ||
+      hasLocalDirPermIssue ||
+      hasActiveQuotaExceeded ||
       this.getUnacknowledgedFailedCookies(rt).length > 0 ||
       this.getActiveCorruptedPaths(rt).length > 0 ||
       hasActionableLatestError
@@ -1066,9 +1367,10 @@ export class SyncEngine {
       return [];
     }
 
+    const nowMs = this.now();
     const items: AttentionItem[] = [];
 
-    // 1. Decrypt / Auth / Storage-Full Errors
+    // 1. Decrypt / Auth / Storage-Full / Local-Directory Permission Errors
     if (status === 'DECRYPT_ERROR') {
       items.push({
         id: 'decrypt_error',
@@ -1099,6 +1401,28 @@ export class SyncEngine {
       });
     }
 
+    const isLocalDirPermError =
+      rt.storage.provider === 'local_directory' &&
+      (rt.meta.latestError?.code === 'ERR_LOCAL_DIR_PERMISSION' ||
+        rt.meta.latestError?.code === 'ERR_LOCAL_DIR_MISSING' ||
+        this.localDirPermissionNeededBySpace.get(rt.spaceId) === true);
+
+    if (isLocalDirPermError && rt.storage.provider === 'local_directory') {
+      items.push({
+        id: 'local_dir_permission_needed',
+        kind: 'local_dir_permission_needed',
+        severity: 'warning',
+        handleKey: rt.storage.handleKey,
+        title: '本地同步文件夹需恢复读写授权',
+        detail:
+          rt.meta.latestError?.message ||
+          `浏览器重启后需要为本地目录「${rt.storage.directoryLabel}」重新授予读写权限。`,
+        suggestion: '请在侧边栏或控制中心点击「恢复文件夹读写授权」以继续同步。',
+        dismissible: true,
+        timestamp: rt.meta.latestError?.timestamp ?? nowMs,
+      });
+    }
+
     if (rt.meta.storageFullHalted) {
       items.push({
         id: 'storage_full',
@@ -1114,7 +1438,12 @@ export class SyncEngine {
     // 2. Latest structured error — keep transient 503/429/network blips silent until persistent (>= threshold)
     const transientFailures = rt.meta.consecutiveTransientFailures ?? 0;
     let showedTransientWarning = false;
-    if (rt.meta.latestError && status !== 'AUTH_ERROR' && !rt.meta.storageFullHalted) {
+    if (
+      rt.meta.latestError &&
+      status !== 'AUTH_ERROR' &&
+      !rt.meta.storageFullHalted &&
+      !isLocalDirPermError
+    ) {
       const isTransient = this.isTransientRetryableError(rt.meta.latestError);
       if (!isTransient) {
         items.push({
@@ -1137,9 +1466,9 @@ export class SyncEngine {
           kind: 'latest_error',
           severity: 'warning',
           count: transientFailures,
-          title: `WebDAV 云端暂时繁忙（${statusHint}，已连续重试 ${transientFailures} 次）`,
+          title: `云端存储暂时繁忙（${statusHint}，已连续重试 ${transientFailures} 次）`,
           detail: '本地变更已合并保存，系统会继续在后台自动退避重试，无需手动操作。',
-          suggestion: '如网盘服务持续异常可稍后点「立即同步重试」，或直接点「忽略」静默等待自动恢复。',
+          suggestion: '如服务持续异常可稍后点「立即同步重试」，或直接点「忽略」静默等待自动恢复。',
           dismissible: true,
           timestamp: rt.meta.latestError.timestamp,
         });
@@ -1151,7 +1480,9 @@ export class SyncEngine {
       (a, b) => b.detectedAt - a.detectedAt,
     );
     for (const d of pendingList) {
-      const remoteTracks = Object.values(rt.tracks).filter((t) => t.siteKey === d.siteKey);
+      const remoteTracks = Object.values(rt.tracks).filter(
+        (t) => t.siteKey === d.siteKey && !t.ephemeral?.localOnly,
+      );
       const isMulti = d.reason === 'multiple_remote_tracks' || remoteTracks.length > 1;
       items.push({
         id: `decision:${d.siteKey}`,
@@ -1277,6 +1608,76 @@ export class SyncEngine {
       });
     }
 
+    // 9. IndexedDB Quota Circuit Breaker Warnings
+    for (const [origin, qInfo] of Object.entries(rt.meta.quotaExceededOrigins ?? {})) {
+      if ((rt.meta.dismissedQuotaOrigins?.[origin] ?? 0) >= qInfo.detectedAt) {
+        continue;
+      }
+      const totalKb = Math.round(qInfo.totalBytes / 1024);
+      const maxKb = Math.round(qInfo.maxBytes / 1024);
+      items.push({
+        id: `quota:${origin}`,
+        kind: 'indexeddb_quota_exceeded',
+        severity: 'warning',
+        siteKey: qInfo.siteKey,
+        count: totalKb,
+        title: `${qInfo.siteKey} IndexedDB 体积超限（${totalKb} KB > ${maxKb} KB），已自动熔断跳过`,
+        detail: `来源 ${origin} 的 IndexedDB 选定表体积超出同步配额上限，已跳过同步以保护性能与云端容量。`,
+        suggestion: '请在站点规则中缩小同步的 ObjectStore 或 Key 前缀范围，或调高体积上限后重试。',
+        dismissible: true,
+        timestamp: qInfo.detectedAt,
+      });
+    }
+
+    // 10. Smart Cookie Expiry Warnings
+    const expiryMap = this.evaluateSiteExpiryMap(rt, nowMs);
+    for (const [siteKey, health] of expiryMap.entries()) {
+      if (health.status === 'healthy') continue;
+      if (rt.meta.dismissedExpiryAlerts?.[siteKey] === health.status) continue;
+
+      const first = health.expiringCookies[0];
+      const uniqueCookieNames = Array.from(new Set(health.expiringCookies.map((c) => c.name).filter(Boolean)));
+      const namesPreview = uniqueCookieNames.slice(0, 3).join(', ');
+      const title =
+        health.status === 'expired'
+          ? `${siteKey} 关键登录 Cookie 已过期`
+          : health.status === 'critical'
+            ? `${siteKey} 关键登录态即将失效`
+            : `${siteKey} 登录态将在近期过期`;
+      const detail = first
+        ? `关注凭据：${namesPreview}${health.expiringCookies.length > 3 ? ` 等 ${health.expiringCookies.length} 项` : ''}。`
+        : '检测到登录凭据即将过期，请及时刷新或重新登录以维持会话有效。';
+      items.push({
+        id: `expiry:${siteKey}`,
+        kind: 'cookie_expiring',
+        severity: health.status === 'expiring_soon' ? 'info' : 'warning',
+        siteKey,
+        trackId: first?.trackId,
+        count: health.expiringCookies.length,
+        title,
+        detail,
+        suggestion: '可在浏览器打开对应网站刷新登录态，或将关键 Cookie 标记为「重点监测」。',
+        dismissible: true,
+        timestamp: nowMs,
+      });
+    }
+
+    // 11. Expired Ephemeral Shared Tracks Notifications
+    for (const notif of rt.meta.expiredEphemeralNotifications ?? []) {
+      if (rt.meta.dismissedEphemeralExpiredAlerts?.[notif.id]) continue;
+      items.push({
+        id: `ephemeral_expired:${notif.id}`,
+        kind: 'ephemeral_track_expired',
+        severity: 'info',
+        siteKey: notif.siteKey,
+        trackId: notif.trackId,
+        title: `${notif.siteKey} 临时分享账号「${notif.label}」已到期清理`,
+        detail: '已按 TTL 自动删除仅限本机的临时分享会话，避免过期凭据残留。',
+        dismissible: true,
+        timestamp: notif.expiredAt,
+      });
+    }
+
     return items;
   }
 
@@ -1285,15 +1686,18 @@ export class SyncEngine {
   // =========================================================================
 
   private async writeRemoteSpaceInfo(
-    webdav: WebDAVConfig,
+    storage: StorageProviderConfig,
     opaqueId: string,
     info: { spaceId: string; spaceName: string; updatedAt: number },
   ): Promise<void> {
     try {
-      const rawClient = new WebDAVClient(
-        { ...webdav, storageFormat: 'binary_enc' },
-        this.webdavClientOptions,
-      );
+      const normalized = normalizeStorageProviderConfig(storage);
+      if (!normalized) return;
+      const rawConfig: StorageProviderConfig =
+        normalized.provider === 'webdav'
+          ? { ...normalized, storageFormat: 'binary_enc' }
+          : normalized;
+      const rawAdapter = this.createStorageAdapter(rawConfig);
       const payload = utf8ToBytes(
         JSON.stringify({
           spaceId: info.spaceId,
@@ -1301,7 +1705,7 @@ export class SyncEngine {
           updatedAt: info.updatedAt,
         }),
       );
-      await rawClient.putBytes(spaceInfoPath(opaqueId), payload, {
+      await rawAdapter.putBytes(spaceInfoPath(opaqueId), payload, {
         contentType: 'text/plain; charset=utf-8',
       });
     } catch {
@@ -1310,15 +1714,18 @@ export class SyncEngine {
   }
 
   private async readRemoteSpaceInfo(
-    webdav: WebDAVConfig,
+    storage: StorageProviderConfig,
     opaqueId: string,
   ): Promise<{ spaceId: string; spaceName?: string; updatedAt?: number } | null> {
     try {
-      const rawClient = new WebDAVClient(
-        { ...webdav, storageFormat: 'binary_enc' },
-        this.webdavClientOptions,
-      );
-      const fetched = await rawClient.getBytes(spaceInfoPath(opaqueId));
+      const normalized = normalizeStorageProviderConfig(storage);
+      if (!normalized) return null;
+      const rawConfig: StorageProviderConfig =
+        normalized.provider === 'webdav'
+          ? { ...normalized, storageFormat: 'binary_enc' }
+          : normalized;
+      const rawAdapter = this.createStorageAdapter(rawConfig);
+      const fetched = await rawAdapter.getBytes(spaceInfoPath(opaqueId));
       const text = bytesToUtf8(fetched.bytes).trim();
       if (!text) return null;
 
@@ -1379,6 +1786,12 @@ export class SyncEngine {
     direction: Exclude<SyncDirection, 'inherit'>;
     syncCookies: boolean;
     syncLocalStorage: boolean;
+    syncSessionStorage: boolean;
+    sessionStorageKeyAllowlist?: string[];
+    syncIndexedDb: boolean;
+    indexedDbTargets?: IndexedDbTargetRule[];
+    indexedDbMaxTotalBytes: number;
+    watchedCookieNames?: string[];
     autoRefresh: boolean;
   } {
     const base = rt.rulesEngine.getEffectivePolicy(domainOrOriginOrUrl);
@@ -1394,6 +1807,10 @@ export class SyncEngine {
         direction: 'disabled',
         syncCookies: false,
         syncLocalStorage: false,
+        syncSessionStorage: false,
+        syncIndexedDb: false,
+        indexedDbMaxTotalBytes: base.indexedDbMaxTotalBytes,
+        watchedCookieNames: base.watchedCookieNames,
         autoRefresh: false,
       };
     }
@@ -1409,6 +1826,10 @@ export class SyncEngine {
         direction: 'disabled',
         syncCookies: false,
         syncLocalStorage: false,
+        syncSessionStorage: false,
+        syncIndexedDb: false,
+        indexedDbMaxTotalBytes: base.indexedDbMaxTotalBytes,
+        watchedCookieNames: base.watchedCookieNames,
         autoRefresh: false,
       };
     }
@@ -1430,6 +1851,12 @@ export class SyncEngine {
       direction: effectiveDirection,
       syncCookies: disabled ? false : base.syncCookies,
       syncLocalStorage: disabled ? false : base.syncLocalStorage,
+      syncSessionStorage: disabled ? false : base.syncSessionStorage,
+      sessionStorageKeyAllowlist: disabled ? undefined : base.sessionStorageKeyAllowlist,
+      syncIndexedDb: disabled ? false : base.syncIndexedDb,
+      indexedDbTargets: disabled ? undefined : base.indexedDbTargets,
+      indexedDbMaxTotalBytes: base.indexedDbMaxTotalBytes,
+      watchedCookieNames: base.watchedCookieNames,
       autoRefresh: disabled ? false : base.autoRefresh,
     };
   }
@@ -1449,7 +1876,9 @@ export class SyncEngine {
     if (rt.meta.space.settings.syncScopeMode !== 'managed_only') {
       return true;
     }
-    const hasRemoteTrack = Object.values(rt.tracks).some((t) => t.siteKey === siteKey);
+    const hasRemoteTrack = Object.values(rt.tracks).some(
+      (t) => t.siteKey === siteKey && !t.ephemeral?.localOnly,
+    );
     if (
       binding &&
       (binding.state === 'AUTO_BOUND' ||
@@ -1486,7 +1915,9 @@ export class SyncEngine {
         continue;
       }
 
-      const remoteTracks = Object.values(rt.tracks).filter((t) => t.siteKey === siteKey);
+      const remoteTracks = Object.values(rt.tracks).filter(
+        (t) => t.siteKey === siteKey && !t.ephemeral?.localOnly,
+      );
       if (remoteTracks.length === 0) {
         delete rt.pendingDecisions[siteKey];
         continue;
@@ -1525,20 +1956,46 @@ export class SyncEngine {
   // Onboarding & Space Lifecycle
   // =========================================================================
 
-  async testWebDAVConnection(config: WebDAVConfig): Promise<CapabilityReport> {
+  async testStorageConnection(storage: StorageProviderConfig): Promise<CapabilityReport> {
     await this.ensureInitialized();
-    this.registerConfigSecrets(config);
-    const detector = new WebDAVCapabilityDetector(config, this.webdavClientOptions);
-    return detector.runFullCheck();
+    const normalized = normalizeStorageProviderConfig(storage);
+    if (!normalized) {
+      throw new Error('Storage provider configuration is missing');
+    }
+    this.registerConfigSecrets(normalized);
+    const adapter = this.createStorageAdapter(normalized);
+    const report = await adapter.checkCapabilities();
+    if (report.overallOk) {
+      this.lastTestedConsistencyByEndpoint.set(adapter.displayEndpoint, report.consistencyLevel);
+      this.lastTestedConsistencyByEndpoint.set(report.url, report.consistencyLevel);
+      if (
+        this.runtime &&
+        this.runtime.client.displayEndpoint === adapter.displayEndpoint &&
+        this.spaceIndex[this.runtime.spaceId]
+      ) {
+        this.spaceIndex[this.runtime.spaceId].consistencyLevel = report.consistencyLevel;
+        await this.storage.set(GLOBAL_NS, 'spaceIndex', this.spaceIndex);
+        this.emitStateChange();
+      }
+    }
+    return report;
   }
 
-  async probeRemoteSpaces(config: WebDAVConfig): Promise<RemoteSpaceProbeItem[]> {
+  async testWebDAVConnection(config: WebDAVConfig): Promise<CapabilityReport> {
+    return this.testStorageConnection({ ...config, provider: 'webdav' });
+  }
+
+  async probeStorageSpaces(storage: StorageProviderConfig): Promise<RemoteSpaceProbeItem[]> {
     await this.ensureInitialized();
-    this.registerConfigSecrets(config);
-    const client = new WebDAVClient(config, this.webdavClientOptions);
-    client.validateUrl();
+    const normalized = normalizeStorageProviderConfig(storage);
+    if (!normalized) {
+      throw new Error('Storage provider configuration is missing');
+    }
+    this.registerConfigSecrets(normalized);
+    const adapter = this.createStorageAdapter(normalized);
+    adapter.validateConfig();
     try {
-      const entries = await client.propfind(spacesRootDir(), 1);
+      const entries = await adapter.list(spacesRootDir(), 1);
       const localByOpaque = new Map<string, LocalSpaceIndexEntry>();
       for (const entry of Object.values(this.spaceIndex)) {
         localByOpaque.set(entry.opaqueId, entry);
@@ -1553,7 +2010,7 @@ export class SyncEngine {
         const dirName = stat.name || extractFilename(normPath);
         if (!dirName || dirName === 'spaces') continue;
 
-        const remoteInfo = await this.readRemoteSpaceInfo(config, dirName);
+        const remoteInfo = await this.readRemoteSpaceInfo(normalized, dirName);
         const localEntry = localByOpaque.get(dirName);
 
         const spaceId = remoteInfo?.spaceId ?? localEntry?.spaceId ?? dirName;
@@ -1572,20 +2029,28 @@ export class SyncEngine {
       return spaces;
     } catch (err) {
       const structured = toStructuredError(err, 'probe');
-      if (structured.status === 404) {
+      if (structured.status === 404 && structured.code !== 'ERR_LOCAL_DIR_MISSING') {
         return [];
       }
       throw err;
     }
   }
 
-  async verifyRemoteSpacePassword(params: {
-    webdav: WebDAVConfig;
+  async probeRemoteSpaces(config: WebDAVConfig): Promise<RemoteSpaceProbeItem[]> {
+    return this.probeStorageSpaces({ ...config, provider: 'webdav' });
+  }
+
+  async verifyStorageSpacePassword(params: {
+    storage: StorageProviderConfig;
     spaceId: string;
     encryptionPassword: string;
   }): Promise<RemoteSpacePasswordVerifyResult> {
     await this.ensureInitialized();
-    this.registerConfigSecrets(params.webdav, params.encryptionPassword);
+    const normalized = normalizeStorageProviderConfig(params.storage);
+    if (!normalized) {
+      throw toStructuredError(new Error('请先配置远端同步存储参数'), 'verify_password');
+    }
+    this.registerConfigSecrets(normalized, params.encryptionPassword);
 
     const trimmedSpaceId = params.spaceId.trim();
     if (!trimmedSpaceId) {
@@ -1595,34 +2060,40 @@ export class SyncEngine {
       throw toStructuredError(new Error('请输入端到端加密主密码'), 'verify_password');
     }
 
-    const client = new WebDAVClient(params.webdav, this.webdavClientOptions);
-    client.validateUrl();
+    const adapter = this.createStorageAdapter(normalized);
+    adapter.validateConfig();
 
-    // Verify connectivity & WebDAV credentials first so auth/network errors are never mistaken for 404
+    // Verify connectivity & credentials first so auth/network errors are never mistaken for 404
     try {
-      await client.options('');
+      if (normalized.provider !== 'github_gist' || Boolean(normalized.gistId)) {
+        await adapter.stat('');
+      }
     } catch (err) {
-      throw toStructuredError(err, 'verify_password', params.webdav.url);
+      throw toStructuredError(err, 'verify_password', adapter.displayEndpoint);
+    }
+
+    if (normalized.provider === 'github_gist' && !normalized.gistId) {
+      return { exists: false, verified: false };
     }
 
     let opaqueId: string;
-    let metaStat: WebDAVResourceStat | null = null;
+    let metaStat: RemoteObjectStat | null = null;
     let joinedByOpaqueId = false;
 
     try {
       if (OPAQUE_SPACE_ID_RE.test(trimmedSpaceId)) {
-        const directStat = await client.stat(spaceMetaPath(trimmedSpaceId));
+        const directStat = await adapter.stat(spaceMetaPath(trimmedSpaceId));
         if (directStat !== null) {
           opaqueId = trimmedSpaceId;
           metaStat = directStat;
           joinedByOpaqueId = true;
         } else {
           opaqueId = await deriveOpaqueId(trimmedSpaceId, 'sp_');
-          metaStat = await client.stat(spaceMetaPath(opaqueId));
+          metaStat = await adapter.stat(spaceMetaPath(opaqueId));
         }
       } else {
         opaqueId = await deriveOpaqueId(trimmedSpaceId, 'sp_');
-        metaStat = await client.stat(spaceMetaPath(opaqueId));
+        metaStat = await adapter.stat(spaceMetaPath(opaqueId));
       }
     } catch (err) {
       throw toStructuredError(err, 'verify_password', spaceMetaPath(trimmedSpaceId));
@@ -1633,11 +2104,11 @@ export class SyncEngine {
     }
 
     const metaPath = spaceMetaPath(opaqueId);
-    const fetched = await client.getBytes(metaPath);
+    const fetched = await adapter.getBytes(metaPath);
 
     let aadSpaceId = trimmedSpaceId;
     if (joinedByOpaqueId) {
-      const hintInfo = await this.readRemoteSpaceInfo(params.webdav, opaqueId);
+      const hintInfo = await this.readRemoteSpaceInfo(normalized, opaqueId);
       if (hintInfo?.spaceId && (await deriveOpaqueId(hintInfo.spaceId, 'sp_')) === opaqueId) {
         aadSpaceId = hintInfo.spaceId;
       } else {
@@ -1686,8 +2157,21 @@ export class SyncEngine {
     }
   }
 
-  async saveAndJoinSpace(params: {
+  async verifyRemoteSpacePassword(params: {
     webdav: WebDAVConfig;
+    spaceId: string;
+    encryptionPassword: string;
+  }): Promise<RemoteSpacePasswordVerifyResult> {
+    return this.verifyStorageSpacePassword({
+      storage: { ...params.webdav, provider: 'webdav' },
+      spaceId: params.spaceId,
+      encryptionPassword: params.encryptionPassword,
+    });
+  }
+
+  async saveAndJoinSpace(params: {
+    webdav?: WebDAVConfig;
+    storage?: StorageProviderConfig;
     spaceId: string;
     spaceName: string;
     encryptionPassword: string;
@@ -1701,7 +2185,8 @@ export class SyncEngine {
   }
 
   private async saveAndJoinSpaceInternal(params: {
-    webdav: WebDAVConfig;
+    webdav?: WebDAVConfig;
+    storage?: StorageProviderConfig;
     spaceId: string;
     spaceName: string;
     encryptionPassword: string;
@@ -1711,20 +2196,26 @@ export class SyncEngine {
     initialManagedSiteKeys?: string[];
   }): Promise<InitialJoinReport> {
     const nowMs = this.now();
-    this.registerConfigSecrets(params.webdav, params.encryptionPassword);
+    const resolvedStorage = normalizeStorageProviderConfig(params.storage, params.webdav);
+    if (!resolvedStorage) {
+      throw toStructuredError(new Error('Storage provider configuration is required'), 'join');
+    }
+    this.registerConfigSecrets(resolvedStorage, params.encryptionPassword);
 
     if (!params.encryptionPassword || params.encryptionPassword.trim().length === 0) {
       throw toStructuredError(new Error('Encryption password is required'), 'join');
     }
 
-    const client = new WebDAVClient(params.webdav, this.webdavClientOptions);
-    client.validateUrl();
+    const client = this.createStorageAdapter(resolvedStorage);
+    client.validateConfig();
 
     // Prohibition #6: Verify connectivity & auth before treating 404 as new space
     try {
-      await client.options('');
+      if (resolvedStorage.provider !== 'github_gist' || Boolean(resolvedStorage.gistId)) {
+        await client.stat('');
+      }
     } catch (err) {
-      const se = toStructuredError(err, 'join', params.webdav.url);
+      const se = toStructuredError(err, 'join', client.displayEndpoint);
       await this.logger.log({
         spaceId: params.spaceId,
         level: 'error',
@@ -1739,7 +2230,7 @@ export class SyncEngine {
 
     // Prevent double-hashing when joining directly with an opaque `sp_...` directory ID
     let opaqueId: string;
-    let metaStat: WebDAVResourceStat | null = null;
+    let metaStat: RemoteObjectStat | null = null;
     let joinedByOpaqueId = false;
 
     try {
@@ -1786,6 +2277,7 @@ export class SyncEngine {
     let spaceMetaEtag: string | undefined;
     let deviceBlacklist: BlacklistEntry[] = [];
     let effectiveSpaceId = params.spaceId;
+    const selfBlacklistUrl = getBlockedSelfUrlForStorage(resolvedStorage);
 
     if (metaStat !== null) {
       // Existing space: MUST decrypt cleanly before ANY write (Prohibition #5, D-014)
@@ -1795,7 +2287,7 @@ export class SyncEngine {
 
       let aadSpaceId = params.spaceId;
       if (joinedByOpaqueId) {
-        const hintInfo = await this.readRemoteSpaceInfo(params.webdav, opaqueId);
+        const hintInfo = await this.readRemoteSpaceInfo(resolvedStorage, opaqueId);
         if (hintInfo?.spaceId && (await deriveOpaqueId(hintInfo.spaceId, 'sp_')) === opaqueId) {
           aadSpaceId = hintInfo.spaceId;
         } else {
@@ -1857,11 +2349,16 @@ export class SyncEngine {
         ...descriptor.settings,
         ...cleanSettingsPatch,
         devicePolicies: mergedDevicePolicies,
+        expiryWarning: {
+          ...DEFAULT_SPACE_SETTINGS.expiryWarning!,
+          ...(descriptor.settings?.expiryWarning ?? {}),
+          ...(cleanSettingsPatch.expiryWarning ?? {}),
+        },
       };
       if (params.presetCategories && params.presetCategories.length > 0) {
         deviceBlacklist = buildPresetBlacklistEntries(
           params.presetCategories,
-          params.webdav.url,
+          selfBlacklistUrl || undefined,
           'device',
         );
       }
@@ -1874,10 +2371,18 @@ export class SyncEngine {
         ...DEFAULT_SPACE_SETTINGS,
         ...cleanSettingsPatch,
         devicePolicies: { ...(cleanSettingsPatch.devicePolicies ?? {}) },
+        expiryWarning: {
+          ...DEFAULT_SPACE_SETTINGS.expiryWarning!,
+          ...(cleanSettingsPatch.expiryWarning ?? {}),
+        },
       };
       const presetSpaceBlacklist =
         params.presetCategories && params.presetCategories.length > 0
-          ? buildPresetBlacklistEntries(params.presetCategories, params.webdav.url, 'space')
+          ? buildPresetBlacklistEntries(
+              params.presetCategories,
+              selfBlacklistUrl || undefined,
+              'space',
+            )
           : [];
       const initialRules: SpaceRuleSet = {
         spaceBlacklist: presetSpaceBlacklist,
@@ -1942,8 +2447,15 @@ export class SyncEngine {
     // Ensure our device directories exist
     await this.ensureRemoteSpaceDirs(client, opaqueId, this.identity.deviceId);
 
+    const resolvedGistId = extractGistIdFromAdapter(client);
+    const effectiveStorage: StorageProviderConfig =
+      resolvedStorage.provider === 'github_gist' && resolvedGistId && !resolvedStorage.gistId
+        ? { ...resolvedStorage, gistId: resolvedGistId }
+        : resolvedStorage;
+    const effectiveWebdav = extractWebdavConfigFromStorage(effectiveStorage);
+
     // Publish lightweight readable space-info.txt hint (contains ZERO cookies/domains/secrets)
-    await this.writeRemoteSpaceInfo(params.webdav, opaqueId, {
+    await this.writeRemoteSpaceInfo(effectiveStorage, opaqueId, {
       spaceId: effectiveSpaceId,
       spaceName: descriptor.name || params.spaceName,
       updatedAt: descriptor.updatedAt ?? nowMs,
@@ -1981,8 +2493,8 @@ export class SyncEngine {
       spaceId: effectiveSpaceId,
       opaqueId,
       name: descriptor.name || params.spaceName,
-      provider: 'webdav',
-      rootPath: params.webdav.rootPath,
+      provider: effectiveStorage.provider,
+      rootPath: getRootPathForSpace(effectiveStorage),
       schemaVersion: CURRENT_SCHEMA_VERSION,
       encryptionVersion: descriptor.encryptionVersion ?? 2,
       keyEpoch: descriptor.keyEpoch,
@@ -2007,8 +2519,18 @@ export class SyncEngine {
       corruptedPaths: [],
       appliedCookieHashes: {},
       appliedLsHashes: {},
+      appliedSsHashes: {},
+      appliedIdbHashes: {},
       pendingCleanLsBySite: {},
+      pendingCleanSsBySite: {},
+      pendingCleanIdbBySite: {},
       pendingEnvLsByOrigin: {},
+      pendingEnvSsByOrigin: {},
+      quotaExceededOrigins: {},
+      dismissedQuotaOrigins: {},
+      dismissedExpiryAlerts: {},
+      dismissedEphemeralExpiredAlerts: {},
+      expiredEphemeralNotifications: [],
     };
 
     const dekKeyring: Record<number, string> = {
@@ -2024,7 +2546,8 @@ export class SyncEngine {
       spaceId: effectiveSpaceId,
       opaqueId,
       name: syncSpace.name,
-      webdav: params.webdav,
+      storage: { ...effectiveStorage },
+      webdav: effectiveWebdav,
       status: 'JOINING',
       keyEpoch: descriptor.keyEpoch,
       dekKeyring: descriptor.settings.sessionLockEnabled ? undefined : { ...dekKeyring },
@@ -2035,13 +2558,16 @@ export class SyncEngine {
 
     const rt: LoadedSpaceRuntime = {
       spaceId: effectiveSpaceId,
-      webdav: params.webdav,
+      storage: effectiveStorage,
+      webdav: effectiveWebdav,
       client,
       meta,
       tracks: {},
       pendingDecisions: {},
       cookies: {},
       localStorage: {},
+      sessionStorage: {},
+      indexedDb: {},
       tombstones: {},
       pendingOutboundEvents: [],
       retryTasks: [],
@@ -2054,6 +2580,7 @@ export class SyncEngine {
       encryptionPassword: params.encryptionPassword,
     };
 
+    this.localDirPermissionNeededBySpace.delete(effectiveSpaceId);
     this.runtime = rt;
     this.activeSpaceId = effectiveSpaceId;
     this.echoSuppressor.clear();
@@ -2365,7 +2892,7 @@ export class SyncEngine {
   }
 
   private async ensureRemoteSpaceDirs(
-    client: WebDAVClient,
+    client: RemoteStorageAdapter,
     opaqueId: string,
     deviceId: string,
   ): Promise<void> {
@@ -2414,6 +2941,219 @@ export class SyncEngine {
     } catch {
       // Ignore probe failure here; regular pull will handle corrupted files
     }
+  }
+
+  async updateSpaceStorageConfig(storage: StorageProviderConfig): Promise<void> {
+    await this.ensureInitialized();
+    const normalized = normalizeStorageProviderConfig(storage);
+    if (!normalized) {
+      throw toStructuredError(new Error('Storage provider configuration is required'), 'update_storage');
+    }
+    this.registerConfigSecrets(normalized);
+
+    return this.enqueueOp(async () => {
+      const rt = this.requireUnlockedRuntime();
+      const adapter = this.createStorageAdapter(normalized);
+      adapter.validateConfig();
+
+      try {
+        if (normalized.provider === 'github_gist' && !normalized.gistId) {
+          // Ensure a fresh Private Gist is created immediately and verified public === false
+          await adapter.ensureDir('');
+        } else {
+          await adapter.stat('');
+        }
+      } catch (err) {
+        const se = toStructuredError(err, 'update_storage', adapter.displayEndpoint);
+        if (
+          se.code === 'ERR_LOCAL_DIR_PERMISSION' ||
+          se.code === 'ERR_LOCAL_DIR_MISSING'
+        ) {
+          this.localDirPermissionNeededBySpace.set(rt.spaceId, true);
+        }
+        throw se;
+      }
+
+      const resolvedGistId = extractGistIdFromAdapter(adapter);
+      const nextStorage: StorageProviderConfig =
+        normalized.provider === 'github_gist' && resolvedGistId && !normalized.gistId
+          ? { ...normalized, gistId: resolvedGistId }
+          : { ...normalized };
+      const nextWebdav = extractWebdavConfigFromStorage(nextStorage);
+
+      const prevProvider = rt.storage.provider;
+      const prevEndpoint = rt.client?.displayEndpoint;
+      const prevClient = rt.client;
+      const prevRootPath = rt.meta.space.rootPath;
+      const nextRootPath = getRootPathForSpace(nextStorage);
+      const backendChanged =
+        prevProvider !== nextStorage.provider ||
+        prevEndpoint !== adapter.displayEndpoint ||
+        prevRootPath !== nextRootPath;
+
+      // Best-effort snapshot of existing encrypted space.enc when migrating backends after MV3 SW restart
+      // (when rt.encryptionPassword is no longer in RAM). Bounded timeout prevents stalling if old server is down.
+      let migratedSpaceMetaBytes: Uint8Array | null = null;
+      if (!rt.encryptionPassword && prevClient && backendChanged && !rt.meta.globalPaused && this.isOnline()) {
+        const metaPathForCopy = spaceMetaPath(rt.meta.space.opaqueId);
+        let copyTimer: ReturnType<typeof setTimeout> | undefined;
+        try {
+          const prevRes = await Promise.race([
+            prevClient.getBytes(metaPathForCopy),
+            new Promise<never>((_, reject) => {
+              copyTimer = setTimeout(() => reject(new Error('timeout')), 1_500);
+            }),
+          ]);
+          if (isSmesEnvelope(prevRes.bytes)) {
+            migratedSpaceMetaBytes = prevRes.bytes;
+          }
+        } catch {
+          // Old backend may be unreachable; proceed without blocking migration
+        } finally {
+          if (copyTimer !== undefined) clearTimeout(copyTimer);
+        }
+      }
+
+      rt.storage = nextStorage;
+      rt.webdav = nextWebdav;
+      rt.client = adapter;
+      rt.meta.space.provider = nextStorage.provider;
+      rt.meta.space.rootPath = nextRootPath;
+      this.localDirPermissionNeededBySpace.delete(rt.spaceId);
+
+      const spaceEntry = this.spaceIndex[rt.spaceId];
+      if (spaceEntry) {
+        if (nextStorage.provider === 'github_gist') {
+          spaceEntry.consistencyLevel = 'append_only_degraded';
+        } else if (this.lastTestedConsistencyByEndpoint.has(adapter.displayEndpoint)) {
+          spaceEntry.consistencyLevel = this.lastTestedConsistencyByEndpoint.get(adapter.displayEndpoint);
+        } else if (backendChanged) {
+          delete spaceEntry.consistencyLevel;
+        }
+      }
+
+      // If switching to an empty/new storage backend while unlocked, bootstrap remote directories,
+      // device manifest, checkpoint, and space.enc (even when resumed via keyVault DEK without RAM password).
+      if (!rt.meta.globalPaused && this.isOnline()) {
+        const metaPath = spaceMetaPath(rt.meta.space.opaqueId);
+        let hasRemoteMeta = false;
+        try {
+          hasRemoteMeta = Boolean(await adapter.stat(metaPath));
+        } catch {
+          hasRemoteMeta = false;
+        }
+        if (!hasRemoteMeta || backendChanged) {
+          try {
+            await this.ensureRemoteSpaceDirs(
+              adapter,
+              rt.meta.space.opaqueId,
+              rt.meta.localDevice.deviceId,
+            );
+            if (!hasRemoteMeta) {
+              let metaBytesToWrite: Uint8Array | null = migratedSpaceMetaBytes;
+              if (rt.encryptionPassword) {
+                const descriptor: SpaceDescriptorPayload = {
+                  spaceId: rt.spaceId,
+                  opaqueId: rt.meta.space.opaqueId,
+                  name: rt.meta.space.name,
+                  schemaVersion: CURRENT_SCHEMA_VERSION,
+                  encryptionVersion: rt.meta.space.encryptionVersion ?? 2,
+                  currentDekBase64: this.getCurrentDek(rt),
+                  keyEpoch: rt.meta.space.keyEpoch,
+                  dekKeyring: { ...rt.dekKeyring },
+                  createdAt: rt.meta.space.createdAt,
+                  updatedAt: rt.meta.space.updatedAt,
+                  settings: rt.meta.space.settings,
+                  rules: rt.meta.rules,
+                  verifier: 'SESSIONMESH_SPACE_OK',
+                };
+                const metaAad = buildSpaceMetaAad(rt.spaceId, metaPath);
+                metaBytesToWrite = await encryptWithPassword(
+                  descriptor,
+                  rt.encryptionPassword,
+                  metaAad,
+                  {
+                    compress: true,
+                    encoding: 'json',
+                    iterations: this.pbkdf2Iterations,
+                    keyEpoch: descriptor.keyEpoch,
+                  },
+                );
+              }
+              if (metaBytesToWrite) {
+                try {
+                  const putRes = await adapter.putBytes(metaPath, metaBytesToWrite, {
+                    ifNoneMatchStar: true,
+                    contentType: 'application/octet-stream',
+                  });
+                  rt.meta.spaceMetaEtag = normalizeEtag(putRes.etag);
+                } catch (putErr) {
+                  const se = toStructuredError(putErr, 'update_storage', metaPath);
+                  if (se.status !== 412) throw se;
+                }
+              }
+            }
+            await this.writeRemoteSpaceInfo(nextStorage, rt.meta.space.opaqueId, {
+              spaceId: rt.spaceId,
+              spaceName: rt.meta.space.name,
+              updatedAt: rt.meta.space.updatedAt,
+            });
+            rt.meta.manifestDirty = true;
+            await this.uploadDeviceManifestIfOnline(rt);
+            await this.uploadCheckpoint(rt);
+          } catch (bootErr) {
+            const se = toStructuredError(bootErr, 'update_storage');
+            if (se.code === 'GIST_PUBLIC_FORBIDDEN' || se.status === 401 || se.status === 403) {
+              throw se;
+            }
+          }
+        }
+      }
+
+      if (
+        rt.meta.latestError &&
+        (rt.meta.latestError.code === 'ERR_LOCAL_DIR_PERMISSION' ||
+          rt.meta.latestError.code === 'ERR_LOCAL_DIR_MISSING' ||
+          rt.meta.latestError.status === 401 ||
+          rt.meta.latestError.status === 403)
+      ) {
+        rt.meta.latestError = null;
+      }
+      if (rt.meta.space.status === 'AUTH_ERROR') {
+        rt.meta.space.status = 'SYNCED';
+      }
+
+      await this.syncAdapterMetadataIfNeeded(rt);
+      rt.meta.space.status = this.computeStatus(rt);
+      await this.persistRuntime(rt);
+    });
+  }
+
+  async clearLocalDirPermissionError(handleKey?: string): Promise<void> {
+    await this.ensureInitialized();
+    return this.enqueueOp(async () => {
+      const rt = this.runtime;
+      if (!rt) return;
+      if (
+        handleKey &&
+        rt.storage.provider === 'local_directory' &&
+        rt.storage.handleKey !== handleKey
+      ) {
+        return;
+      }
+      this.localDirPermissionNeededBySpace.delete(rt.spaceId);
+      if (
+        rt.meta.latestError &&
+        (rt.meta.latestError.code === 'ERR_LOCAL_DIR_PERMISSION' ||
+          rt.meta.latestError.code === 'ERR_LOCAL_DIR_MISSING' ||
+          rt.meta.latestError.phase === 'local_dir_permission')
+      ) {
+        rt.meta.latestError = null;
+      }
+      rt.client = this.createStorageAdapter(rt.storage);
+      rt.meta.space.status = this.computeStatus(rt);
+      await this.persistRuntime(rt);
+    });
   }
 
   async unlockSession(encryptionPassword: string, spaceId?: string): Promise<void> {
@@ -2545,6 +3285,7 @@ export class SyncEngine {
     await this.ensureInitialized();
     const current = this.requireRuntime();
     return this.saveAndJoinSpace({
+      storage: current.storage,
       webdav: current.webdav,
       spaceId,
       spaceName,
@@ -2577,7 +3318,7 @@ export class SyncEngine {
           name: trimmed,
           updatedAt: nextUpdatedAt,
         }));
-        await this.writeRemoteSpaceInfo(this.runtime.webdav, this.runtime.meta.space.opaqueId, {
+        await this.writeRemoteSpaceInfo(this.runtime.storage, this.runtime.meta.space.opaqueId, {
           spaceId,
           spaceName: trimmed,
           updatedAt: nextUpdatedAt,
@@ -2591,7 +3332,7 @@ export class SyncEngine {
           meta.space.updatedAt = Math.max(nowMs, meta.space.updatedAt + 1);
           await this.storage.set(ns, 'meta', meta);
         }
-        await this.writeRemoteSpaceInfo(entry.webdav, entry.opaqueId, {
+        await this.writeRemoteSpaceInfo(resolveEntryStorage(entry), entry.opaqueId, {
           spaceId,
           spaceName: trimmed,
           updatedAt: nowMs,
@@ -2693,9 +3434,9 @@ export class SyncEngine {
       if (!entry) return;
 
       if (deleteRemote) {
-        const client = new WebDAVClient(entry.webdav, this.webdavClientOptions);
+        const client = this.createStorageAdapter(resolveEntryStorage(entry));
         try {
-          await client.delete(spaceBasePath(entry.opaqueId));
+          await client.delete(spaceBasePath(entry.opaqueId), { isCollection: true });
         } catch (err) {
           const se = toStructuredError(err, 'delete_space');
           if (se.status !== 404) {
@@ -2708,6 +3449,7 @@ export class SyncEngine {
       if (this.keyVault) {
         await this.keyVault.clearDek(spaceId);
       }
+      this.localDirPermissionNeededBySpace.delete(spaceId);
       delete this.spaceIndex[spaceId];
       await this.storage.set(GLOBAL_NS, 'spaceIndex', this.spaceIndex);
 
@@ -2737,14 +3479,25 @@ export class SyncEngine {
       throw new Error('Passphrase is required to generate pairing code');
     }
     this.logger.registerSecret(passphrase);
-    const payload: PairingPayload = {
-      version: 1,
-      webdav: rt.webdav,
-      spaceId: rt.spaceId,
-      spaceName: rt.meta.space.name,
-      createdAt: this.now(),
-      fromDeviceName: rt.meta.localDevice.name,
-    };
+    const payload: PairingPayload =
+      rt.storage.provider === 'webdav' && rt.webdav
+        ? {
+            version: 1,
+            webdav: rt.webdav,
+            storage: rt.storage,
+            spaceId: rt.spaceId,
+            spaceName: rt.meta.space.name,
+            createdAt: this.now(),
+            fromDeviceName: rt.meta.localDevice.name,
+          }
+        : {
+            version: 2,
+            storage: rt.storage,
+            spaceId: rt.spaceId,
+            spaceName: rt.meta.space.name,
+            createdAt: this.now(),
+            fromDeviceName: rt.meta.localDevice.name,
+          };
     return cryptoEncodePairingCode(payload, passphrase);
   }
 
@@ -2752,7 +3505,9 @@ export class SyncEngine {
     code: string,
     passphrase: string,
   ): Promise<{
-    webdav: WebDAVConfig;
+    version: 1 | 2;
+    webdav?: WebDAVConfig;
+    storage: StorageProviderConfig;
     spaceId: string;
     spaceName: string;
     fromDeviceName: string;
@@ -2760,9 +3515,16 @@ export class SyncEngine {
     await this.ensureInitialized();
     this.logger.registerSecret(passphrase);
     const payload = await cryptoDecodePairingCode(code, passphrase);
-    this.registerConfigSecrets(payload.webdav);
+    const storage = normalizeStorageProviderConfig(payload.storage, payload.webdav);
+    if (!storage) {
+      throw new Error('Decoded pairing payload does not include storage provider configuration');
+    }
+    const webdav = payload.webdav ?? extractWebdavConfigFromStorage(storage);
+    this.registerConfigSecrets(storage);
     return {
-      webdav: payload.webdav,
+      version: payload.version,
+      webdav,
+      storage,
       spaceId: payload.spaceId,
       spaceName: payload.spaceName,
       fromDeviceName: payload.fromDeviceName,
@@ -2868,40 +3630,64 @@ export class SyncEngine {
       }
       // 1. Push outbound events if direction allows (explicit sync bypasses cooldown/backoff/on_page_leave hold)
       if ((direction === 'both' || direction === 'push') && canPushBeforePull) {
-        // Reconcile live open-tab localStorage changes (CREATE/UPDATE/DELETE) before pushing so
-        // explicit "立即同步" / "当前网站上传" never misses recent SPA token mutations waiting on content-script poll!
-        if (rt.meta.space.settings.syncLocalStorage) {
-          try {
-            const openTabs = await this.browser.queryTabs();
-            const openSiteKeys = new Set<string>();
-            for (const tab of openTabs) {
-              const origin = tab.url ? normalizeOriginSafe(tab.url) : null;
-              if (!origin) continue;
-              const sk = resolveSiteKey(origin, rt.meta.rules.ssoGroups);
-              if (!sk) continue;
-              if (siteKeyFilter && sk !== siteKeyFilter) continue;
-              openSiteKeys.add(sk);
+        // Reconcile live open-tab localStorage / sessionStorage / IndexedDB changes before pushing so
+        // explicit "立即同步" / "当前网站上传" never misses recent SPA mutations.
+        try {
+          const openTabs = await this.browser.queryTabs();
+          const openOrigins = new Set<string>();
+          const openSiteKeys = new Set<string>();
+          for (const tab of openTabs) {
+            const origin = tab.url ? normalizeOriginSafe(tab.url) : null;
+            if (!origin) continue;
+            openOrigins.add(origin);
+            const sk = resolveSiteKey(origin, rt.meta.rules.ssoGroups);
+            if (!sk) continue;
+            if (siteKeyFilter && sk !== siteKeyFilter) continue;
+            openSiteKeys.add(sk);
+          }
+          for (const sk of openSiteKeys) {
+            if (rt.rulesEngine.isBlacklisted(sk).blacklisted) continue;
+            const binding = rt.meta.localDevice.siteBindings[sk];
+            if (
+              !binding?.trackId ||
+              binding.state === 'BLACKLISTED' ||
+              binding.state === 'UNMANAGED' ||
+              binding.state === 'PENDING_CHOICE'
+            ) {
+              continue;
             }
-            for (const sk of openSiteKeys) {
-              if (rt.rulesEngine.isBlacklisted(sk).blacklisted) continue;
-              const binding = rt.meta.localDevice.siteBindings[sk];
-              if (
-                !binding?.trackId ||
-                binding.state === 'BLACKLISTED' ||
-                binding.state === 'UNMANAGED' ||
-                binding.state === 'PENDING_CHOICE'
-              ) {
-                continue;
-              }
+            if (rt.meta.space.settings.syncLocalStorage) {
               await this.reconcileOpenTabLocalStorage(rt, sk, binding.trackId, {
                 prequeriedTabs: openTabs,
                 allowLocalTrackSwitch: false,
                 detectDeletes: Boolean(options?.userInitiated),
               });
             }
-          } catch {
-            // Non-fatal: continue pushing queued events even if tab query fails
           }
+          for (const origin of openOrigins) {
+            const sk = resolveSiteKey(origin, rt.meta.rules.ssoGroups);
+            if (!sk || (siteKeyFilter && sk !== siteKeyFilter)) continue;
+            const originPolicy = this.getEffectivePolicyForDevice(rt, origin, sk);
+            if (
+              originPolicy.excluded ||
+              originPolicy.direction === 'disabled' ||
+              originPolicy.direction === 'pull_only'
+            ) {
+              continue;
+            }
+            if (originPolicy.syncSessionStorage) {
+              await this.reconcileOpenTabSessionStorage(rt, origin, {
+                detectDeletes: Boolean(options?.userInitiated),
+              });
+            }
+            if (originPolicy.syncIndexedDb) {
+              await this.captureOriginIndexedDbInternal(rt, origin, {
+                detectDeletes: Boolean(options?.userInitiated),
+              });
+            }
+          }
+        } catch {
+          // Non-fatal: continue pushing queued events even if tab query fails
         }
         pushedEvents = await this.pushOutboundInternal(rt, siteKeyFilter);
         if (siteKeyFilter) {
@@ -2970,6 +3756,8 @@ export class SyncEngine {
       }
       rt.meta.consecutiveTransientFailures = 0;
       rt.meta.autoPushBackoffUntilMs = undefined;
+      this.localDirPermissionNeededBySpace.delete(rt.spaceId);
+      await this.syncAdapterMetadataIfNeeded(rt);
       if (!rt.meta.storageFullHalted) {
         rt.meta.latestError = null;
         if (rt.pendingOutboundEvents.length === 0) {
@@ -2997,6 +3785,11 @@ export class SyncEngine {
       } else if (se.code === 'DECRYPT_ERROR') {
         rt.encryptionPassword = undefined;
         rt.meta.space.status = 'DECRYPT_ERROR';
+      } else if (se.code === 'ERR_LOCAL_DIR_PERMISSION' || se.code === 'ERR_LOCAL_DIR_MISSING') {
+        if (rt.storage.provider === 'local_directory') {
+          this.localDirPermissionNeededBySpace.set(rt.spaceId, true);
+        }
+        rt.meta.space.status = 'PARTIAL';
       } else if (se.status === 401 || se.status === 403) {
         rt.meta.space.status = 'AUTH_ERROR';
       } else if (this.isTransientRetryableError(se)) {
@@ -3081,18 +3874,27 @@ export class SyncEngine {
       if (!inBackoff && !siteRecentlyPulled && !anyRecentlyPulled) {
         this.lastSiteVisitPullAt.set(siteKey, nowMs);
         this.lastAnySiteVisitPullAt = nowMs;
-        // Pull & apply ALL managed remote updates in one WebDAV round-trip (so multi-tab restore never skips sibling sites)
+        // Pull & apply ALL managed remote updates in one round-trip (so multi-tab restore never skips sibling sites)
         await this.syncNow({ direction: 'pull', triggerRefresh: false });
       }
     }
 
-    // If LocalStorage sync is enabled, check origin context and apply any pending remote LS
+    // Check origin context and apply any pending remote LS / SessionStorage / IndexedDB
     const origin = normalizeOriginSafe(url);
     if (origin && policy.syncLocalStorage) {
       const ls = await this.browser.getLocalStorage(origin);
       if (ls.available) {
         await this.ingestLocalStorageSnapshot(origin, ls.items);
       }
+    }
+    if (origin && policy.syncSessionStorage && this.browser.getSessionStorage) {
+      const ss = await this.browser.getSessionStorage(origin);
+      if (ss.available) {
+        await this.ingestSessionStorageSnapshot(origin, ss.items);
+      }
+    }
+    if (origin && policy.syncIndexedDb) {
+      await this.reconcileOriginExtendedStorage(origin);
     }
   }
 
@@ -3298,7 +4100,7 @@ export class SyncEngine {
 
   async updateSpaceSettings(patch: Partial<SpaceSettings>): Promise<SpaceSettings> {
     await this.ensureInitialized();
-    const rt = this.requireRuntime();
+    const rt = this.requireUnlockedRuntime();
     const nextUpdatedAt = Math.max(this.now(), rt.meta.space.updatedAt + 1);
 
     rt.meta.space.settings = {
@@ -3310,7 +4112,7 @@ export class SyncEngine {
           : { ...(rt.meta.space.settings.devicePolicies ?? {}) },
     };
     rt.meta.space.updatedAt = nextUpdatedAt;
-    rt.rulesEngine.update(rt.meta.space.settings, rt.meta.rules, rt.meta.deviceBlacklist);
+    this.syncRulesEngineState(rt);
 
     if (rt.meta.space.settings.sessionLockEnabled && this.keyVault) {
       await this.keyVault.clearDek(rt.spaceId);
@@ -3657,6 +4459,8 @@ export class SyncEngine {
       }
       rt.meta.consecutiveTransientFailures = 0;
       rt.meta.autoPushBackoffUntilMs = undefined;
+      this.localDirPermissionNeededBySpace.delete(rt.spaceId);
+      await this.syncAdapterMetadataIfNeeded(rt);
       if (!rt.meta.storageFullHalted) {
         rt.meta.latestError = null;
         if (rt.pendingOutboundEvents.length === 0) {
@@ -3678,6 +4482,11 @@ export class SyncEngine {
       if (se.code === 'ERR_STORAGE_FULL' || se.status === 507) {
         rt.meta.storageFullHalted = true;
         this.haltWriteRetryTasks(rt, se);
+        rt.meta.space.status = 'PARTIAL';
+      } else if (se.code === 'ERR_LOCAL_DIR_PERMISSION' || se.code === 'ERR_LOCAL_DIR_MISSING') {
+        if (rt.storage.provider === 'local_directory') {
+          this.localDirPermissionNeededBySpace.set(rt.spaceId, true);
+        }
         rt.meta.space.status = 'PARTIAL';
       } else if (se.status === 401 || se.status === 403) {
         rt.meta.space.status = 'AUTH_ERROR';
@@ -3741,6 +4550,56 @@ export class SyncEngine {
       // ignore
     }
     return out;
+  }
+
+  private advanceCausalVersion(
+    rt: LoadedSpaceRuntime,
+    localOnly: boolean,
+    baseVc: VectorClock,
+    nowMs: number,
+  ): { nextSeq: number; version: ReturnType<typeof createNextCausalVersion> } {
+    if (localOnly) {
+      return {
+        nextSeq: 0,
+        version: createNextCausalVersion({
+          clock: rt.hlcClock,
+          baseVectorClock: baseVc,
+          deviceId: rt.meta.localDevice.deviceId,
+          nextDeviceSeq: 0,
+          nowMs,
+        }),
+      };
+    }
+    const nextSeq = rt.meta.localDevice.sequence + 1;
+    rt.meta.localDevice.sequence = nextSeq;
+    rt.meta.localDevice.localRevision += 1;
+    const version = createNextCausalVersion({
+      clock: rt.hlcClock,
+      baseVectorClock: baseVc,
+      deviceId: rt.meta.localDevice.deviceId,
+      nextDeviceSeq: nextSeq,
+      nowMs,
+    });
+    rt.meta.localDevice.checkpoint.processedVectorClock = incrementVectorClock(
+      rt.meta.localDevice.checkpoint.processedVectorClock,
+      rt.meta.localDevice.deviceId,
+      nextSeq,
+    );
+    rt.meta.localDevice.checkpoint.updatedAt = nowMs;
+    return { nextSeq, version };
+  }
+
+  private recordEmittedSyncEvent(
+    rt: LoadedSpaceRuntime,
+    localOnly: boolean,
+    event: SyncEvent,
+    nowMs: number,
+  ): void {
+    this.supersedeConflictsForObject(rt, event.objectId, nowMs);
+    if (!localOnly) {
+      this.enqueueOutboundEvent(rt, event);
+      rt.eventsHistory.push(event);
+    }
   }
 
   private async emitLocalCookieUpsert(
@@ -3808,24 +4667,8 @@ export class SyncEngine {
       baseVc = mergeVectorClocks(baseVc, forceBaseVc);
     }
 
-    const nextSeq = rt.meta.localDevice.sequence + 1;
-    rt.meta.localDevice.sequence = nextSeq;
-    rt.meta.localDevice.localRevision += 1;
-
-    const version = createNextCausalVersion({
-      clock: rt.hlcClock,
-      baseVectorClock: baseVc,
-      deviceId: rt.meta.localDevice.deviceId,
-      nextDeviceSeq: nextSeq,
-      nowMs,
-    });
-
-    rt.meta.localDevice.checkpoint.processedVectorClock = incrementVectorClock(
-      rt.meta.localDevice.checkpoint.processedVectorClock,
-      rt.meta.localDevice.deviceId,
-      nextSeq,
-    );
-    rt.meta.localDevice.checkpoint.updatedAt = nowMs;
+    const localOnly = this.isLocalOnlyTrack(rt, trackId);
+    const { nextSeq, version } = this.advanceCausalVersion(rt, localOnly, baseVc, nowMs);
 
     const record: CookieRecord = {
       logicalId,
@@ -3848,7 +4691,7 @@ export class SyncEngine {
       sourceDeviceName: rt.meta.localDevice.name,
       deleted: false,
       updatedAt: nowMs,
-      syncStatus: 'LOCAL_NEWER',
+      syncStatus: localOnly ? 'LOCAL_ONLY' : 'LOCAL_NEWER',
     };
 
     rt.cookies[logicalId] = record;
@@ -3878,9 +4721,7 @@ export class SyncEngine {
       status: 'QUEUED',
     };
 
-    this.supersedeConflictsForObject(rt, event.objectId, nowMs);
-    this.enqueueOutboundEvent(rt, event);
-    rt.eventsHistory.push(event);
+    this.recordEmittedSyncEvent(rt, localOnly, event, nowMs);
     this.refreshTrackCounts(rt, trackId, nowMs);
 
     return record;
@@ -3905,24 +4746,8 @@ export class SyncEngine {
       baseVc = mergeVectorClocks(baseVc, forceBaseVc);
     }
 
-    const nextSeq = rt.meta.localDevice.sequence + 1;
-    rt.meta.localDevice.sequence = nextSeq;
-    rt.meta.localDevice.localRevision += 1;
-
-    const version = createNextCausalVersion({
-      clock: rt.hlcClock,
-      baseVectorClock: baseVc,
-      deviceId: rt.meta.localDevice.deviceId,
-      nextDeviceSeq: nextSeq,
-      nowMs,
-    });
-
-    rt.meta.localDevice.checkpoint.processedVectorClock = incrementVectorClock(
-      rt.meta.localDevice.checkpoint.processedVectorClock,
-      rt.meta.localDevice.deviceId,
-      nextSeq,
-    );
-    rt.meta.localDevice.checkpoint.updatedAt = nowMs;
+    const localOnly = this.isLocalOnlyTrack(rt, record.trackId);
+    const { nextSeq, version } = this.advanceCausalVersion(rt, localOnly, baseVc, nowMs);
 
     const deletedRecord: CookieRecord = {
       ...record,
@@ -3975,9 +4800,7 @@ export class SyncEngine {
       status: 'QUEUED',
     };
 
-    this.supersedeConflictsForObject(rt, event.objectId, nowMs);
-    this.enqueueOutboundEvent(rt, event);
-    rt.eventsHistory.push(event);
+    this.recordEmittedSyncEvent(rt, localOnly, event, nowMs);
     this.refreshTrackCounts(rt, record.trackId, nowMs);
   }
 
@@ -3990,6 +4813,7 @@ export class SyncEngine {
     value: string,
     preferredOp: 'CREATE' | 'UPDATE' | 'RESTORE',
     forceBaseVc?: VectorClock,
+    options?: { contextAvailable?: boolean },
   ): Promise<LocalStorageRecord | null> {
     const MAX_LOCAL_STORAGE_VALUE_LENGTH = 256 * 1024;
     if (value.length > MAX_LOCAL_STORAGE_VALUE_LENGTH) {
@@ -3999,6 +4823,7 @@ export class SyncEngine {
     const logicalId = buildLocalStorageLogicalId(trackId, origin, key);
     const existing = rt.localStorage[logicalId];
     const existingTombstone = rt.tombstones[logicalId];
+    const contextAvailable = options?.contextAvailable ?? true;
 
     if (
       preferredOp !== 'RESTORE' &&
@@ -4021,24 +4846,8 @@ export class SyncEngine {
       baseVc = mergeVectorClocks(baseVc, forceBaseVc);
     }
 
-    const nextSeq = rt.meta.localDevice.sequence + 1;
-    rt.meta.localDevice.sequence = nextSeq;
-    rt.meta.localDevice.localRevision += 1;
-
-    const version = createNextCausalVersion({
-      clock: rt.hlcClock,
-      baseVectorClock: baseVc,
-      deviceId: rt.meta.localDevice.deviceId,
-      nextDeviceSeq: nextSeq,
-      nowMs,
-    });
-
-    rt.meta.localDevice.checkpoint.processedVectorClock = incrementVectorClock(
-      rt.meta.localDevice.checkpoint.processedVectorClock,
-      rt.meta.localDevice.deviceId,
-      nextSeq,
-    );
-    rt.meta.localDevice.checkpoint.updatedAt = nowMs;
+    const localOnly = this.isLocalOnlyTrack(rt, trackId);
+    const { nextSeq, version } = this.advanceCausalVersion(rt, localOnly, baseVc, nowMs);
 
     const record: LocalStorageRecord = {
       logicalId,
@@ -4052,13 +4861,17 @@ export class SyncEngine {
       sourceDeviceName: rt.meta.localDevice.name,
       deleted: false,
       updatedAt: nowMs,
-      contextAvailable: true,
-      syncStatus: 'LOCAL_NEWER',
+      contextAvailable,
+      syncStatus: localOnly ? 'LOCAL_ONLY' : 'LOCAL_NEWER',
     };
 
     rt.localStorage[logicalId] = record;
     delete rt.tombstones[logicalId];
-    rt.meta.appliedLsHashes[logicalId] = value;
+    if (contextAvailable) {
+      rt.meta.appliedLsHashes[logicalId] = value;
+    } else {
+      delete rt.meta.appliedLsHashes[logicalId];
+    }
 
     const { version: _v, syncStatus: _s, ...localStorageData } = record;
     const payloadHash = await sha256Hex(`${origin}:${key}:${value}`);
@@ -4082,9 +4895,7 @@ export class SyncEngine {
       status: 'QUEUED',
     };
 
-    this.supersedeConflictsForObject(rt, event.objectId, nowMs);
-    this.enqueueOutboundEvent(rt, event);
-    rt.eventsHistory.push(event);
+    this.recordEmittedSyncEvent(rt, localOnly, event, nowMs);
     this.refreshTrackCounts(rt, trackId, nowMs);
     return record;
   }
@@ -4104,24 +4915,8 @@ export class SyncEngine {
       baseVc = mergeVectorClocks(baseVc, rt.tombstones[record.logicalId].deleteVersion.vectorClock);
     }
 
-    const nextSeq = rt.meta.localDevice.sequence + 1;
-    rt.meta.localDevice.sequence = nextSeq;
-    rt.meta.localDevice.localRevision += 1;
-
-    const version = createNextCausalVersion({
-      clock: rt.hlcClock,
-      baseVectorClock: baseVc,
-      deviceId: rt.meta.localDevice.deviceId,
-      nextDeviceSeq: nextSeq,
-      nowMs,
-    });
-
-    rt.meta.localDevice.checkpoint.processedVectorClock = incrementVectorClock(
-      rt.meta.localDevice.checkpoint.processedVectorClock,
-      rt.meta.localDevice.deviceId,
-      nextSeq,
-    );
-    rt.meta.localDevice.checkpoint.updatedAt = nowMs;
+    const localOnly = this.isLocalOnlyTrack(rt, record.trackId);
+    const { nextSeq, version } = this.advanceCausalVersion(rt, localOnly, baseVc, nowMs);
 
     const deletedRec: LocalStorageRecord = {
       ...record,
@@ -4172,9 +4967,349 @@ export class SyncEngine {
       status: 'QUEUED',
     };
 
-    this.supersedeConflictsForObject(rt, event.objectId, nowMs);
-    this.enqueueOutboundEvent(rt, event);
-    rt.eventsHistory.push(event);
+    this.recordEmittedSyncEvent(rt, localOnly, event, nowMs);
+    this.refreshTrackCounts(rt, record.trackId, nowMs);
+  }
+
+  private async emitLocalSessionStorageUpsert(
+    rt: LoadedSpaceRuntime,
+    siteKey: string,
+    trackId: string,
+    origin: string,
+    key: string,
+    value: string,
+    preferredOp: 'CREATE' | 'UPDATE' | 'RESTORE',
+    forceBaseVc?: VectorClock,
+    options?: { contextAvailable?: boolean },
+  ): Promise<SessionStorageRecord | null> {
+    const MAX_SESSION_STORAGE_VALUE_LENGTH = 256 * 1024;
+    if (value.length > MAX_SESSION_STORAGE_VALUE_LENGTH) {
+      return null;
+    }
+    const nowMs = this.now();
+    const logicalId = buildSessionStorageLogicalId(trackId, origin, key);
+    const existing = rt.sessionStorage[logicalId];
+    const existingTombstone = rt.tombstones[logicalId];
+    const contextAvailable = options?.contextAvailable ?? true;
+
+    if (
+      preferredOp !== 'RESTORE' &&
+      !forceBaseVc &&
+      existing &&
+      !existing.deleted &&
+      existing.value === value
+    ) {
+      return null;
+    }
+
+    let baseVc = { ...rt.meta.localDevice.checkpoint.processedVectorClock };
+    if (existing?.version?.vectorClock) {
+      baseVc = mergeVectorClocks(baseVc, existing.version.vectorClock);
+    }
+    if (existingTombstone?.deleteVersion?.vectorClock) {
+      baseVc = mergeVectorClocks(baseVc, existingTombstone.deleteVersion.vectorClock);
+    }
+    if (forceBaseVc) {
+      baseVc = mergeVectorClocks(baseVc, forceBaseVc);
+    }
+
+    const localOnly = this.isLocalOnlyTrack(rt, trackId);
+    const { nextSeq, version } = this.advanceCausalVersion(rt, localOnly, baseVc, nowMs);
+
+    const record: SessionStorageRecord = {
+      logicalId,
+      siteKey,
+      trackId,
+      origin,
+      key,
+      value,
+      version,
+      sourceDevice: rt.meta.localDevice.deviceId,
+      sourceDeviceName: rt.meta.localDevice.name,
+      deleted: false,
+      updatedAt: nowMs,
+      contextAvailable,
+      syncStatus: localOnly ? 'LOCAL_ONLY' : 'LOCAL_NEWER',
+    };
+
+    rt.sessionStorage[logicalId] = record;
+    delete rt.tombstones[logicalId];
+    rt.meta.appliedSsHashes = rt.meta.appliedSsHashes ?? {};
+    if (contextAvailable) {
+      rt.meta.appliedSsHashes[logicalId] = value;
+    } else {
+      delete rt.meta.appliedSsHashes[logicalId];
+    }
+
+    const { version: _v, syncStatus: _s, ...sessionStorageData } = record;
+    const payloadHash = await sha256Hex(`ss:${origin}:${key}:${value}`);
+
+    const event: SyncEvent = {
+      eventId: randomId('evt'),
+      spaceId: rt.spaceId,
+      trackId,
+      siteKey,
+      deviceId: rt.meta.localDevice.deviceId,
+      deviceName: rt.meta.localDevice.name,
+      deviceSeq: nextSeq,
+      objectType: 'sessionStorage',
+      objectId: logicalId,
+      operation: existing ? preferredOp : preferredOp === 'RESTORE' ? 'RESTORE' : 'CREATE',
+      baseVersion: existing?.version ?? existingTombstone?.deleteVersion ?? null,
+      version,
+      sessionStorageData,
+      payloadHash,
+      createdAt: nowMs,
+      status: 'QUEUED',
+    };
+
+    this.recordEmittedSyncEvent(rt, localOnly, event, nowMs);
+    this.refreshTrackCounts(rt, trackId, nowMs);
+    return record;
+  }
+
+  private async emitLocalSessionStorageDelete(
+    rt: LoadedSpaceRuntime,
+    record: SessionStorageRecord,
+    reason: TombstoneReason,
+    deleteReason: string,
+  ): Promise<void> {
+    const nowMs = this.now();
+    let baseVc = mergeVectorClocks(
+      rt.meta.localDevice.checkpoint.processedVectorClock,
+      record.version.vectorClock,
+    );
+    if (rt.tombstones[record.logicalId]?.deleteVersion?.vectorClock) {
+      baseVc = mergeVectorClocks(baseVc, rt.tombstones[record.logicalId].deleteVersion.vectorClock);
+    }
+
+    const localOnly = this.isLocalOnlyTrack(rt, record.trackId);
+    const { nextSeq, version } = this.advanceCausalVersion(rt, localOnly, baseVc, nowMs);
+
+    const deletedRec: SessionStorageRecord = {
+      ...record,
+      version,
+      sourceDevice: rt.meta.localDevice.deviceId,
+      sourceDeviceName: rt.meta.localDevice.name,
+      deleted: true,
+      updatedAt: nowMs,
+      syncStatus: 'DELETED',
+    };
+    rt.sessionStorage[record.logicalId] = deletedRec;
+    if (rt.meta.appliedSsHashes) {
+      delete rt.meta.appliedSsHashes[record.logicalId];
+    }
+
+    rt.tombstones[record.logicalId] = {
+      objectId: record.logicalId,
+      objectType: 'sessionStorage',
+      siteKey: record.siteKey,
+      trackId: record.trackId,
+      deleteVersion: version,
+      previousVersion: record.version,
+      sourceDevice: rt.meta.localDevice.deviceId,
+      reason,
+      createdAt: nowMs,
+      acknowledgedDevices: [rt.meta.localDevice.deviceId],
+      reclaimable: false,
+    };
+
+    const { version: _v, syncStatus: _s, ...sessionStorageData } = deletedRec;
+    const payloadHash = await sha256Hex(`delete_ss:${record.logicalId}:${version.versionId}`);
+
+    const event: SyncEvent = {
+      eventId: randomId('evt'),
+      spaceId: rt.spaceId,
+      trackId: record.trackId,
+      siteKey: record.siteKey,
+      deviceId: rt.meta.localDevice.deviceId,
+      deviceName: rt.meta.localDevice.name,
+      deviceSeq: nextSeq,
+      objectType: 'sessionStorage',
+      objectId: record.logicalId,
+      operation: 'DELETE',
+      baseVersion: record.version,
+      version,
+      sessionStorageData,
+      deleteReason,
+      payloadHash,
+      createdAt: nowMs,
+      status: 'QUEUED',
+    };
+
+    this.recordEmittedSyncEvent(rt, localOnly, event, nowMs);
+    this.refreshTrackCounts(rt, record.trackId, nowMs);
+  }
+
+  private async emitLocalIndexedDbUpsert(
+    rt: LoadedSpaceRuntime,
+    siteKey: string,
+    trackId: string,
+    item: Omit<
+      IndexedDbRecord,
+      'logicalId' | 'siteKey' | 'trackId' | 'version' | 'sourceDevice' | 'sourceDeviceName' | 'deleted' | 'updatedAt' | 'syncStatus'
+    >,
+    preferredOp: 'CREATE' | 'UPDATE' | 'RESTORE',
+    forceBaseVc?: VectorClock,
+  ): Promise<IndexedDbRecord | null> {
+    const nowMs = this.now();
+    const logicalId = buildIndexedDbLogicalId({
+      trackId,
+      origin: item.origin,
+      dbName: item.dbName,
+      storeName: item.storeName,
+      encodedKey: item.encodedKey,
+    });
+    const existing = rt.indexedDb[logicalId];
+    const existingTombstone = rt.tombstones[logicalId];
+    const contentHash = `${item.dbVersion ?? 0}:${item.encodedValue}`;
+
+    if (
+      preferredOp !== 'RESTORE' &&
+      !forceBaseVc &&
+      existing &&
+      !existing.deleted &&
+      `${existing.dbVersion ?? 0}:${existing.encodedValue}` === contentHash
+    ) {
+      return null;
+    }
+
+    let baseVc = { ...rt.meta.localDevice.checkpoint.processedVectorClock };
+    if (existing?.version?.vectorClock) {
+      baseVc = mergeVectorClocks(baseVc, existing.version.vectorClock);
+    }
+    if (existingTombstone?.deleteVersion?.vectorClock) {
+      baseVc = mergeVectorClocks(baseVc, existingTombstone.deleteVersion.vectorClock);
+    }
+    if (forceBaseVc) {
+      baseVc = mergeVectorClocks(baseVc, forceBaseVc);
+    }
+
+    const localOnly = this.isLocalOnlyTrack(rt, trackId);
+    const { nextSeq, version } = this.advanceCausalVersion(rt, localOnly, baseVc, nowMs);
+
+    const byteLength =
+      item.byteLength > 0
+        ? item.byteLength
+        : item.encodedKey.length + item.encodedValue.length;
+
+    const record: IndexedDbRecord = {
+      ...item,
+      logicalId,
+      siteKey,
+      trackId,
+      byteLength,
+      version,
+      sourceDevice: rt.meta.localDevice.deviceId,
+      sourceDeviceName: rt.meta.localDevice.name,
+      deleted: false,
+      updatedAt: nowMs,
+      contextAvailable: true,
+      syncStatus: localOnly ? 'LOCAL_ONLY' : 'LOCAL_NEWER',
+    };
+
+    rt.indexedDb[logicalId] = record;
+    delete rt.tombstones[logicalId];
+    rt.meta.appliedIdbHashes = rt.meta.appliedIdbHashes ?? {};
+    rt.meta.appliedIdbHashes[logicalId] = contentHash;
+
+    const { version: _v, syncStatus: _s, ...indexedDbData } = record;
+    const payloadHash = await sha256Hex(`idb:${logicalId}:${contentHash}`);
+
+    const event: SyncEvent = {
+      eventId: randomId('evt'),
+      spaceId: rt.spaceId,
+      trackId,
+      siteKey,
+      deviceId: rt.meta.localDevice.deviceId,
+      deviceName: rt.meta.localDevice.name,
+      deviceSeq: nextSeq,
+      objectType: 'indexedDb',
+      objectId: logicalId,
+      operation: existing ? preferredOp : preferredOp === 'RESTORE' ? 'RESTORE' : 'CREATE',
+      baseVersion: existing?.version ?? existingTombstone?.deleteVersion ?? null,
+      version,
+      indexedDbData,
+      payloadHash,
+      createdAt: nowMs,
+      status: 'QUEUED',
+    };
+
+    this.recordEmittedSyncEvent(rt, localOnly, event, nowMs);
+    this.refreshTrackCounts(rt, trackId, nowMs);
+    return record;
+  }
+
+  private async emitLocalIndexedDbDelete(
+    rt: LoadedSpaceRuntime,
+    record: IndexedDbRecord,
+    reason: TombstoneReason,
+    deleteReason: string,
+  ): Promise<void> {
+    const nowMs = this.now();
+    let baseVc = mergeVectorClocks(
+      rt.meta.localDevice.checkpoint.processedVectorClock,
+      record.version.vectorClock,
+    );
+    if (rt.tombstones[record.logicalId]?.deleteVersion?.vectorClock) {
+      baseVc = mergeVectorClocks(baseVc, rt.tombstones[record.logicalId].deleteVersion.vectorClock);
+    }
+
+    const localOnly = this.isLocalOnlyTrack(rt, record.trackId);
+    const { nextSeq, version } = this.advanceCausalVersion(rt, localOnly, baseVc, nowMs);
+
+    const deletedRec: IndexedDbRecord = {
+      ...record,
+      version,
+      sourceDevice: rt.meta.localDevice.deviceId,
+      sourceDeviceName: rt.meta.localDevice.name,
+      deleted: true,
+      updatedAt: nowMs,
+      syncStatus: 'DELETED',
+    };
+    rt.indexedDb[record.logicalId] = deletedRec;
+    if (rt.meta.appliedIdbHashes) {
+      delete rt.meta.appliedIdbHashes[record.logicalId];
+    }
+
+    rt.tombstones[record.logicalId] = {
+      objectId: record.logicalId,
+      objectType: 'indexedDb',
+      siteKey: record.siteKey,
+      trackId: record.trackId,
+      deleteVersion: version,
+      previousVersion: record.version,
+      sourceDevice: rt.meta.localDevice.deviceId,
+      reason,
+      createdAt: nowMs,
+      acknowledgedDevices: [rt.meta.localDevice.deviceId],
+      reclaimable: false,
+    };
+
+    const { version: _v, syncStatus: _s, ...indexedDbData } = deletedRec;
+    const payloadHash = await sha256Hex(`delete_idb:${record.logicalId}:${version.versionId}`);
+
+    const event: SyncEvent = {
+      eventId: randomId('evt'),
+      spaceId: rt.spaceId,
+      trackId: record.trackId,
+      siteKey: record.siteKey,
+      deviceId: rt.meta.localDevice.deviceId,
+      deviceName: rt.meta.localDevice.name,
+      deviceSeq: nextSeq,
+      objectType: 'indexedDb',
+      objectId: record.logicalId,
+      operation: 'DELETE',
+      baseVersion: record.version,
+      version,
+      indexedDbData,
+      deleteReason,
+      payloadHash,
+      createdAt: nowMs,
+      status: 'QUEUED',
+    };
+
+    this.recordEmittedSyncEvent(rt, localOnly, event, nowMs);
     this.refreshTrackCounts(rt, record.trackId, nowMs);
   }
 
@@ -4186,6 +5321,12 @@ export class SyncEngine {
     ).length;
     track.localStorageCount = Object.values(rt.localStorage).filter(
       (l) => l.trackId === trackId && !l.deleted,
+    ).length;
+    track.sessionStorageCount = Object.values(rt.sessionStorage).filter(
+      (s) => s.trackId === trackId && !s.deleted,
+    ).length;
+    track.indexedDbCount = Object.values(rt.indexedDb).filter(
+      (d) => d.trackId === trackId && !d.deleted,
     ).length;
     track.updatedAt = nowMs;
     track.revision = (track.revision ?? 0) + 1;
@@ -4206,9 +5347,12 @@ export class SyncEngine {
     }
 
     // Compact duplicate pending events for the same objectId before chunking & uploading
-    rt.pendingOutboundEvents = this.compactPendingOutboundEvents(rt.pendingOutboundEvents);
+    rt.pendingOutboundEvents = this.compactPendingOutboundEvents(
+      rt.pendingOutboundEvents.filter((ev) => !this.isLocalOnlyTrack(rt, ev.trackId)),
+    );
 
     const eligible = rt.pendingOutboundEvents.filter((ev) => {
+      if (this.isLocalOnlyTrack(rt, ev.trackId)) return false;
       if (siteKeyFilter && ev.siteKey !== siteKeyFilter) return false;
       if (excludeSiteKeys && excludeSiteKeys.has(ev.siteKey)) return false;
       const policy = this.getEffectivePolicyForDevice(rt, ev.siteKey, ev.siteKey);
@@ -4247,7 +5391,11 @@ export class SyncEngine {
       const estSize =
         ev.objectType === 'localStorage'
           ? (ev.localStorageData?.value?.length ?? 0) + (ev.localStorageData?.key?.length ?? 0) + 256
-          : (ev.cookieData?.value?.length ?? 0) + (ev.cookieData?.name?.length ?? 0) + 256;
+          : ev.objectType === 'sessionStorage'
+            ? (ev.sessionStorageData?.value?.length ?? 0) + (ev.sessionStorageData?.key?.length ?? 0) + 256
+            : ev.objectType === 'indexedDb'
+              ? (ev.indexedDbData?.encodedValue?.length ?? 0) + (ev.indexedDbData?.encodedKey?.length ?? 0) + 256
+              : (ev.cookieData?.value?.length ?? 0) + (ev.cookieData?.name?.length ?? 0) + 256;
       if (
         currentChunk.length > 0 &&
         (currentChunk.length >= MAX_EVENTS_PER_BATCH || currentBytes + estSize > MAX_BATCH_EST_BYTES)
@@ -4284,7 +5432,10 @@ export class SyncEngine {
       const touchedTrackIds = new Set(chunk.map((e) => e.trackId));
       const tracksDelta: SiteTrack[] = [];
       for (const tid of touchedTrackIds) {
-        if (rt.tracks[tid]) tracksDelta.push(rt.tracks[tid]);
+        const tr = rt.tracks[tid];
+        if (tr && !tr.ephemeral?.localOnly) {
+          tracksDelta.push(tr);
+        }
       }
 
       const batch: EventBatch = {
@@ -4335,6 +5486,16 @@ export class SyncEngine {
           if (rec && !rec.deleted && rec.syncStatus === 'LOCAL_NEWER') {
             rec.syncStatus = 'IN_SYNC';
           }
+        } else if (ev.objectType === 'sessionStorage') {
+          const rec = rt.sessionStorage[ev.objectId];
+          if (rec && !rec.deleted && rec.syncStatus === 'LOCAL_NEWER') {
+            rec.syncStatus = 'IN_SYNC';
+          }
+        } else if (ev.objectType === 'indexedDb') {
+          const rec = rt.indexedDb[ev.objectId];
+          if (rec && !rec.deleted && rec.syncStatus === 'LOCAL_NEWER') {
+            rec.syncStatus = 'IN_SYNC';
+          }
         } else {
           const rec = rt.localStorage[ev.objectId];
           if (rec && !rec.deleted && rec.syncStatus === 'LOCAL_NEWER') {
@@ -4382,12 +5543,25 @@ export class SyncEngine {
   ): Promise<{ status: number; etag?: string }> {
     const maxRetries = 2;
     let lastErr: unknown;
+    let ensuredParentOn409 = false;
     for (let attempt = 0; attempt <= maxRetries; attempt += 1) {
       try {
         return await rt.client.putBytes(remotePath, bytes, options);
       } catch (err) {
         lastErr = err;
         const se = toStructuredError(err, 'push', remotePath);
+        if (se.status === 409 && !ensuredParentOn409) {
+          ensuredParentOn409 = true;
+          const slashIdx = remotePath.lastIndexOf('/');
+          if (slashIdx > 0) {
+            try {
+              await rt.client.ensureDir(remotePath.slice(0, slashIdx));
+              continue;
+            } catch {
+              // Fall through and surface original conflict error
+            }
+          }
+        }
         const isTransientRateOrUnavailable = se.status === 429 || se.status === 503;
         if (!isTransientRateOrUnavailable || attempt >= maxRetries) {
           throw err;
@@ -4413,12 +5587,51 @@ export class SyncEngine {
     const remotePath = deviceFilePath(rt.meta.space.opaqueId, rt.meta.localDevice.deviceId);
     const aad = buildFileAad(rt.spaceId, rt.meta.space.keyEpoch, 'device', remotePath);
 
+    // Local-only ephemeral tracks must NEVER leak to remote manifests or peers.
+    const localOnlyTrackIds = new Set<string>();
+    const syncableTracks: Record<string, SiteTrack> = {};
+    for (const [tid, tr] of Object.entries(rt.tracks)) {
+      if (tr.ephemeral?.localOnly) {
+        localOnlyTrackIds.add(tid);
+      } else {
+        syncableTracks[tid] = tr;
+      }
+    }
+
+    const sanitizedBindings: Record<string, DeviceSiteBinding> = {};
+    for (const [siteKey, binding] of Object.entries(rt.meta.localDevice.siteBindings)) {
+      const filteredAvail = binding.availableTrackIds?.filter((id) => !localOnlyTrackIds.has(id));
+      if (binding.trackId && localOnlyTrackIds.has(binding.trackId)) {
+        sanitizedBindings[siteKey] = {
+          ...binding,
+          trackId: filteredAvail?.[0],
+          availableTrackIds: filteredAvail,
+        };
+      } else {
+        sanitizedBindings[siteKey] = filteredAvail
+          ? { ...binding, availableTrackIds: filteredAvail }
+          : binding;
+      }
+    }
+
+    const sanitizedRemovedTracks: Record<string, number> = {};
+    for (const [tid, ts] of Object.entries(rt.meta.removedTracks ?? {})) {
+      if (!localOnlyTrackIds.has(tid)) {
+        sanitizedRemovedTracks[tid] = ts;
+      }
+    }
+
+    const sanitizedDevice: Device = {
+      ...rt.meta.localDevice,
+      siteBindings: sanitizedBindings,
+    };
+
     const stateDigest = await sha256Hex(
       JSON.stringify({
-        seq: rt.meta.localDevice.sequence,
-        bindings: rt.meta.localDevice.siteBindings,
-        tracks: Object.keys(rt.tracks).sort(),
-        removedTracks: rt.meta.removedTracks ?? {},
+        seq: sanitizedDevice.sequence,
+        bindings: sanitizedBindings,
+        tracks: Object.keys(syncableTracks).sort(),
+        removedTracks: sanitizedRemovedTracks,
         rulesAt: rt.meta.rules.updatedAt,
         settingsAt: rt.meta.space.updatedAt,
         overrides: rt.meta.deviceOverrides,
@@ -4426,9 +5639,9 @@ export class SyncEngine {
     );
 
     const manifest: RemoteDeviceManifest = {
-      device: rt.meta.localDevice,
-      tracks: rt.tracks,
-      removedTracks: rt.meta.removedTracks ?? {},
+      device: sanitizedDevice,
+      tracks: syncableTracks,
+      removedTracks: sanitizedRemovedTracks,
       rulesDelta: rt.meta.rules,
       settingsDelta: {
         settings: rt.meta.space.settings,
@@ -4586,22 +5799,27 @@ export class SyncEngine {
             if (desc.rules && desc.rules.updatedAt > rt.meta.rules.updatedAt) {
               rt.meta.rules = desc.rules;
             }
-            rt.rulesEngine.update(rt.meta.space.settings, rt.meta.rules, rt.meta.deviceBlacklist);
+            this.syncRulesEngineState(rt);
           }
         }
       } catch (err) {
         const se = toStructuredError(err, 'pull_space_meta', metaPath);
-        if (se.code === 'DECRYPT_ERROR') {
+        if (
+          se.code === 'DECRYPT_ERROR' ||
+          se.code === 'GIST_PUBLIC_FORBIDDEN' ||
+          se.status === 401 ||
+          se.status === 403
+        ) {
           throw se;
         }
       }
     }
 
-    // 2. ETag Short-Circuit: Single PROPFIND Depth:1 on devices/
+    // 2. ETag Short-Circuit: Single list(depth: 1) on devices/
     const devDir = devicesDir(rt.meta.space.opaqueId);
-    let deviceStats: WebDAVResourceStat[] = [];
+    let deviceStats: RemoteObjectStat[] = [];
     try {
-      deviceStats = await rt.client.propfind(devDir, 1);
+      deviceStats = await rt.client.list(devDir, 1);
     } catch (err) {
       const se = toStructuredError(err, 'pull_devices', devDir);
       if (se.status === 404) {
@@ -4662,7 +5880,11 @@ export class SyncEngine {
               rt.meta.removedTracks[tid] = removedAt;
             }
             const existingTrack = rt.tracks[tid];
-            if (existingTrack && existingTrack.updatedAt <= removedAt) {
+            if (
+              existingTrack &&
+              !existingTrack.ephemeral?.localOnly &&
+              existingTrack.updatedAt <= removedAt
+            ) {
               const removedSiteKey = existingTrack.siteKey;
               delete rt.tracks[tid];
               const remainingForSite = Object.values(rt.tracks).some(
@@ -4705,7 +5927,7 @@ export class SyncEngine {
         if (manifest.tracks) {
           for (const [tid, peerTrack] of Object.entries(manifest.tracks)) {
             this.mergeRemoteTrack(rt, tid, peerTrack);
-            if (rt.tracks[tid]) {
+            if (rt.tracks[tid] && !rt.tracks[tid].ephemeral?.localOnly) {
               touchedSites.add(peerTrack.siteKey);
             }
           }
@@ -4735,7 +5957,7 @@ export class SyncEngine {
             devicePolicies: { ...(manifest.settingsDelta.settings?.devicePolicies ?? {}) },
           };
           rt.meta.space.updatedAt = manifest.settingsDelta.updatedAt;
-          rt.rulesEngine.update(rt.meta.space.settings, rt.meta.rules, rt.meta.deviceBlacklist);
+          this.syncRulesEngineState(rt);
           settingsUpdated = true;
         }
 
@@ -4768,9 +5990,9 @@ export class SyncEngine {
 
         // Scan peer's events directory for unprocessed event batches
         const peerEvtDir = deviceEventsDir(rt.meta.space.opaqueId, peerId);
-        let eventStats: WebDAVResourceStat[] = [];
+        let eventStats: RemoteObjectStat[] = [];
         try {
-          eventStats = await rt.client.propfind(peerEvtDir, 1);
+          eventStats = await rt.client.list(peerEvtDir, 1);
         } catch (err) {
           const se = toStructuredError(err, 'pull_events', peerEvtDir);
           if (se.status === 404) {
@@ -4819,7 +6041,9 @@ export class SyncEngine {
             if (batch.tracksDelta) {
               for (const tr of batch.tracksDelta) {
                 this.mergeRemoteTrack(rt, tr.trackId, tr);
-                touchedSites.add(tr.siteKey);
+                if (!tr.ephemeral?.localOnly) {
+                  touchedSites.add(tr.siteKey);
+                }
               }
             }
 
@@ -4929,6 +6153,16 @@ export class SyncEngine {
           candidateSites.add(rec.siteKey);
         }
       }
+      for (const rec of Object.values(rt.sessionStorage)) {
+        if (rec.syncStatus === 'REMOTE_NEWER' || rec.syncStatus === 'REMOTE_ONLY') {
+          candidateSites.add(rec.siteKey);
+        }
+      }
+      for (const rec of Object.values(rt.indexedDb)) {
+        if (rec.syncStatus === 'REMOTE_NEWER' || rec.syncStatus === 'REMOTE_ONLY') {
+          candidateSites.add(rec.siteKey);
+        }
+      }
 
       const allLocalCookies = candidateSites.size > 0 ? await this.browser.getAllCookies() : [];
 
@@ -4949,7 +6183,9 @@ export class SyncEngine {
           const localSiteCookies = allLocalCookies.filter((c) =>
             domainMatchesSiteKey(c.domain, siteKey, rt.meta.rules.ssoGroups),
           );
-          const remoteTracks = Object.values(rt.tracks).filter((t) => t.siteKey === siteKey);
+          const remoteTracks = Object.values(rt.tracks).filter(
+            (t) => t.siteKey === siteKey && !t.ephemeral?.localOnly,
+          );
           if (remoteTracks.length === 0) continue;
 
           const decision = evaluateSiteDiscovery({
@@ -5033,6 +6269,14 @@ export class SyncEngine {
   }
 
   private mergeRemoteTrack(rt: LoadedSpaceRuntime, trackId: string, peerTrack: SiteTrack): void {
+    if (peerTrack.ephemeral?.localOnly) {
+      return;
+    }
+    const existing = rt.tracks[trackId];
+    if (existing?.ephemeral?.localOnly) {
+      return;
+    }
+
     const removedAt = rt.meta.removedTracks?.[trackId];
     if (removedAt !== undefined) {
       if (peerTrack.updatedAt <= removedAt) {
@@ -5043,7 +6287,6 @@ export class SyncEngine {
       }
     }
 
-    const existing = rt.tracks[trackId];
     if (!existing) {
       rt.tracks[trackId] = {
         ...peerTrack,
@@ -5064,11 +6307,106 @@ export class SyncEngine {
       ...(peerIsNewer ? peerTrack : existing),
       sortOrder: (peerIsNewer ? peerTrack.sortOrder : existing.sortOrder) ?? existing.sortOrder ?? peerTrack.sortOrder,
       accountNote: (peerIsNewer ? peerTrack.accountNote : existing.accountNote) ?? existing.accountNote ?? peerTrack.accountNote,
+      color: peerIsNewer ? peerTrack.color : existing.color,
+      badgeText: peerIsNewer ? peerTrack.badgeText : existing.badgeText,
       lastUsedAt: Math.max(existing.lastUsedAt ?? 0, peerTrack.lastUsedAt ?? 0) || undefined,
       memberDeviceIds: mergedMembers,
       revision: Math.max(existing.revision ?? 0, peerTrack.revision ?? 0),
       updatedAt: Math.max(existing.updatedAt, peerTrack.updatedAt),
     };
+  }
+
+  private integrateKvOrIdbRemoteEvent<
+    T extends LocalStorageRecord | SessionStorageRecord | IndexedDbRecord,
+  >(params: {
+    rt: LoadedSpaceRuntime;
+    ev: SyncEvent;
+    nowMs: number;
+    collection: Record<string, T>;
+    eventData: Omit<T, 'version' | 'syncStatus'> | undefined;
+    objectType: 'localStorage' | 'sessionStorage' | 'indexedDb';
+    primaryDeviceId?: string;
+    applySyncStatus: 'REMOTE_NEWER' | 'LOCAL_NEWER';
+  }): boolean {
+    const { rt, ev, nowMs, collection, eventData, objectType, primaryDeviceId, applySyncStatus } =
+      params;
+    const localRec = collection[ev.objectId];
+    const localTomb = rt.tombstones[ev.objectId];
+
+    let remoteRec: T | undefined;
+    let remoteTomb: Tombstone | undefined;
+
+    if (ev.operation === 'DELETE') {
+      remoteTomb = {
+        objectId: ev.objectId,
+        objectType,
+        siteKey: ev.siteKey,
+        trackId: ev.trackId,
+        deleteVersion: ev.version,
+        previousVersion: ev.baseVersion ?? null,
+        sourceDevice: ev.deviceId,
+        reason: 'explicit',
+        createdAt: ev.createdAt,
+        acknowledgedDevices: [ev.deviceId, rt.meta.localDevice.deviceId],
+        reclaimable: false,
+      };
+    } else if (eventData) {
+      remoteRec = {
+        ...(eventData as unknown as T),
+        version: ev.version,
+        sourceDevice: ev.deviceId,
+        sourceDeviceName: ev.deviceName,
+        deleted: false,
+        updatedAt: ev.createdAt,
+      };
+    } else {
+      return false;
+    }
+
+    const outcome = resolveItemMerge<T>({
+      spaceId: rt.spaceId,
+      localRecord: localRec && !localRec.deleted ? localRec : undefined,
+      localTombstone: localTomb,
+      remoteRecord: remoteRec,
+      remoteTombstone: remoteTomb,
+      primaryDeviceId,
+    });
+
+    if (outcome.conflict) {
+      this.supersedeConflictsForObject(rt, ev.objectId, nowMs);
+      rt.conflicts[outcome.conflict.conflictId] = outcome.conflict;
+    } else if (outcome.comparison === 'REMOTE_NEWER') {
+      this.supersedeConflictsForObject(rt, ev.objectId, nowMs);
+    }
+
+    if (outcome.winner === 'tombstone' && outcome.tombstone) {
+      rt.tombstones[ev.objectId] = outcome.tombstone;
+      const baseRec =
+        localRec ??
+        (eventData ? ({ ...eventData, version: ev.version } as unknown as T) : undefined);
+      if (baseRec) {
+        collection[ev.objectId] = {
+          ...baseRec,
+          version: outcome.tombstone.deleteVersion,
+          deleted: true,
+          updatedAt: Math.max(baseRec.updatedAt, ev.createdAt),
+          syncStatus: 'DELETED',
+        };
+      }
+      return outcome.changedLocal || Boolean(localRec && !localRec.deleted);
+    }
+
+    if (outcome.winner === 'remote' && outcome.record) {
+      collection[ev.objectId] = {
+        ...outcome.record,
+        deleted: false,
+        syncStatus: applySyncStatus,
+      };
+      delete rt.tombstones[ev.objectId];
+      return true;
+    }
+
+    return false;
   }
 
   private integrateRemoteEvent(
@@ -5077,6 +6415,9 @@ export class SyncEngine {
     nowMs: number,
     options: { recordHistory?: boolean; defaultSyncStatus?: 'REMOTE_NEWER' | 'LOCAL_NEWER' } = {},
   ): boolean {
+    if (this.isLocalOnlyTrack(rt, ev.trackId)) {
+      return false;
+    }
     const applySyncStatus = options.defaultSyncStatus ?? 'REMOTE_NEWER';
     // Advance HLC monotonically on receive (S-014 clock skew resilience)
     rt.hlcClock.receive(ev.version.hlc, nowMs);
@@ -5188,83 +6529,43 @@ export class SyncEngine {
       return false;
     }
 
+    if (ev.objectType === 'sessionStorage') {
+      return this.integrateKvOrIdbRemoteEvent<SessionStorageRecord>({
+        rt,
+        ev,
+        nowMs,
+        collection: rt.sessionStorage,
+        eventData: ev.sessionStorageData,
+        objectType: 'sessionStorage',
+        primaryDeviceId,
+        applySyncStatus,
+      });
+    }
+
+    if (ev.objectType === 'indexedDb') {
+      return this.integrateKvOrIdbRemoteEvent<IndexedDbRecord>({
+        rt,
+        ev,
+        nowMs,
+        collection: rt.indexedDb,
+        eventData: ev.indexedDbData,
+        objectType: 'indexedDb',
+        primaryDeviceId,
+        applySyncStatus,
+      });
+    }
+
     // LocalStorage event
-    const localRec = rt.localStorage[ev.objectId];
-    const localTomb = rt.tombstones[ev.objectId];
-
-    let remoteRec: LocalStorageRecord | undefined;
-    let remoteTomb: Tombstone | undefined;
-
-    if (ev.operation === 'DELETE') {
-      remoteTomb = {
-        objectId: ev.objectId,
-        objectType: 'localStorage',
-        siteKey: ev.siteKey,
-        trackId: ev.trackId,
-        deleteVersion: ev.version,
-        previousVersion: ev.baseVersion ?? null,
-        sourceDevice: ev.deviceId,
-        reason: 'explicit',
-        createdAt: ev.createdAt,
-        acknowledgedDevices: [ev.deviceId, rt.meta.localDevice.deviceId],
-        reclaimable: false,
-      };
-    } else if (ev.localStorageData) {
-      remoteRec = {
-        ...ev.localStorageData,
-        version: ev.version,
-        sourceDevice: ev.deviceId,
-        sourceDeviceName: ev.deviceName,
-        deleted: false,
-        updatedAt: ev.createdAt,
-      };
-    } else {
-      return false;
-    }
-
-    const outcome = resolveItemMerge<LocalStorageRecord>({
-      spaceId: rt.spaceId,
-      localRecord: localRec && !localRec.deleted ? localRec : undefined,
-      localTombstone: localTomb,
-      remoteRecord: remoteRec,
-      remoteTombstone: remoteTomb,
+    return this.integrateKvOrIdbRemoteEvent<LocalStorageRecord>({
+      rt,
+      ev,
+      nowMs,
+      collection: rt.localStorage,
+      eventData: ev.localStorageData,
+      objectType: 'localStorage',
       primaryDeviceId,
+      applySyncStatus,
     });
-
-    if (outcome.conflict) {
-      this.supersedeConflictsForObject(rt, ev.objectId, nowMs);
-      rt.conflicts[outcome.conflict.conflictId] = outcome.conflict;
-    } else if (outcome.comparison === 'REMOTE_NEWER') {
-      this.supersedeConflictsForObject(rt, ev.objectId, nowMs);
-    }
-
-    if (outcome.winner === 'tombstone' && outcome.tombstone) {
-      rt.tombstones[ev.objectId] = outcome.tombstone;
-      const baseRec =
-        localRec ?? (ev.localStorageData ? { ...ev.localStorageData, version: ev.version } : undefined);
-      if (baseRec) {
-        rt.localStorage[ev.objectId] = {
-          ...baseRec,
-          version: outcome.tombstone.deleteVersion,
-          deleted: true,
-          updatedAt: Math.max(baseRec.updatedAt, ev.createdAt),
-          syncStatus: 'DELETED',
-        };
-      }
-      return outcome.changedLocal || Boolean(localRec && !localRec.deleted);
-    }
-
-    if (outcome.winner === 'remote' && outcome.record) {
-      rt.localStorage[ev.objectId] = {
-        ...outcome.record,
-        deleted: false,
-        syncStatus: applySyncStatus,
-      };
-      delete rt.tombstones[ev.objectId];
-      return true;
-    }
-
-    return false;
   }
 
   /**
@@ -5595,6 +6896,291 @@ export class SyncEngine {
       }
     }
 
+    // Apply SessionStorage records grouped by strict Origin
+    const trackSs = Object.values(rt.sessionStorage).filter((s) => s.trackId === trackId);
+    const hasAnySiteSs = Object.values(rt.sessionStorage).some((s) => s.siteKey === siteKey);
+    const shouldApplySs = Boolean(
+      this.browser.getSessionStorage &&
+        this.browser.applySessionStorage &&
+        (policy.syncSessionStorage ||
+          rt.meta.space.settings.syncSessionStorage ||
+          trackSs.length > 0 ||
+          (options.allowLocalTrackSwitch && hasAnySiteSs)),
+    );
+    if (shouldApplySs && this.browser.getSessionStorage && this.browser.applySessionStorage) {
+      const byOriginSs = new Map<string, SessionStorageRecord[]>();
+      const knownSiteSsKeys = new Set<string>();
+      for (const s of Object.values(rt.sessionStorage)) {
+        if (s.siteKey === siteKey) knownSiteSsKeys.add(s.key);
+      }
+      for (const s of trackSs) {
+        const arr = byOriginSs.get(s.origin) ?? [];
+        arr.push(s);
+        byOriginSs.set(s.origin, arr);
+      }
+      const clearedSsOrigins: string[] = [];
+      if (options.cleanStale) {
+        for (const rec of Object.values(rt.sessionStorage)) {
+          if (rec.siteKey === siteKey && !byOriginSs.has(rec.origin)) {
+            byOriginSs.set(rec.origin, []);
+          }
+        }
+        try {
+          const tabs = await this.browser.queryTabs();
+          for (const tab of tabs) {
+            const origin = tab.url ? normalizeOriginSafe(tab.url) : null;
+            if (
+              origin &&
+              resolveSiteKey(origin, rt.meta.rules.ssoGroups) === siteKey &&
+              !byOriginSs.has(origin)
+            ) {
+              byOriginSs.set(origin, []);
+            }
+          }
+        } catch {
+          // ignore
+        }
+      }
+
+      for (const [origin, records] of byOriginSs.entries()) {
+        const ssState = await this.browser.getSessionStorage(origin);
+        if (!ssState.available) {
+          for (const rec of records) {
+            if (!rec.deleted) {
+              rec.contextAvailable = false;
+              if (rec.syncStatus !== 'IN_SYNC') {
+                rec.syncStatus = 'REMOTE_NEWER';
+              }
+            }
+          }
+          continue;
+        }
+        if (options.cleanStale) {
+          clearedSsOrigins.push(origin);
+        }
+
+        const ssMutations: Array<{ key: string; value?: string; deleted?: boolean }> = [];
+        if (options.cleanStale) {
+          const liveKeys = new Set(records.filter((r) => !r.deleted).map((r) => r.key));
+          for (const k of Object.keys(ssState.items)) {
+            const allowlisted =
+              !policy.sessionStorageKeyAllowlist?.length ||
+              matchesSessionStorageAllowlist(k, policy.sessionStorageKeyAllowlist) ||
+              knownSiteSsKeys.has(k);
+            if (allowlisted && !liveKeys.has(k)) {
+              this.echoSuppressor.registerLocalStorageMutation(
+                `__ss__${origin}`,
+                k,
+                'remove',
+                '',
+                nowMs,
+              );
+              ssMutations.push({ key: k, deleted: true });
+            }
+          }
+        }
+
+        for (const rec of records) {
+          if (rec.deleted) {
+            const delReason = options.deleteReasonsByObject?.get(rec.logicalId);
+            if (
+              delReason !== 'remote_track_only' &&
+              Object.prototype.hasOwnProperty.call(ssState.items, rec.key)
+            ) {
+              this.echoSuppressor.registerLocalStorageMutation(
+                `__ss__${origin}`,
+                rec.key,
+                'remove',
+                '',
+                nowMs,
+              );
+              ssMutations.push({ key: rec.key, deleted: true });
+            }
+          } else {
+            rec.contextAvailable = true;
+            const hasOwnKey = Object.prototype.hasOwnProperty.call(ssState.items, rec.key);
+            const currentSsVal = hasOwnKey ? ssState.items[rec.key] : undefined;
+            if (
+              (!hasOwnKey || currentSsVal !== rec.value) &&
+              (options.cleanStale ||
+                rec.syncStatus === 'REMOTE_NEWER' ||
+                rec.syncStatus === 'REMOTE_ONLY' ||
+                !hasOwnKey)
+            ) {
+              this.echoSuppressor.registerLocalStorageMutation(
+                `__ss__${origin}`,
+                rec.key,
+                'set',
+                rec.value,
+                nowMs,
+              );
+              ssMutations.push({ key: rec.key, value: rec.value });
+              rec.syncStatus = 'IN_SYNC';
+              rt.meta.appliedSsHashes = rt.meta.appliedSsHashes ?? {};
+              rt.meta.appliedSsHashes[rec.logicalId] = rec.value;
+            } else if (
+              hasOwnKey &&
+              currentSsVal === rec.value &&
+              rec.syncStatus !== 'IN_SYNC' &&
+              rec.syncStatus !== 'LOCAL_NEWER'
+            ) {
+              rec.syncStatus = 'IN_SYNC';
+              rt.meta.appliedSsHashes = rt.meta.appliedSsHashes ?? {};
+              rt.meta.appliedSsHashes[rec.logicalId] = rec.value;
+            }
+          }
+        }
+
+        if (ssMutations.length > 0) {
+          const res = await this.browser.applySessionStorage(origin, ssMutations);
+          if (res.applied) {
+            changedLocalStorage = true;
+          } else {
+            for (const rec of records) {
+              if (!rec.deleted) rec.contextAvailable = false;
+            }
+          }
+        }
+      }
+
+      if (options.cleanStale) {
+        rt.meta.pendingCleanSsBySite = rt.meta.pendingCleanSsBySite ?? {};
+        rt.meta.pendingCleanSsBySite[siteKey] = {
+          trackId,
+          clearedOrigins: clearedSsOrigins,
+        };
+      }
+    }
+
+    // Apply lightweight IndexedDB records grouped by strict Origin
+    const trackIdb = Object.values(rt.indexedDb).filter((d) => d.trackId === trackId);
+    const hasAnySiteIdb = Object.values(rt.indexedDb).some((d) => d.siteKey === siteKey);
+    const shouldApplyIdb = Boolean(
+      this.browser.applyIndexedDbMutations &&
+        (policy.syncIndexedDb ||
+          trackIdb.length > 0 ||
+          (options.allowLocalTrackSwitch &&
+            (Boolean(policy.indexedDbTargets?.length) || hasAnySiteIdb))),
+    );
+    if (shouldApplyIdb && this.browser.applyIndexedDbMutations) {
+      const byOriginIdb = new Map<string, IndexedDbRecord[]>();
+      const storePairMap = new Map<string, { dbName: string; storeName: string }>();
+      for (const rec of Object.values(rt.indexedDb)) {
+        if (rec.siteKey === siteKey) {
+          storePairMap.set(`${rec.dbName}::${rec.storeName}`, {
+            dbName: rec.dbName,
+            storeName: rec.storeName,
+          });
+        }
+      }
+      for (const targetRule of policy.indexedDbTargets ?? []) {
+        for (const storeName of targetRule.objectStores ?? []) {
+          storePairMap.set(`${targetRule.dbName}::${storeName}`, {
+            dbName: targetRule.dbName,
+            storeName,
+          });
+        }
+      }
+      for (const d of trackIdb) {
+        const arr = byOriginIdb.get(d.origin) ?? [];
+        arr.push(d);
+        byOriginIdb.set(d.origin, arr);
+      }
+      const clearedIdbOrigins: string[] = [];
+      if (options.cleanStale) {
+        for (const rec of Object.values(rt.indexedDb)) {
+          if (rec.siteKey === siteKey && !byOriginIdb.has(rec.origin)) {
+            byOriginIdb.set(rec.origin, []);
+          }
+        }
+        try {
+          const tabs = await this.browser.queryTabs();
+          for (const tab of tabs) {
+            const origin = tab.url ? normalizeOriginSafe(tab.url) : null;
+            if (
+              origin &&
+              resolveSiteKey(origin, rt.meta.rules.ssoGroups) === siteKey &&
+              !byOriginIdb.has(origin)
+            ) {
+              byOriginIdb.set(origin, []);
+            }
+          }
+        } catch {
+          // ignore
+        }
+      }
+
+      const clearStoresList = Array.from(storePairMap.values());
+      for (const [origin, records] of byOriginIdb.entries()) {
+        const idbMutations: IndexedDbMutation[] = [];
+        for (const rec of records) {
+          if (rec.deleted) {
+            const delReason = options.deleteReasonsByObject?.get(rec.logicalId);
+            if (delReason !== 'remote_track_only') {
+              idbMutations.push({
+                dbName: rec.dbName,
+                dbVersion: rec.dbVersion,
+                storeName: rec.storeName,
+                keyPath: rec.keyPath,
+                autoIncrement: rec.autoIncrement,
+                encodedKey: rec.encodedKey,
+                deleted: true,
+              });
+            }
+          } else if (
+            options.cleanStale ||
+            rec.syncStatus === 'REMOTE_NEWER' ||
+            rec.syncStatus === 'REMOTE_ONLY' ||
+            rec.contextAvailable === false
+          ) {
+            idbMutations.push({
+              dbName: rec.dbName,
+              dbVersion: rec.dbVersion,
+              storeName: rec.storeName,
+              keyPath: rec.keyPath,
+              autoIncrement: rec.autoIncrement,
+              encodedKey: rec.encodedKey,
+              encodedValue: rec.encodedValue,
+            });
+          }
+        }
+
+        if (idbMutations.length > 0 || (options.cleanStale && clearStoresList.length > 0)) {
+          const idbRes = await this.browser.applyIndexedDbMutations(
+            origin,
+            idbMutations,
+            options.cleanStale && clearStoresList.length > 0 ? clearStoresList : undefined,
+          );
+          if (idbRes.applied) {
+            if (options.cleanStale) {
+              clearedIdbOrigins.push(origin);
+            }
+            rt.meta.appliedIdbHashes = rt.meta.appliedIdbHashes ?? {};
+            for (const rec of records) {
+              if (!rec.deleted) {
+                rec.contextAvailable = true;
+                rec.syncStatus = 'IN_SYNC';
+                rt.meta.appliedIdbHashes[rec.logicalId] = `${rec.dbVersion ?? 0}:${rec.encodedValue}`;
+              }
+            }
+            changedLocalStorage = true;
+          } else {
+            for (const rec of records) {
+              if (!rec.deleted) rec.contextAvailable = false;
+            }
+          }
+        }
+      }
+
+      if (options.cleanStale) {
+        rt.meta.pendingCleanIdbBySite = rt.meta.pendingCleanIdbBySite ?? {};
+        rt.meta.pendingCleanIdbBySite[siteKey] = {
+          trackId,
+          clearedOrigins: clearedIdbOrigins,
+        };
+      }
+    }
+
     // Only real Cookie changes (never LocalStorage-only background churn) may trigger optional page reloads
     const changedAny = changedVersions.length > 0;
     if (changedAny && options.triggerRefresh) {
@@ -5868,6 +7454,7 @@ export class SyncEngine {
             mutationsToApply.push({ key: rec.key, deleted: true });
           }
         } else {
+          const wasContextMissing = !rec.contextAvailable;
           if (!rec.contextAvailable) {
             rec.contextAvailable = true;
             stateMutated = true;
@@ -5879,6 +7466,7 @@ export class SyncEngine {
               (policy.direction !== 'push_only' && sitePolicy.direction !== 'push_only')) &&
             (!hasOwnKey || currentLsVal !== rec.value) &&
             (isPendingOriginClean ||
+              wasContextMissing ||
               rec.syncStatus === 'REMOTE_NEWER' ||
               rec.syncStatus === 'REMOTE_ONLY' ||
               !hasOwnKey)
@@ -6112,6 +7700,1204 @@ export class SyncEngine {
   }
 
   // =========================================================================
+  // SessionStorage & Lightweight IndexedDB Sync (Extended Origin Storage)
+  // =========================================================================
+
+  async getPageMountConfig(origin: string): Promise<{
+    acknowledged: boolean;
+    syncSessionStorage: boolean;
+    sessionStorageKeyAllowlist?: string[];
+    syncIndexedDb: boolean;
+    indexedDbTargets?: IndexedDbTargetRule[];
+    indexedDbMaxTotalBytes: number;
+  }> {
+    await this.ensureInitialized();
+    const normOrigin = normalizeOriginSafe(origin);
+    const rt = this.runtime;
+    if (
+      !rt ||
+      !normOrigin ||
+      rt.meta.globalPaused ||
+      rt.meta.localDevice.state !== 'active' ||
+      !rt.dekKeyring[rt.meta.space.keyEpoch]
+    ) {
+      return {
+        acknowledged: true,
+        syncSessionStorage: false,
+        syncIndexedDb: false,
+        indexedDbMaxTotalBytes: DEFAULT_INDEXEDDB_MAX_TOTAL_BYTES,
+      };
+    }
+
+    const siteKey = resolveSiteKey(normOrigin, rt.meta.rules.ssoGroups);
+    const managed = Boolean(siteKey && this.isSiteManagedOrRemotelyTracked(rt, siteKey));
+    const policy = this.getEffectivePolicyForDevice(rt, normOrigin, siteKey);
+    const sitePolicy = siteKey ? this.getEffectivePolicyForDevice(rt, siteKey, siteKey) : policy;
+
+    const allEnvRules = [
+      ...(rt.meta.deviceEnvSyncRules ?? []),
+      ...(rt.meta.rules.envSyncRules ?? []),
+    ];
+    const envSourceNeedsSs = allEnvRules.some(
+      (r) =>
+        r.enabled &&
+        r.autoSync &&
+        Boolean(r.syncSessionStorage) &&
+        envRuleMatchesUrl(r, normOrigin, rt.meta.rules.ssoGroups) === 'source',
+    );
+
+    const syncSessionStorage = Boolean(
+      envSourceNeedsSs ||
+        (managed &&
+          !policy.excluded &&
+          !sitePolicy.excluded &&
+          sitePolicy.direction !== 'disabled' &&
+          policy.syncSessionStorage),
+    );
+    const hasIdbTargets = Boolean(policy.indexedDbTargets && policy.indexedDbTargets.length > 0);
+    const syncIndexedDb = Boolean(
+      managed &&
+        !policy.excluded &&
+        !sitePolicy.excluded &&
+        sitePolicy.direction !== 'disabled' &&
+        policy.syncIndexedDb &&
+        hasIdbTargets,
+    );
+
+    return {
+      acknowledged: true,
+      syncSessionStorage,
+      sessionStorageKeyAllowlist: policy.sessionStorageKeyAllowlist,
+      syncIndexedDb,
+      indexedDbTargets: syncIndexedDb ? policy.indexedDbTargets : undefined,
+      indexedDbMaxTotalBytes: policy.indexedDbMaxTotalBytes,
+    };
+  }
+
+  async reconcileOriginExtendedStorage(origin: string): Promise<void> {
+    await this.ensureInitialized();
+    const normOrigin = normalizeOriginSafe(origin);
+    if (!normOrigin) return;
+
+    return this.enqueueOp(async () => {
+      const rt = this.runtime;
+      if (
+        !rt ||
+        rt.meta.globalPaused ||
+        rt.meta.localDevice.state !== 'active' ||
+        !rt.dekKeyring[rt.meta.space.keyEpoch]
+      ) {
+        return;
+      }
+
+      let mutated = false;
+      let emitted = false;
+
+      if (this.browser.getSessionStorage) {
+        const ssState = await this.browser.getSessionStorage(normOrigin);
+        if (ssState.available) {
+          const ssRes = await this.ingestSessionStorageSnapshotInternal(
+            rt,
+            normOrigin,
+            ssState.items,
+          );
+          if (ssRes.mutated) mutated = true;
+          if (ssRes.emitted) emitted = true;
+        }
+      }
+
+      const idbRes = await this.reconcileOriginIndexedDbInternal(rt, normOrigin, {
+        applyPending: true,
+      });
+      if (idbRes.mutated) mutated = true;
+      if (idbRes.emitted) emitted = true;
+
+      if (mutated || emitted) {
+        rt.meta.space.status = this.computeStatus(rt);
+        await this.persistRuntime(rt);
+      }
+      if (emitted) {
+        await this.attemptAutoPush(rt, 'extended_storage_reconcile_push');
+      }
+    });
+  }
+
+  private resolveOrCreateTrackIdForOriginWrite(
+    rt: LoadedSpaceRuntime,
+    siteKey: string,
+    explicitTrackId: string | undefined,
+    nowMs: number,
+  ): string {
+    const boundTrackId = rt.meta.localDevice.siteBindings[siteKey]?.trackId;
+    if (explicitTrackId) {
+      const targetTrack = rt.tracks[explicitTrackId];
+      if (!targetTrack || targetTrack.siteKey !== siteKey) {
+        throw new Error(`Track "${explicitTrackId}" not found for site "${siteKey}"`);
+      }
+      return explicitTrackId;
+    }
+    if (boundTrackId && rt.tracks[boundTrackId]) {
+      return boundTrackId;
+    }
+
+    const existingTracks = Object.values(rt.tracks).filter(
+      (t) => t.siteKey === siteKey && !t.ephemeral?.localOnly,
+    );
+    let trackId: string;
+    if (existingTracks.length === 1) {
+      trackId = existingTracks[0].trackId;
+    } else {
+      trackId = randomId('trk');
+      rt.tracks[trackId] = {
+        trackId,
+        siteKey,
+        label: `${rt.meta.localDevice.name} 的版本`,
+        originDeviceId: rt.meta.localDevice.deviceId,
+        originDeviceName: rt.meta.localDevice.name,
+        cookieCount: 0,
+        localStorageCount: 0,
+        sessionStorageCount: 0,
+        indexedDbCount: 0,
+        updatedAt: nowMs,
+        memberDeviceIds: [rt.meta.localDevice.deviceId],
+        revision: 1,
+      };
+    }
+    rt.meta.localDevice.siteBindings[siteKey] = {
+      siteKey,
+      state: 'USER_BOUND',
+      trackId,
+      hasLocalBaseline: true,
+      decidedAt: nowMs,
+      decidedBy: 'user',
+    };
+    return trackId;
+  }
+
+  private async reconcileOpenTabSessionStorage(
+    rt: LoadedSpaceRuntime,
+    origin: string,
+    options?: { detectDeletes?: boolean },
+  ): Promise<boolean> {
+    if (!this.browser.getSessionStorage) return false;
+    const ssState = await this.browser.getSessionStorage(origin);
+    if (!ssState.available) return false;
+    const res = await this.ingestSessionStorageSnapshotInternal(rt, origin, ssState.items, {
+      detectDeletes: options?.detectDeletes,
+      skipAutoPushAndPersist: true,
+    });
+    return res.emitted || res.mutated;
+  }
+
+  async ingestSessionStorageSnapshot(
+    origin: string,
+    items: Record<string, string>,
+  ): Promise<void> {
+    await this.ensureInitialized();
+    const normOrigin = normalizeOriginSafe(origin);
+    if (!normOrigin) return;
+
+    return this.enqueueOp(async () => {
+      const rt = this.runtime;
+      if (
+        !rt ||
+        rt.meta.globalPaused ||
+        rt.meta.localDevice.state !== 'active' ||
+        !rt.dekKeyring[rt.meta.space.keyEpoch]
+      ) {
+        return;
+      }
+
+      const res = await this.ingestSessionStorageSnapshotInternal(rt, normOrigin, items);
+      if (res.mutated || res.emitted) {
+        rt.meta.space.status = this.computeStatus(rt);
+        await this.persistRuntime(rt);
+      }
+      if (res.emitted) {
+        await this.attemptAutoPush(rt, 'sessionstorage_snapshot_push');
+      }
+    });
+  }
+
+  private async ingestSessionStorageSnapshotInternal(
+    rt: LoadedSpaceRuntime,
+    normOrigin: string,
+    items: Record<string, string>,
+    options?: { detectDeletes?: boolean; skipAutoPushAndPersist?: boolean },
+  ): Promise<{ mutated: boolean; emitted: boolean }> {
+    const nowMs = this.now();
+    const siteKey = resolveSiteKey(normOrigin, rt.meta.rules.ssoGroups);
+    if (!siteKey) return { mutated: false, emitted: false };
+
+    const hasItems = Object.keys(items).length > 0;
+    const cascadeAutoSsEnvSync = async () => {
+      await this.hydrateAutoEnvTargetsOnMount(rt, normOrigin);
+      if (hasItems) {
+        await this.runAutoEnvSyncForSourceSites(rt, [siteKey], { onlyWithSessionStorage: true });
+      }
+    };
+
+    if (!this.isSiteManagedOrRemotelyTracked(rt, siteKey)) {
+      await cascadeAutoSsEnvSync();
+      return { mutated: false, emitted: false };
+    }
+
+    const policy = this.getEffectivePolicyForDevice(rt, normOrigin, siteKey);
+    const sitePolicy = this.getEffectivePolicyForDevice(rt, siteKey, siteKey);
+    if (policy.excluded || sitePolicy.excluded) {
+      await this.hydrateAutoEnvTargetsOnMount(rt, normOrigin);
+      return { mutated: false, emitted: false };
+    }
+    if (!policy.syncSessionStorage || sitePolicy.direction === 'disabled') {
+      await cascadeAutoSsEnvSync();
+      return { mutated: false, emitted: false };
+    }
+
+    const binding = rt.meta.localDevice.siteBindings[siteKey];
+    if (binding?.state === 'BLACKLISTED') {
+      await this.hydrateAutoEnvTargetsOnMount(rt, normOrigin);
+      return { mutated: false, emitted: false };
+    }
+    if (
+      !binding ||
+      !binding.trackId ||
+      binding.state === 'PENDING_CHOICE' ||
+      binding.state === 'UNMANAGED'
+    ) {
+      await cascadeAutoSsEnvSync();
+      return { mutated: false, emitted: false };
+    }
+
+    if (rt.meta.pendingEnvSsByOrigin?.[normOrigin]) {
+      await this.hydrateAutoEnvTargetsOnMount(rt, normOrigin);
+      return { mutated: true, emitted: false };
+    }
+
+    const trackId = binding.trackId;
+    const mutationsToApply: Array<{ key: string; value?: string; deleted?: boolean }> = [];
+    let stateMutated = false;
+    const remoteRecords = Object.values(rt.sessionStorage).filter(
+      (r) => r.trackId === trackId && r.origin === normOrigin,
+    );
+    const handledKeys = new Set<string>();
+    const pendingSiteClean = rt.meta.pendingCleanSsBySite?.[siteKey];
+    const isPendingOriginClean = Boolean(
+      pendingSiteClean &&
+        pendingSiteClean.trackId === trackId &&
+        !pendingSiteClean.clearedOrigins.includes(normOrigin),
+    );
+    let effectiveItems: Record<string, string> = items;
+    if (isPendingOriginClean && pendingSiteClean) {
+      pendingSiteClean.clearedOrigins.push(normOrigin);
+      stateMutated = true;
+      const liveRemoteKeys = new Set(remoteRecords.filter((r) => !r.deleted).map((r) => r.key));
+      const filtered: Record<string, string> = Object.create(null);
+      for (const [k, v] of Object.entries(items)) {
+        if (matchesSessionStorageAllowlist(k, policy.sessionStorageKeyAllowlist) && !liveRemoteKeys.has(k)) {
+          this.echoSuppressor.registerLocalStorageMutation(`__ss__${normOrigin}`, k, 'remove', '', nowMs);
+          mutationsToApply.push({ key: k, deleted: true });
+        } else {
+          Object.defineProperty(filtered, k, {
+            value: v,
+            enumerable: true,
+            writable: true,
+            configurable: true,
+          });
+        }
+      }
+      effectiveItems = filtered;
+    }
+
+    for (const rec of remoteRecords) {
+      handledKeys.add(rec.key);
+      if (rec.deleted) {
+        if (
+          (isPendingOriginClean ||
+            (policy.direction !== 'push_only' && sitePolicy.direction !== 'push_only')) &&
+          Object.prototype.hasOwnProperty.call(items, rec.key)
+        ) {
+          this.echoSuppressor.registerLocalStorageMutation(`__ss__${normOrigin}`, rec.key, 'remove', '', nowMs);
+          mutationsToApply.push({ key: rec.key, deleted: true });
+        }
+      } else {
+        const wasContextMissing = !rec.contextAvailable;
+        if (!rec.contextAvailable) {
+          rec.contextAvailable = true;
+          stateMutated = true;
+        }
+        const hasOwnKey = Object.prototype.hasOwnProperty.call(items, rec.key);
+        const currentSsVal = hasOwnKey ? items[rec.key] : undefined;
+        if (
+          (isPendingOriginClean ||
+            (policy.direction !== 'push_only' && sitePolicy.direction !== 'push_only')) &&
+          (!hasOwnKey || currentSsVal !== rec.value) &&
+          (isPendingOriginClean ||
+            wasContextMissing ||
+            rec.syncStatus === 'REMOTE_NEWER' ||
+            rec.syncStatus === 'REMOTE_ONLY' ||
+            !hasOwnKey)
+        ) {
+          this.echoSuppressor.registerLocalStorageMutation(
+            `__ss__${normOrigin}`,
+            rec.key,
+            'set',
+            rec.value,
+            nowMs,
+          );
+          mutationsToApply.push({ key: rec.key, value: rec.value });
+          rec.syncStatus = 'IN_SYNC';
+          rt.meta.appliedSsHashes = rt.meta.appliedSsHashes ?? {};
+          rt.meta.appliedSsHashes[rec.logicalId] = rec.value;
+          stateMutated = true;
+        } else if (
+          hasOwnKey &&
+          currentSsVal === rec.value &&
+          rec.syncStatus !== 'IN_SYNC' &&
+          rec.syncStatus !== 'LOCAL_NEWER'
+        ) {
+          rec.syncStatus = 'IN_SYNC';
+          rt.meta.appliedSsHashes = rt.meta.appliedSsHashes ?? {};
+          rt.meta.appliedSsHashes[rec.logicalId] = rec.value;
+          stateMutated = true;
+        }
+      }
+    }
+
+    if (mutationsToApply.length > 0 && this.browser.applySessionStorage) {
+      await this.browser.applySessionStorage(normOrigin, mutationsToApply);
+    }
+
+    let emittedAny = false;
+    if (policy.direction !== 'pull_only' && sitePolicy.direction !== 'pull_only') {
+      for (const [key, value] of Object.entries(effectiveItems)) {
+        if (!matchesSessionStorageAllowlist(key, policy.sessionStorageKeyAllowlist)) continue;
+        if (handledKeys.has(key)) {
+          const logicalId = buildSessionStorageLogicalId(trackId, normOrigin, key);
+          const existing = rt.sessionStorage[logicalId];
+          if (
+            existing &&
+            !existing.deleted &&
+            existing.value !== value &&
+            !mutationsToApply.some((m) => m.key === key)
+          ) {
+            const res = await this.emitLocalSessionStorageUpsert(
+              rt,
+              siteKey,
+              trackId,
+              normOrigin,
+              key,
+              value,
+              'UPDATE',
+            );
+            if (res) emittedAny = true;
+          }
+          continue;
+        }
+        const logicalId = buildSessionStorageLogicalId(trackId, normOrigin, key);
+        if (rt.tombstones[logicalId]) continue;
+        const res = await this.emitLocalSessionStorageUpsert(
+          rt,
+          siteKey,
+          trackId,
+          normOrigin,
+          key,
+          value,
+          'CREATE',
+        );
+        if (res) emittedAny = true;
+      }
+
+      if (options?.detectDeletes) {
+        const pendingUpsertIds = new Set(
+          rt.pendingOutboundEvents
+            .filter((ev) => ev.objectType === 'sessionStorage' && ev.operation !== 'DELETE')
+            .map((ev) => ev.objectId),
+        );
+        for (const rec of remoteRecords) {
+          if (rec.deleted) continue;
+          if (!matchesSessionStorageAllowlist(rec.key, policy.sessionStorageKeyAllowlist)) continue;
+          if (Object.prototype.hasOwnProperty.call(effectiveItems, rec.key)) continue;
+          if (rt.meta.appliedSsHashes?.[rec.logicalId] === undefined) continue;
+          if (pendingUpsertIds.has(rec.logicalId)) continue;
+          if (rec.syncStatus === 'REMOTE_ONLY' || rec.syncStatus === 'REMOTE_NEWER') continue;
+          await this.emitLocalSessionStorageDelete(rt, rec, 'explicit', 'explicit');
+          emittedAny = true;
+        }
+      }
+    }
+
+    if (!options?.skipAutoPushAndPersist) {
+      await cascadeAutoSsEnvSync();
+    }
+    return {
+      mutated: stateMutated || mutationsToApply.length > 0,
+      emitted: emittedAny,
+    };
+  }
+
+  async ingestSessionStorageMutations(
+    origin: string,
+    changes: Array<{ key: string; value?: string; deleted?: boolean }>,
+    options?: { isPageLeaving?: boolean },
+  ): Promise<void> {
+    await this.ensureInitialized();
+    const normOrigin = normalizeOriginSafe(origin);
+    if (!normOrigin || changes.length === 0) return;
+
+    return this.enqueueOp(async () => {
+      const rt = this.runtime;
+      if (
+        !rt ||
+        rt.meta.globalPaused ||
+        rt.meta.localDevice.state !== 'active' ||
+        !rt.dekKeyring[rt.meta.space.keyEpoch]
+      ) {
+        return;
+      }
+
+      const nowMs = this.now();
+      const siteKey = resolveSiteKey(normOrigin, rt.meta.rules.ssoGroups);
+      if (!siteKey) return;
+
+      if (options?.isPageLeaving) {
+        const leaveMuteUntil = this.postTrackSwitchLeaveMuteUntil.get(siteKey) ?? 0;
+        if (leaveMuteUntil > nowMs) return;
+      }
+
+      const nonEchoChanges = changes.filter((ch) => {
+        const op = ch.deleted ? 'remove' : 'set';
+        const val = ch.value ?? '';
+        return !this.echoSuppressor.shouldSuppressLocalStorageEvent(
+          `__ss__${normOrigin}`,
+          ch.key,
+          op,
+          val,
+          nowMs,
+        );
+      });
+      if (nonEchoChanges.length === 0) return;
+
+      const cascadeAutoSsEnvSync = async () => {
+        await this.runAutoEnvSyncForSourceSites(rt, [siteKey], { onlyWithSessionStorage: true });
+      };
+
+      if (!this.isSiteManagedOrRemotelyTracked(rt, siteKey)) {
+        await cascadeAutoSsEnvSync();
+        return;
+      }
+
+      const policy = this.getEffectivePolicyForDevice(rt, normOrigin, siteKey);
+      const sitePolicy = this.getEffectivePolicyForDevice(rt, siteKey, siteKey);
+      if (policy.excluded || sitePolicy.excluded) return;
+      if (
+        !policy.syncSessionStorage ||
+        policy.direction === 'disabled' ||
+        policy.direction === 'pull_only' ||
+        sitePolicy.direction === 'disabled' ||
+        sitePolicy.direction === 'pull_only'
+      ) {
+        await cascadeAutoSsEnvSync();
+        return;
+      }
+
+      const binding = rt.meta.localDevice.siteBindings[siteKey];
+      if (!binding?.trackId || binding.state === 'BLACKLISTED' || binding.state === 'PENDING_CHOICE' || binding.state === 'UNMANAGED') {
+        await cascadeAutoSsEnvSync();
+        return;
+      }
+
+      let emittedAny = false;
+      for (const ch of nonEchoChanges) {
+        if (!matchesSessionStorageAllowlist(ch.key, policy.sessionStorageKeyAllowlist)) continue;
+        const val = ch.value ?? '';
+        const logicalId = buildSessionStorageLogicalId(binding.trackId, normOrigin, ch.key);
+        if (ch.deleted) {
+          const existing = rt.sessionStorage[logicalId];
+          if (existing && !existing.deleted) {
+            await this.emitLocalSessionStorageDelete(rt, existing, 'explicit', 'explicit');
+            emittedAny = true;
+          }
+        } else {
+          const res = await this.emitLocalSessionStorageUpsert(
+            rt,
+            siteKey,
+            binding.trackId,
+            normOrigin,
+            ch.key,
+            val,
+            'UPDATE',
+          );
+          if (res) emittedAny = true;
+        }
+      }
+
+      if (emittedAny) {
+        rt.meta.space.status = this.computeStatus(rt);
+        await this.persistRuntime(rt);
+        await this.attemptAutoPush(rt, 'sessionstorage_mutation_push');
+      }
+      await cascadeAutoSsEnvSync();
+    });
+  }
+
+  async getSessionStorageRecords(filter?: {
+    siteKey?: string;
+    origin?: string;
+    trackId?: string;
+  }): Promise<SessionStorageRecord[]> {
+    await this.ensureInitialized();
+    const rt = this.runtime;
+    if (!rt) return [];
+
+    return Object.values(rt.sessionStorage)
+      .filter((r) => {
+        if (r.deleted) return false;
+        if (filter?.origin && r.origin !== filter.origin) return false;
+        if (filter?.trackId) return r.trackId === filter.trackId;
+        if (filter?.siteKey) {
+          const boundTrack = rt.meta.localDevice.siteBindings[filter.siteKey]?.trackId;
+          if (boundTrack) return r.trackId === boundTrack;
+          return r.siteKey === filter.siteKey;
+        }
+        return true;
+      })
+      .sort((a, b) => a.origin.localeCompare(b.origin) || a.key.localeCompare(b.key));
+  }
+
+  async upsertSessionStorageItem(
+    origin: string,
+    key: string,
+    value: string,
+    explicitTrackId?: string,
+  ): Promise<SessionStorageRecord> {
+    await this.ensureInitialized();
+    const normOrigin = normalizeOriginSafe(origin);
+    if (!normOrigin) throw new Error(`Invalid origin: ${origin}`);
+
+    return this.enqueueOp(async () => {
+      const rt = this.requireUnlockedRuntime();
+      const nowMs = this.now();
+      const siteKey = resolveSiteKey(normOrigin, rt.meta.rules.ssoGroups);
+      const trackId = this.resolveOrCreateTrackIdForOriginWrite(rt, siteKey, explicitTrackId, nowMs);
+      const isActiveBoundTrack =
+        !explicitTrackId || rt.meta.localDevice.siteBindings[siteKey]?.trackId === trackId;
+
+      let contextAvailable = false;
+      if (isActiveBoundTrack && this.browser.applySessionStorage) {
+        this.echoSuppressor.registerLocalStorageMutation(`__ss__${normOrigin}`, key, 'set', value, nowMs);
+        const applyRes = await this.browser.applySessionStorage(normOrigin, [{ key, value }]);
+        contextAvailable = applyRes.applied;
+      }
+
+      const rec =
+        (await this.emitLocalSessionStorageUpsert(rt, siteKey, trackId, normOrigin, key, value, 'UPDATE')) ??
+        rt.sessionStorage[buildSessionStorageLogicalId(trackId, normOrigin, key)];
+
+      rec.contextAvailable = contextAvailable;
+      if (!contextAvailable && rt.meta.appliedSsHashes) {
+        delete rt.meta.appliedSsHashes[rec.logicalId];
+      }
+      await this.persistRuntime(rt);
+
+      if (rt.meta.space.settings.autoSync) {
+        await this.tryPushOutboundBestEffort(rt, 'upsert_session_storage');
+        rt.meta.space.status = this.computeStatus(rt);
+        await this.persistRuntime(rt);
+      }
+      return { ...rec };
+    });
+  }
+
+  async applySessionStorageItem(logicalId: string): Promise<SessionStorageRecord> {
+    await this.ensureInitialized();
+    return this.enqueueOp(async () => {
+      const rt = this.requireUnlockedRuntime();
+      const rec = rt.sessionStorage[logicalId];
+      if (!rec) throw new Error(`SessionStorage record not found: ${logicalId}`);
+      if (!this.browser.applySessionStorage) {
+        throw new Error('Browser adapter does not support sessionStorage write');
+      }
+
+      const nowMs = this.now();
+      this.echoSuppressor.registerLocalStorageMutation(
+        `__ss__${rec.origin}`,
+        rec.key,
+        'set',
+        rec.value,
+        nowMs,
+      );
+      const res = await this.browser.applySessionStorage(rec.origin, [
+        { key: rec.key, value: rec.value },
+      ]);
+      rec.contextAvailable = res.applied;
+      rec.syncStatus = res.applied ? 'IN_SYNC' : 'REMOTE_NEWER';
+      if (res.applied) {
+        rt.meta.appliedSsHashes = rt.meta.appliedSsHashes ?? {};
+        rt.meta.appliedSsHashes[rec.logicalId] = rec.value;
+      }
+      await this.persistRuntime(rt);
+      return { ...rec };
+    });
+  }
+
+  async deleteSessionStorageItems(logicalIds: string[], scope: DeleteScope): Promise<void> {
+    await this.ensureInitialized();
+    return this.enqueueOp(async () => {
+      const rt = this.requireUnlockedRuntime();
+      const nowMs = this.now();
+      let pushNeeded = false;
+
+      for (const lid of logicalIds) {
+        const rec = rt.sessionStorage[lid];
+        if (!rec) continue;
+        const isActiveTrack =
+          rt.meta.localDevice.siteBindings[rec.siteKey]?.trackId === rec.trackId;
+
+        if (scope === 'local_only') {
+          if (isActiveTrack && this.browser.applySessionStorage) {
+            this.echoSuppressor.registerLocalStorageMutation(`__ss__${rec.origin}`, rec.key, 'remove', '', nowMs);
+            await this.browser.applySessionStorage(rec.origin, [{ key: rec.key, deleted: true }]);
+          }
+          rec.syncStatus = 'REMOTE_ONLY';
+          continue;
+        }
+
+        if (scope === 'remote_track_only') {
+          await this.emitLocalSessionStorageDelete(rt, rec, 'user_delete', 'remote_track_only');
+          pushNeeded = true;
+          continue;
+        }
+
+        if (scope === 'all_devices') {
+          if (isActiveTrack && this.browser.applySessionStorage) {
+            this.echoSuppressor.registerLocalStorageMutation(`__ss__${rec.origin}`, rec.key, 'remove', '', nowMs);
+            await this.browser.applySessionStorage(rec.origin, [{ key: rec.key, deleted: true }]);
+          }
+          await this.emitLocalSessionStorageDelete(rt, rec, 'user_delete', 'all_devices');
+          pushNeeded = true;
+        }
+      }
+
+      await this.persistRuntime(rt);
+      if (pushNeeded && rt.meta.space.settings.autoSync) {
+        await this.tryPushOutboundBestEffort(rt, 'delete_session_storage');
+        rt.meta.space.status = this.computeStatus(rt);
+        await this.persistRuntime(rt);
+      }
+    });
+  }
+
+  async inspectPageIndexedDb(
+    origin: string,
+  ): Promise<{ available: boolean; databases: InspectedIndexedDbDatabase[]; reason?: string }> {
+    await this.ensureInitialized();
+    const normOrigin = normalizeOriginSafe(origin);
+    if (!normOrigin) {
+      return { available: false, databases: [], reason: `Invalid origin: ${origin}` };
+    }
+    if (!this.browser.inspectIndexedDb) {
+      return { available: false, databases: [], reason: 'IndexedDB inspection unavailable' };
+    }
+    return this.browser.inspectIndexedDb(normOrigin);
+  }
+
+  async captureOriginIndexedDb(origin: string): Promise<void> {
+    await this.ensureInitialized();
+    const normOrigin = normalizeOriginSafe(origin);
+    if (!normOrigin) return;
+
+    return this.enqueueOp(async () => {
+      const rt = this.runtime;
+      if (
+        !rt ||
+        rt.meta.globalPaused ||
+        rt.meta.localDevice.state !== 'active' ||
+        !rt.dekKeyring[rt.meta.space.keyEpoch]
+      ) {
+        return;
+      }
+
+      const res = await this.reconcileOriginIndexedDbInternal(rt, normOrigin, {
+        applyPending: true,
+        detectDeletes: true,
+      });
+      if (res.mutated || res.emitted) {
+        rt.meta.space.status = this.computeStatus(rt);
+        await this.persistRuntime(rt);
+      }
+      if (res.emitted) {
+        await this.attemptAutoPush(rt, 'indexeddb_capture_push');
+      }
+    });
+  }
+
+  private matchesIndexedDbTargets(
+    rec: Pick<IndexedDbRecord, 'dbName' | 'storeName' | 'encodedKey'>,
+    targets: IndexedDbTargetRule[],
+  ): boolean {
+    for (const rule of targets) {
+      if (rule.dbName !== rec.dbName) continue;
+      if (rule.objectStores && rule.objectStores.length > 0 && !rule.objectStores.includes(rec.storeName)) {
+        continue;
+      }
+      if (rule.keyPrefixes && rule.keyPrefixes.length > 0) {
+        const keyOk = rule.keyPrefixes.some(
+          (pref) => rec.encodedKey.startsWith(pref) || rec.encodedKey.includes(pref),
+        );
+        if (!keyOk) continue;
+      }
+      return true;
+    }
+    return false;
+  }
+
+  private async reconcileOriginIndexedDbInternal(
+    rt: LoadedSpaceRuntime,
+    normOrigin: string,
+    options?: { applyPending?: boolean; detectDeletes?: boolean },
+  ): Promise<{ mutated: boolean; emitted: boolean; capturedCount: number; quotaExceeded?: boolean }> {
+    const nowMs = this.now();
+    const siteKey = resolveSiteKey(normOrigin, rt.meta.rules.ssoGroups);
+    if (!siteKey || !this.isSiteManagedOrRemotelyTracked(rt, siteKey)) {
+      return { mutated: false, emitted: false, capturedCount: 0 };
+    }
+
+    const policy = this.getEffectivePolicyForDevice(rt, normOrigin, siteKey);
+    const sitePolicy = this.getEffectivePolicyForDevice(rt, siteKey, siteKey);
+    if (
+      policy.excluded ||
+      sitePolicy.excluded ||
+      policy.direction === 'disabled' ||
+      !policy.syncIndexedDb ||
+      !policy.indexedDbTargets ||
+      policy.indexedDbTargets.length === 0
+    ) {
+      return { mutated: false, emitted: false, capturedCount: 0 };
+    }
+
+    const binding = rt.meta.localDevice.siteBindings[siteKey];
+    if (
+      !binding?.trackId ||
+      binding.state === 'BLACKLISTED' ||
+      binding.state === 'PENDING_CHOICE' ||
+      binding.state === 'UNMANAGED'
+    ) {
+      return { mutated: false, emitted: false, capturedCount: 0 };
+    }
+
+    const trackId = binding.trackId;
+    let mutated = false;
+    let emitted = false;
+    let capturedCount = 0;
+
+    // 1. Apply pending clean-switch or remote IndexedDB records when tab mounts
+    const pendingSiteClean = rt.meta.pendingCleanIdbBySite?.[siteKey];
+    const isPendingOriginClean = Boolean(
+      pendingSiteClean &&
+        pendingSiteClean.trackId === trackId &&
+        !pendingSiteClean.clearedOrigins.includes(normOrigin),
+    );
+    if (
+      options?.applyPending &&
+      this.browser.applyIndexedDbMutations &&
+      (isPendingOriginClean ||
+        (policy.direction !== 'push_only' && sitePolicy.direction !== 'push_only'))
+    ) {
+      const originRecords = Object.values(rt.indexedDb).filter(
+        (d) => d.trackId === trackId && d.origin === normOrigin,
+      );
+      const idbMutations: IndexedDbMutation[] = [];
+      for (const rec of originRecords) {
+        if (rec.deleted) {
+          idbMutations.push({
+            dbName: rec.dbName,
+            dbVersion: rec.dbVersion,
+            storeName: rec.storeName,
+            keyPath: rec.keyPath,
+            autoIncrement: rec.autoIncrement,
+            encodedKey: rec.encodedKey,
+            deleted: true,
+          });
+        } else if (
+          isPendingOriginClean ||
+          rec.syncStatus === 'REMOTE_NEWER' ||
+          rec.syncStatus === 'REMOTE_ONLY' ||
+          rec.contextAvailable === false
+        ) {
+          idbMutations.push({
+            dbName: rec.dbName,
+            dbVersion: rec.dbVersion,
+            storeName: rec.storeName,
+            keyPath: rec.keyPath,
+            autoIncrement: rec.autoIncrement,
+            encodedKey: rec.encodedKey,
+            encodedValue: rec.encodedValue,
+          });
+        }
+      }
+
+      const clearStores: Array<{ dbName: string; storeName: string }> = [];
+      if (isPendingOriginClean && pendingSiteClean) {
+        const seenPairs = new Set<string>();
+        for (const rec of Object.values(rt.indexedDb)) {
+          if (rec.siteKey === siteKey) {
+            const k = `${rec.dbName}::${rec.storeName}`;
+            if (!seenPairs.has(k)) {
+              seenPairs.add(k);
+              clearStores.push({ dbName: rec.dbName, storeName: rec.storeName });
+            }
+          }
+        }
+        for (const rule of policy.indexedDbTargets) {
+          for (const storeName of rule.objectStores ?? []) {
+            const k = `${rule.dbName}::${storeName}`;
+            if (!seenPairs.has(k)) {
+              seenPairs.add(k);
+              clearStores.push({ dbName: rule.dbName, storeName });
+            }
+          }
+        }
+        pendingSiteClean.clearedOrigins.push(normOrigin);
+        mutated = true;
+      }
+
+      if (idbMutations.length > 0 || clearStores.length > 0) {
+        const applyRes = await this.browser.applyIndexedDbMutations(
+          normOrigin,
+          idbMutations,
+          clearStores.length > 0 ? clearStores : undefined,
+        );
+        if (applyRes.applied) {
+          rt.meta.appliedIdbHashes = rt.meta.appliedIdbHashes ?? {};
+          for (const rec of originRecords) {
+            if (!rec.deleted) {
+              rec.contextAvailable = true;
+              rec.syncStatus = 'IN_SYNC';
+              rt.meta.appliedIdbHashes[rec.logicalId] = `${rec.dbVersion ?? 0}:${rec.encodedValue}`;
+            }
+          }
+          mutated = true;
+        }
+      }
+    }
+
+    // 2. Capture local IndexedDB records if push allowed (subject to strict byte quota circuit breaker)
+    if (
+      policy.direction !== 'pull_only' &&
+      sitePolicy.direction !== 'pull_only' &&
+      this.browser.getIndexedDbRecords
+    ) {
+      const res = await this.browser.getIndexedDbRecords(
+        normOrigin,
+        policy.indexedDbTargets,
+        policy.indexedDbMaxTotalBytes,
+      );
+      if (res.available) {
+        const sumBytes = res.records.reduce(
+          (sum, r) => sum + (r.byteLength || r.encodedKey.length + r.encodedValue.length),
+          0,
+        );
+        const totalBytes = Math.max(res.totalBytes || 0, sumBytes);
+        if (res.quotaExceeded || totalBytes > policy.indexedDbMaxTotalBytes) {
+          rt.meta.quotaExceededOrigins = rt.meta.quotaExceededOrigins ?? {};
+          rt.meta.quotaExceededOrigins[normOrigin] = {
+            siteKey,
+            totalBytes,
+            maxBytes: policy.indexedDbMaxTotalBytes,
+            detectedAt: nowMs,
+          };
+          mutated = true;
+          await this.logger.log({
+            spaceId: rt.spaceId,
+            level: 'warn',
+            phase: 'indexeddb_quota',
+            siteKey,
+            code: 'INDEXEDDB_QUOTA_EXCEEDED',
+            message: `IndexedDB size (${totalBytes} bytes) on ${normOrigin} exceeded cap (${policy.indexedDbMaxTotalBytes} bytes); skipped sync`,
+            timestamp: nowMs,
+          });
+          return { mutated, emitted: false, capturedCount: 0, quotaExceeded: true };
+        }
+
+        if (rt.meta.quotaExceededOrigins?.[normOrigin]) {
+          delete rt.meta.quotaExceededOrigins[normOrigin];
+          mutated = true;
+        }
+
+        const liveLogicalIds = new Set<string>();
+        for (const item of res.records) {
+          const itemWithOrigin = { ...item, origin: normalizeOriginSafe(item.origin) || normOrigin };
+          const logicalId = buildIndexedDbLogicalId({
+            trackId,
+            origin: itemWithOrigin.origin,
+            dbName: itemWithOrigin.dbName,
+            storeName: itemWithOrigin.storeName,
+            encodedKey: itemWithOrigin.encodedKey,
+          });
+          liveLogicalIds.add(logicalId);
+          const existing = rt.indexedDb[logicalId];
+          const lastApplied = rt.meta.appliedIdbHashes?.[logicalId];
+          const contentHash = `${itemWithOrigin.dbVersion ?? 0}:${itemWithOrigin.encodedValue}`;
+          if (existing && !existing.deleted && `${existing.dbVersion ?? 0}:${existing.encodedValue}` === contentHash) {
+            rt.meta.appliedIdbHashes = rt.meta.appliedIdbHashes ?? {};
+            rt.meta.appliedIdbHashes[logicalId] = contentHash;
+            capturedCount += 1;
+            continue;
+          }
+          if (
+            lastApplied === undefined &&
+            existing &&
+            existing.sourceDevice !== rt.meta.localDevice.deviceId &&
+            (existing.syncStatus === 'REMOTE_NEWER' || existing.syncStatus === 'REMOTE_ONLY')
+          ) {
+            continue;
+          }
+
+          const upserted = await this.emitLocalIndexedDbUpsert(
+            rt,
+            siteKey,
+            trackId,
+            itemWithOrigin,
+            existing && !existing.deleted ? 'UPDATE' : 'CREATE',
+          );
+          if (upserted) {
+            emitted = true;
+            capturedCount += 1;
+          }
+        }
+
+        if (options?.detectDeletes) {
+          const pendingUpsertIds = new Set(
+            rt.pendingOutboundEvents
+              .filter((ev) => ev.objectType === 'indexedDb' && ev.operation !== 'DELETE')
+              .map((ev) => ev.objectId),
+          );
+          for (const rec of Object.values(rt.indexedDb)) {
+            if (rec.trackId !== trackId || rec.origin !== normOrigin || rec.deleted) continue;
+            if (!this.matchesIndexedDbTargets(rec, policy.indexedDbTargets)) continue;
+            if (liveLogicalIds.has(rec.logicalId)) continue;
+            if (rt.meta.appliedIdbHashes?.[rec.logicalId] === undefined) continue;
+            if (pendingUpsertIds.has(rec.logicalId)) continue;
+            if (rec.syncStatus === 'REMOTE_ONLY' || rec.syncStatus === 'REMOTE_NEWER') continue;
+            await this.emitLocalIndexedDbDelete(rt, rec, 'explicit', 'explicit');
+            emitted = true;
+          }
+        }
+      }
+    }
+
+    return { mutated, emitted, capturedCount };
+  }
+
+  private async captureOriginIndexedDbInternal(
+    rt: LoadedSpaceRuntime,
+    normOrigin: string,
+    options?: { detectDeletes?: boolean },
+  ): Promise<boolean> {
+    const res = await this.reconcileOriginIndexedDbInternal(rt, normOrigin, {
+      applyPending: false,
+      detectDeletes: options?.detectDeletes,
+    });
+    return res.emitted || res.mutated;
+  }
+
+  async capturePageExtendedStorageNow(
+    origin: string,
+  ): Promise<{ capturedSession: number; capturedIndexedDb: number }> {
+    await this.ensureInitialized();
+    const normOrigin = normalizeOriginSafe(origin);
+    if (!normOrigin) throw new Error(`Invalid origin: ${origin}`);
+
+    return this.enqueueOp(async () => {
+      const rt = this.requireUnlockedRuntime();
+      const nowMs = this.now();
+      const siteKey = resolveSiteKey(normOrigin, rt.meta.rules.ssoGroups);
+      if (!siteKey) {
+        return { capturedSession: 0, capturedIndexedDb: 0 };
+      }
+
+      const policy = this.getEffectivePolicyForDevice(rt, normOrigin, siteKey);
+      if (policy.excluded || policy.direction === 'disabled') {
+        throw new Error(`站点 "${siteKey}" 处于黑名单或禁用同步策略中，无法采集扩展存储`);
+      }
+
+      const trackId = this.resolveOrCreateTrackIdForOriginWrite(rt, siteKey, undefined, nowMs);
+      let capturedSession = 0;
+      let capturedIndexedDb = 0;
+      let emitted = false;
+
+      if (this.browser.getSessionStorage) {
+        const ssState = await this.browser.getSessionStorage(normOrigin);
+        if (ssState.available) {
+          for (const [k, v] of Object.entries(ssState.items)) {
+            if (!matchesSessionStorageAllowlist(k, policy.sessionStorageKeyAllowlist)) continue;
+            const res = await this.emitLocalSessionStorageUpsert(
+              rt,
+              siteKey,
+              trackId,
+              normOrigin,
+              k,
+              v,
+              'UPDATE',
+            );
+            if (res) {
+              emitted = true;
+              capturedSession += 1;
+            }
+          }
+        }
+      }
+
+      if (policy.indexedDbTargets && policy.indexedDbTargets.length > 0) {
+        const idbRes = await this.reconcileOriginIndexedDbInternal(rt, normOrigin, {
+          applyPending: false,
+          detectDeletes: true,
+        });
+        capturedIndexedDb = idbRes.capturedCount;
+        if (idbRes.emitted) emitted = true;
+      }
+
+      rt.meta.space.status = this.computeStatus(rt);
+      await this.persistRuntime(rt);
+      if (emitted && rt.meta.space.settings.autoSync) {
+        await this.tryPushOutboundBestEffort(rt, 'capture_extended_storage_now');
+        rt.meta.space.status = this.computeStatus(rt);
+        await this.persistRuntime(rt);
+      }
+
+      return { capturedSession, capturedIndexedDb };
+    });
+  }
+
+  async getIndexedDbRecords(filter?: {
+    siteKey?: string;
+    origin?: string;
+    trackId?: string;
+    dbName?: string;
+  }): Promise<IndexedDbRecord[]> {
+    await this.ensureInitialized();
+    const rt = this.runtime;
+    if (!rt) return [];
+
+    return Object.values(rt.indexedDb)
+      .filter((r) => {
+        if (r.deleted) return false;
+        if (filter?.origin && r.origin !== filter.origin) return false;
+        if (filter?.dbName && r.dbName !== filter.dbName) return false;
+        if (filter?.trackId) return r.trackId === filter.trackId;
+        if (filter?.siteKey) {
+          const boundTrack = rt.meta.localDevice.siteBindings[filter.siteKey]?.trackId;
+          if (boundTrack) return r.trackId === boundTrack;
+          return r.siteKey === filter.siteKey;
+        }
+        return true;
+      })
+      .sort(
+        (a, b) =>
+          a.origin.localeCompare(b.origin) ||
+          a.dbName.localeCompare(b.dbName) ||
+          a.storeName.localeCompare(b.storeName) ||
+          a.encodedKey.localeCompare(b.encodedKey),
+      );
+  }
+
+  async applyIndexedDbRecord(logicalId: string): Promise<IndexedDbRecord> {
+    await this.ensureInitialized();
+    return this.enqueueOp(async () => {
+      const rt = this.requireUnlockedRuntime();
+      const rec = rt.indexedDb[logicalId];
+      if (!rec) throw new Error(`IndexedDB record not found: ${logicalId}`);
+      if (!this.browser.applyIndexedDbMutations) {
+        throw new Error('Browser adapter does not support IndexedDB write');
+      }
+
+      const res = await this.browser.applyIndexedDbMutations(rec.origin, [
+        {
+          dbName: rec.dbName,
+          dbVersion: rec.dbVersion,
+          storeName: rec.storeName,
+          keyPath: rec.keyPath,
+          autoIncrement: rec.autoIncrement,
+          encodedKey: rec.encodedKey,
+          encodedValue: rec.encodedValue,
+        },
+      ]);
+      rec.contextAvailable = res.applied;
+      rec.syncStatus = res.applied ? 'IN_SYNC' : 'REMOTE_NEWER';
+      if (res.applied) {
+        rt.meta.appliedIdbHashes = rt.meta.appliedIdbHashes ?? {};
+        rt.meta.appliedIdbHashes[rec.logicalId] = `${rec.dbVersion ?? 0}:${rec.encodedValue}`;
+      }
+      await this.persistRuntime(rt);
+      return { ...rec };
+    });
+  }
+
+  async deleteIndexedDbRecords(logicalIds: string[], scope: DeleteScope): Promise<void> {
+    await this.ensureInitialized();
+    return this.enqueueOp(async () => {
+      const rt = this.requireUnlockedRuntime();
+      let pushNeeded = false;
+
+      for (const lid of logicalIds) {
+        const rec = rt.indexedDb[lid];
+        if (!rec) continue;
+        const isActiveTrack =
+          rt.meta.localDevice.siteBindings[rec.siteKey]?.trackId === rec.trackId;
+
+        if (scope === 'local_only') {
+          if (isActiveTrack && this.browser.applyIndexedDbMutations) {
+            await this.browser.applyIndexedDbMutations(rec.origin, [
+              {
+                dbName: rec.dbName,
+                dbVersion: rec.dbVersion,
+                storeName: rec.storeName,
+                keyPath: rec.keyPath,
+                autoIncrement: rec.autoIncrement,
+                encodedKey: rec.encodedKey,
+                deleted: true,
+              },
+            ]);
+          }
+          rec.syncStatus = 'REMOTE_ONLY';
+          continue;
+        }
+
+        if (scope === 'remote_track_only') {
+          await this.emitLocalIndexedDbDelete(rt, rec, 'user_delete', 'remote_track_only');
+          pushNeeded = true;
+          continue;
+        }
+
+        if (scope === 'all_devices') {
+          if (isActiveTrack && this.browser.applyIndexedDbMutations) {
+            await this.browser.applyIndexedDbMutations(rec.origin, [
+              {
+                dbName: rec.dbName,
+                dbVersion: rec.dbVersion,
+                storeName: rec.storeName,
+                keyPath: rec.keyPath,
+                autoIncrement: rec.autoIncrement,
+                encodedKey: rec.encodedKey,
+                deleted: true,
+              },
+            ]);
+          }
+          await this.emitLocalIndexedDbDelete(rt, rec, 'user_delete', 'all_devices');
+          pushNeeded = true;
+        }
+      }
+
+      await this.persistRuntime(rt);
+      if (pushNeeded && rt.meta.space.settings.autoSync) {
+        await this.tryPushOutboundBestEffort(rt, 'delete_indexeddb');
+        rt.meta.space.status = this.computeStatus(rt);
+        await this.persistRuntime(rt);
+      }
+    });
+  }
+
+  // =========================================================================
   // Multi-Track Decisions, Clean Track Switch & Safety Undo
   // =========================================================================
 
@@ -6121,7 +8907,9 @@ export class SyncEngine {
     if (!rt) return [];
     return Object.values(rt.pendingDecisions).map((d) => ({
       ...d,
-      remoteTracks: Object.values(rt.tracks).filter((t) => t.siteKey === d.siteKey),
+      remoteTracks: Object.values(rt.tracks).filter(
+        (t) => t.siteKey === d.siteKey && !t.ephemeral?.localOnly,
+      ),
     }));
   }
 
@@ -6137,9 +8925,17 @@ export class SyncEngine {
     );
 
     const localStorageByOrigin: Record<string, Record<string, string>> = {};
+    const sessionStorageByOrigin: Record<string, Record<string, string>> = {};
+    const indexedDbRecords: IndexedDbRecord[] = [];
     const candidateOrigins = new Set<string>();
     for (const lsRec of Object.values(rt.localStorage)) {
       if (lsRec.siteKey === siteKey) candidateOrigins.add(lsRec.origin);
+    }
+    for (const ssRec of Object.values(rt.sessionStorage)) {
+      if (ssRec.siteKey === siteKey) candidateOrigins.add(ssRec.origin);
+    }
+    for (const idbRec of Object.values(rt.indexedDb)) {
+      if (idbRec.siteKey === siteKey) candidateOrigins.add(idbRec.origin);
     }
     try {
       const tabs = await this.browser.queryTabs();
@@ -6154,10 +8950,25 @@ export class SyncEngine {
       // ignore
     }
 
+    const activeTrackId = rt.meta.localDevice.siteBindings[siteKey]?.trackId;
+    if (activeTrackId) {
+      for (const rec of Object.values(rt.indexedDb)) {
+        if (rec.trackId === activeTrackId && !rec.deleted) {
+          indexedDbRecords.push({ ...rec });
+        }
+      }
+    }
+
     for (const origin of candidateOrigins) {
       const ls = await this.browser.getLocalStorage(origin);
       if (ls.available) {
         localStorageByOrigin[origin] = { ...ls.items };
+      }
+      if (this.browser.getSessionStorage) {
+        const ss = await this.browser.getSessionStorage(origin);
+        if (ss.available) {
+          sessionStorageByOrigin[origin] = { ...ss.items };
+        }
       }
     }
 
@@ -6174,6 +8985,9 @@ export class SyncEngine {
       previousBinding: prevBinding,
       cookies: siteCookies,
       localStorageByOrigin,
+      sessionStorageByOrigin:
+        Object.keys(sessionStorageByOrigin).length > 0 ? sessionStorageByOrigin : undefined,
+      indexedDbRecords: indexedDbRecords.length > 0 ? indexedDbRecords : undefined,
     };
 
     rt.undoPoints.unshift(point);
@@ -6203,7 +9017,9 @@ export class SyncEngine {
     const nowMs = this.now();
     const effectivePolicy = this.getEffectivePolicyForDevice(rt, siteKey, siteKey);
 
-    const remoteTracks = Object.values(rt.tracks).filter((t) => t.siteKey === siteKey);
+    const remoteTracks = Object.values(rt.tracks).filter(
+      (t) => t.siteKey === siteKey && !t.ephemeral?.localOnly,
+    );
     const allLocalCookies = await this.browser.getAllCookies();
     const localSiteCookies = allLocalCookies.filter(
       (c) =>
@@ -6501,6 +9317,35 @@ export class SyncEngine {
         detectDeletes: true,
       });
       if (lsMutated) mutated = true;
+    }
+
+    try {
+      const tabs = await this.browser.queryTabs();
+      const origins = new Set<string>();
+      for (const tab of tabs) {
+        const origin = tab.url ? normalizeOriginSafe(tab.url) : null;
+        if (origin && resolveSiteKey(origin, rt.meta.rules.ssoGroups) === siteKey) {
+          origins.add(origin);
+        }
+      }
+      for (const origin of origins) {
+        const originPolicy = this.getEffectivePolicyForDevice(rt, origin, siteKey);
+        if (originPolicy.excluded || originPolicy.direction === 'disabled') continue;
+        if (originPolicy.syncSessionStorage) {
+          const ssMutated = await this.reconcileOpenTabSessionStorage(rt, origin, {
+            detectDeletes: true,
+          });
+          if (ssMutated) mutated = true;
+        }
+        if (originPolicy.syncIndexedDb) {
+          const idbMutated = await this.captureOriginIndexedDbInternal(rt, origin, {
+            detectDeletes: true,
+          });
+          if (idbMutated) mutated = true;
+        }
+      }
+    } catch {
+      // ignore tab query errors
     }
 
     return mutated;
@@ -6962,15 +9807,22 @@ export class SyncEngine {
         const newTrackId = randomId('trk');
         if (rt.meta.removedTracks) delete rt.meta.removedTracks[newTrackId];
 
+        const trackColor = sanitizeTrackColor(options.color);
+        const trackBadgeText = sanitizeTrackBadgeText(options.badgeText);
+
         const newTrack: SiteTrack = {
           trackId: newTrackId,
           siteKey: normSiteKey,
           label: sanitizeShortLabel(options.label) || `账号 ${existingSorted.length + 1}`,
           accountNote: sanitizeShortLabel(options.accountNote, 160) || undefined,
+          color: trackColor,
+          badgeText: trackBadgeText,
           originDeviceId: rt.meta.localDevice.deviceId,
           originDeviceName: rt.meta.localDevice.name,
           cookieCount: 0,
           localStorageCount: 0,
+          sessionStorageCount: 0,
+          indexedDbCount: 0,
           updatedAt: nowMs,
           sortOrder: nextOrder,
           lastUsedAt: nowMs,
@@ -7049,15 +9901,22 @@ export class SyncEngine {
       const newTrackId = randomId('trk');
       if (rt.meta.removedTracks) delete rt.meta.removedTracks[newTrackId];
 
+      const trackColor = sanitizeTrackColor(options.color);
+      const trackBadgeText = sanitizeTrackBadgeText(options.badgeText);
+
       const newTrack: SiteTrack = {
         trackId: newTrackId,
         siteKey: normSiteKey,
         label: sanitizeShortLabel(options.label) || `账号 ${existingSorted.length + 1}`,
         accountNote: sanitizeShortLabel(options.accountNote, 160) || undefined,
+        color: trackColor,
+        badgeText: trackBadgeText,
         originDeviceId: rt.meta.localDevice.deviceId,
         originDeviceName: rt.meta.localDevice.name,
         cookieCount: localSiteCookies.length,
         localStorageCount: 0,
+        sessionStorageCount: 0,
+        indexedDbCount: 0,
         updatedAt: nowMs,
         sortOrder: nextOrder,
         lastUsedAt: nowMs,
@@ -7146,6 +10005,7 @@ export class SyncEngine {
           total: 1,
           appliedCookies: 0,
           failedCookies: 0,
+          reloadedTabs: 0,
         };
       }
 
@@ -7234,8 +10094,90 @@ export class SyncEngine {
         total: sorted.length,
         appliedCookies: applyRes.appliedCookies,
         failedCookies: applyRes.failedCookies,
+        reloadedTabs: reloaded,
       };
     });
+  }
+
+  private purgeTrackRecordsLocally(rt: LoadedSpaceRuntime, trackId: string): void {
+    for (const [lid, rec] of Object.entries(rt.cookies)) {
+      if (rec.trackId === trackId) {
+        delete rt.cookies[lid];
+        delete rt.meta.appliedCookieHashes[lid];
+      }
+    }
+    for (const [lid, rec] of Object.entries(rt.localStorage)) {
+      if (rec.trackId === trackId) {
+        delete rt.localStorage[lid];
+        delete rt.meta.appliedLsHashes[lid];
+      }
+    }
+    for (const [lid, rec] of Object.entries(rt.sessionStorage)) {
+      if (rec.trackId === trackId) {
+        delete rt.sessionStorage[lid];
+        if (rt.meta.appliedSsHashes) delete rt.meta.appliedSsHashes[lid];
+      }
+    }
+    for (const [lid, rec] of Object.entries(rt.indexedDb)) {
+      if (rec.trackId === trackId) {
+        delete rt.indexedDb[lid];
+        if (rt.meta.appliedIdbHashes) delete rt.meta.appliedIdbHashes[lid];
+      }
+    }
+    for (const [lid, tomb] of Object.entries(rt.tombstones)) {
+      if (tomb.trackId === trackId) delete rt.tombstones[lid];
+    }
+    rt.pendingOutboundEvents = rt.pendingOutboundEvents.filter((ev) => ev.trackId !== trackId);
+  }
+
+  private async wipeBrowserStateForSite(
+    rt: LoadedSpaceRuntime,
+    siteKey: string,
+    nowMs: number,
+  ): Promise<void> {
+    this.changeDetector.discardWhere((c) =>
+      domainMatchesSiteKey(c.domain, siteKey, rt.meta.rules.ssoGroups),
+    );
+    this.postTrackSwitchLeaveMuteUntil.set(siteKey, this.now() + 2_500);
+    const jar = await this.browser.getAllCookies();
+    for (const bc of jar) {
+      if (!domainMatchesSiteKey(bc.domain, siteKey, rt.meta.rules.ssoGroups)) continue;
+      if (rt.meta.space.settings.filterAnalyticsNoiseCookies && isAnalyticsNoiseCookie(bc.name)) {
+        continue;
+      }
+      try {
+        await this.removeExactBrowserCookie(bc, cookieContentCanonicalHash(bc), nowMs);
+      } catch {
+        // ignore missing cookie
+      }
+    }
+    try {
+      const tabs = await this.browser.queryTabs();
+      for (const tab of tabs) {
+        const origin = tab.url ? normalizeOriginSafe(tab.url) : null;
+        if (!origin || resolveSiteKey(origin, rt.meta.rules.ssoGroups) !== siteKey) continue;
+        const ls = await this.browser.getLocalStorage(origin);
+        if (ls.available) {
+          const muts = Object.keys(ls.items).map((key) => {
+            this.echoSuppressor.registerLocalStorageMutation(origin, key, 'remove', '', nowMs);
+            return { key, deleted: true };
+          });
+          if (muts.length > 0) await this.browser.applyLocalStorage(origin, muts);
+        }
+        if (this.browser.getSessionStorage && this.browser.applySessionStorage) {
+          const ss = await this.browser.getSessionStorage(origin);
+          if (ss.available) {
+            const muts = Object.keys(ss.items).map((key) => {
+              this.echoSuppressor.registerLocalStorageMutation(`__ss__${origin}`, key, 'remove', '', nowMs);
+              return { key, deleted: true };
+            });
+            if (muts.length > 0) await this.browser.applySessionStorage(origin, muts);
+          }
+        }
+      }
+    } catch {
+      // ignore tab cleanup error
+    }
   }
 
   async deleteSiteTrack(
@@ -7254,22 +10196,38 @@ export class SyncEngine {
       }
 
       const nowMs = this.now();
+      const wasLocalOnly = Boolean(track.ephemeral?.localOnly);
 
-      // Emit tombstones for live records belonging to this deleted account track
-      for (const rec of Object.values(rt.cookies)) {
-        if (rec.trackId === trackId && !rec.deleted) {
-          await this.emitLocalCookieDelete(rt, rec, 'user_delete', 'all_devices');
+      if (wasLocalOnly) {
+        this.purgeTrackRecordsLocally(rt, trackId);
+        delete rt.tracks[trackId];
+      } else {
+        // Emit tombstones for live records belonging to this deleted account track
+        for (const rec of Object.values(rt.cookies)) {
+          if (rec.trackId === trackId && !rec.deleted) {
+            await this.emitLocalCookieDelete(rt, rec, 'user_delete', 'all_devices');
+          }
         }
-      }
-      for (const rec of Object.values(rt.localStorage)) {
-        if (rec.trackId === trackId && !rec.deleted) {
-          await this.emitLocalStorageDelete(rt, rec, 'user_delete', 'all_devices');
+        for (const rec of Object.values(rt.localStorage)) {
+          if (rec.trackId === trackId && !rec.deleted) {
+            await this.emitLocalStorageDelete(rt, rec, 'user_delete', 'all_devices');
+          }
         }
-      }
+        for (const rec of Object.values(rt.sessionStorage)) {
+          if (rec.trackId === trackId && !rec.deleted) {
+            await this.emitLocalSessionStorageDelete(rt, rec, 'user_delete', 'all_devices');
+          }
+        }
+        for (const rec of Object.values(rt.indexedDb)) {
+          if (rec.trackId === trackId && !rec.deleted) {
+            await this.emitLocalIndexedDbDelete(rt, rec, 'user_delete', 'all_devices');
+          }
+        }
 
-      rt.meta.removedTracks = rt.meta.removedTracks ?? {};
-      rt.meta.removedTracks[trackId] = Math.max(nowMs, track.updatedAt + 1);
-      delete rt.tracks[trackId];
+        rt.meta.removedTracks = rt.meta.removedTracks ?? {};
+        rt.meta.removedTracks[trackId] = Math.max(nowMs, track.updatedAt + 1);
+        delete rt.tracks[trackId];
+      }
 
       // Clear dangling sourceTrackId references on envSyncRules
       for (const rule of rt.meta.rules.envSyncRules ?? []) {
@@ -7290,7 +10248,9 @@ export class SyncEngine {
 
       const curBinding = rt.meta.localDevice.siteBindings[normSiteKey];
       if (curBinding?.trackId === trackId) {
-        await this.captureSafetyUndoPoint(rt, normSiteKey, `delete_track:${trackId}`);
+        if (!wasLocalOnly) {
+          await this.captureSafetyUndoPoint(rt, normSiteKey, `delete_track:${trackId}`);
+        }
         if (remaining.length > 0) {
           const nextTrack = remaining[0];
           if (!nextTrack.memberDeviceIds.includes(rt.meta.localDevice.deviceId)) {
@@ -7328,6 +10288,9 @@ export class SyncEngine {
           }
           switchedToTrack = { ...nextTrack };
         } else {
+          if (wasLocalOnly) {
+            await this.wipeBrowserStateForSite(rt, normSiteKey, nowMs);
+          }
           rt.meta.localDevice.siteBindings[normSiteKey] = {
             siteKey: normSiteKey,
             state: 'UNMANAGED',
@@ -7341,8 +10304,10 @@ export class SyncEngine {
         curBinding.availableTrackIds = remaining.map((t) => t.trackId);
       }
 
-      await this.tryPushOutboundBestEffort(rt, 'delete_track_push');
-      await this.uploadDeviceManifestIfOnline(rt);
+      if (!wasLocalOnly) {
+        await this.tryPushOutboundBestEffort(rt, 'delete_track_push');
+        await this.uploadDeviceManifestIfOnline(rt);
+      }
       if (switchedToTrack) {
         await this.runAutoEnvSyncForSourceSites(rt, [normSiteKey]);
       }
@@ -7381,6 +10346,20 @@ export class SyncEngine {
         track.accountNote = cleanedNote || undefined;
       }
 
+      if (patch.color !== undefined) {
+        track.color =
+          patch.color === null || patch.color.trim() === ''
+            ? undefined
+            : sanitizeTrackColor(patch.color);
+      }
+
+      if (patch.badgeText !== undefined) {
+        track.badgeText =
+          patch.badgeText === null || patch.badgeText.trim() === ''
+            ? undefined
+            : sanitizeTrackBadgeText(patch.badgeText);
+      }
+
       if (patch.sortOrder !== undefined && Number.isFinite(patch.sortOrder)) {
         track.sortOrder = Math.max(1, Math.floor(patch.sortOrder));
       }
@@ -7388,7 +10367,9 @@ export class SyncEngine {
       track.updatedAt = this.now();
       track.revision = (track.revision ?? 0) + 1;
 
-      await this.uploadDeviceManifestIfOnline(rt);
+      if (!track.ephemeral?.localOnly) {
+        await this.uploadDeviceManifestIfOnline(rt);
+      }
       await this.persistRuntime(rt);
       return { ...track };
     });
@@ -7454,6 +10435,7 @@ export class SyncEngine {
       spaceId: s.spaceId,
       name: s.name,
       status: s.status,
+      provider: s.storage?.provider ?? (s.webdav ? ('webdav' as const) : undefined),
     }));
 
     const rt = this.runtime;
@@ -7469,9 +10451,34 @@ export class SyncEngine {
         pendingDecisionsCount: 0,
         unresolvedConflictsCount: 0,
         undoPointsCount: 0,
+        expiringSitesCount: 0,
         latestError: null,
         attentionItems: [],
       };
+    }
+
+    if (
+      rt.storage.provider === 'local_directory' &&
+      this.storageAdapterOptions?.resolveDirectoryHandle
+    ) {
+      try {
+        const handle = await this.storageAdapterOptions.resolveDirectoryHandle(rt.storage.handleKey);
+        if (!handle) {
+          this.localDirPermissionNeededBySpace.set(rt.spaceId, true);
+        } else if (typeof handle.queryPermission === 'function') {
+          const perm = await handle.queryPermission({ mode: 'readwrite' });
+          if (perm !== 'granted') {
+            this.localDirPermissionNeededBySpace.set(rt.spaceId, true);
+          } else if (
+            rt.meta.latestError?.code !== 'ERR_LOCAL_DIR_PERMISSION' &&
+            rt.meta.latestError?.code !== 'ERR_LOCAL_DIR_MISSING'
+          ) {
+            this.localDirPermissionNeededBySpace.delete(rt.spaceId);
+          }
+        }
+      } catch {
+        this.localDirPermissionNeededBySpace.set(rt.spaceId, true);
+      }
     }
 
     const locked = !rt.dekKeyring[rt.meta.space.keyEpoch];
@@ -7489,7 +10496,28 @@ export class SyncEngine {
           !l.deleted &&
           pullBoundTrackIds.has(l.trackId) &&
           (l.syncStatus === 'REMOTE_NEWER' || l.contextAvailable === false),
+      ).length +
+      Object.values(rt.sessionStorage).filter(
+        (s) =>
+          !s.deleted &&
+          pullBoundTrackIds.has(s.trackId) &&
+          (s.syncStatus === 'REMOTE_NEWER' || s.contextAvailable === false),
+      ).length +
+      Object.values(rt.indexedDb).filter(
+        (d) =>
+          !d.deleted &&
+          pullBoundTrackIds.has(d.trackId) &&
+          (d.syncStatus === 'REMOTE_NEWER' || d.contextAvailable === false),
       ).length;
+
+    let expiringSitesCount = 0;
+    if (!locked) {
+      const expiryMap = this.evaluateSiteExpiryMap(rt, this.now());
+      for (const h of expiryMap.values()) {
+        if (h.status !== 'healthy') expiringSitesCount += 1;
+      }
+    }
+
     const attentionItems =
       locked && status !== 'DECRYPT_ERROR' ? [] : this.buildAttentionItems(rt, status);
 
@@ -7501,8 +10529,14 @@ export class SyncEngine {
       spaces,
       device: { ...rt.meta.localDevice },
       status,
-      webdavConnected: this.isOnline() && status !== 'AUTH_ERROR' && status !== 'OFFLINE',
-      webdavUrl: rt.webdav.url,
+      storageProvider: rt.storage.provider,
+      storageEndpoint: rt.client.displayEndpoint,
+      webdavConnected:
+        this.isOnline() &&
+        status !== 'AUTH_ERROR' &&
+        status !== 'OFFLINE' &&
+        !this.localDirPermissionNeededBySpace.get(rt.spaceId),
+      webdavUrl: rt.webdav?.url ?? rt.client.displayEndpoint,
       consistencyLevel: this.spaceIndex[rt.spaceId]?.consistencyLevel,
       lastSyncAt: rt.meta.lastSyncAt,
       lastLatencyMs: rt.meta.lastLatencyMs,
@@ -7511,14 +10545,27 @@ export class SyncEngine {
       pendingDecisionsCount: Object.keys(rt.pendingDecisions).length,
       unresolvedConflictsCount: Object.values(rt.conflicts).filter((c) => !c.resolved).length,
       undoPointsCount: rt.undoPoints.length,
+      expiringSitesCount,
       latestError: rt.meta.latestError ?? null,
       attentionItems,
     };
   }
 
-  async getWebDAVConfig(): Promise<WebDAVConfig | null> {
+  async getStorageConfig(): Promise<StorageProviderConfig | null> {
     await this.ensureInitialized();
     if (!this.runtime) return null;
+    return { ...this.runtime.storage };
+  }
+
+  async getSanitizedStorageConfig(): Promise<SanitizedStorageProviderConfig | null> {
+    await this.ensureInitialized();
+    if (!this.runtime) return null;
+    return sanitizeStorageProviderConfig(this.runtime.storage) ?? null;
+  }
+
+  async getWebDAVConfig(): Promise<WebDAVConfig | null> {
+    await this.ensureInitialized();
+    if (!this.runtime?.webdav) return null;
     return { ...this.runtime.webdav };
   }
 
@@ -7542,6 +10589,7 @@ export class SyncEngine {
     if (!rt) return [];
 
     const nowMs = this.now();
+    const expiryMap = this.evaluateSiteExpiryMap(rt, nowMs);
     const isManagedOnly = rt.meta.space.settings.syncScopeMode === 'managed_only';
     const siteKeys = new Set<string>();
     for (const sk of Object.keys(rt.meta.localDevice.siteBindings)) siteKeys.add(sk);
@@ -7581,9 +10629,24 @@ export class SyncEngine {
             (l) => l.trackId === activeTrack.trackId && !l.deleted,
           )
         : Object.values(rt.localStorage).filter((l) => l.siteKey === siteKey && !l.deleted);
+      const activeSs = activeTrack
+        ? Object.values(rt.sessionStorage).filter(
+            (s) => s.trackId === activeTrack.trackId && !s.deleted,
+          )
+        : Object.values(rt.sessionStorage).filter((s) => s.siteKey === siteKey && !s.deleted);
+      const activeIdb = activeTrack
+        ? Object.values(rt.indexedDb).filter(
+            (d) => d.trackId === activeTrack.trackId && !d.deleted,
+          )
+        : Object.values(rt.indexedDb).filter((d) => d.siteKey === siteKey && !d.deleted);
 
-      let latestRec: (CookieRecord | LocalStorageRecord) | undefined;
-      for (const r of [...activeCookies, ...activeLs]) {
+      let latestRec:
+        | CookieRecord
+        | LocalStorageRecord
+        | SessionStorageRecord
+        | IndexedDbRecord
+        | undefined;
+      for (const r of [...activeCookies, ...activeLs, ...activeSs, ...activeIdb]) {
         if (!latestRec || r.updatedAt > latestRec.updatedAt) {
           latestRec = r;
         }
@@ -7593,8 +10656,21 @@ export class SyncEngine {
       if (binding.state === 'BLACKLISTED') syncStatus = 'EXCLUDED';
       else if (binding.state === 'PENDING_CHOICE') syncStatus = 'PENDING_CHOICE';
       else if (activeCookies.some((c) => c.syncStatus === 'APPLY_FAILED')) syncStatus = 'APPLY_FAILED';
-      else if (activeCookies.some((c) => c.syncStatus === 'LOCAL_NEWER')) syncStatus = 'LOCAL_NEWER';
-      else if (activeCookies.some((c) => c.syncStatus === 'REMOTE_NEWER')) syncStatus = 'REMOTE_NEWER';
+      else if (
+        activeCookies.some((c) => c.syncStatus === 'LOCAL_NEWER') ||
+        activeLs.some((l) => l.syncStatus === 'LOCAL_NEWER') ||
+        activeSs.some((s) => s.syncStatus === 'LOCAL_NEWER') ||
+        activeIdb.some((d) => d.syncStatus === 'LOCAL_NEWER')
+      ) {
+        syncStatus = 'LOCAL_NEWER';
+      } else if (
+        activeCookies.some((c) => c.syncStatus === 'REMOTE_NEWER') ||
+        activeLs.some((l) => l.syncStatus === 'REMOTE_NEWER') ||
+        activeSs.some((s) => s.syncStatus === 'REMOTE_NEWER') ||
+        activeIdb.some((d) => d.syncStatus === 'REMOTE_NEWER')
+      ) {
+        syncStatus = 'REMOTE_NEWER';
+      }
 
       summaries.push({
         siteKey,
@@ -7603,11 +10679,14 @@ export class SyncEngine {
         allTracks,
         cookieCount: activeCookies.length,
         localStorageCount: activeLs.length,
+        sessionStorageCount: activeSs.length,
+        indexedDbCount: activeIdb.length,
         latestVersionId: latestRec?.version.versionId,
         sourceDeviceName: latestRec?.sourceDeviceName,
         updatedAt: latestRec?.updatedAt ?? activeTrack?.updatedAt,
         syncStatus,
         rollingTokenDamped: this.rollingTokenDamper.isSiteDamped(siteKey, nowMs),
+        expiryHealth: expiryMap.get(siteKey),
       });
     }
 
@@ -7790,7 +10869,9 @@ export class SyncEngine {
           }
         }
 
-        const remoteTracks = Object.values(rt.tracks).filter((t) => t.siteKey === siteKey);
+        const remoteTracks = Object.values(rt.tracks).filter(
+          (t) => t.siteKey === siteKey && !t.ephemeral?.localOnly,
+        );
         const existingBinding = rt.meta.localDevice.siteBindings[siteKey];
 
         const decision = evaluateSiteDiscovery({
@@ -8006,22 +11087,48 @@ export class SyncEngine {
         return;
       }
 
-      // scope === 'space_remove': emit all_devices tombstones for remote cookies & LS, drop tracks, unmanage locally
+      // scope === 'space_remove': emit all_devices tombstones for remote cookies/LS/SS/IDB, drop tracks, unmanage locally
+      const localOnlyTrackIds = new Set<string>();
+      rt.meta.removedTracks = rt.meta.removedTracks ?? {};
+      for (const [tid, tr] of Object.entries(rt.tracks)) {
+        if (tr.siteKey === normSiteKey && tr.ephemeral?.localOnly) {
+          localOnlyTrackIds.add(tid);
+        }
+      }
+
       const siteCookies = Object.values(rt.cookies).filter(
-        (c) => c.siteKey === normSiteKey && !c.deleted,
+        (c) => c.siteKey === normSiteKey && !c.deleted && !localOnlyTrackIds.has(c.trackId),
       );
       for (const rec of siteCookies) {
         await this.emitLocalCookieDelete(rt, rec, 'user_delete', 'all_devices');
       }
 
       const siteLs = Object.values(rt.localStorage).filter(
-        (l) => l.siteKey === normSiteKey && !l.deleted,
+        (l) => l.siteKey === normSiteKey && !l.deleted && !localOnlyTrackIds.has(l.trackId),
       );
       for (const rec of siteLs) {
         await this.emitLocalStorageDelete(rt, rec, 'user_delete', 'all_devices');
       }
 
-      rt.meta.removedTracks = rt.meta.removedTracks ?? {};
+      const siteSs = Object.values(rt.sessionStorage).filter(
+        (s) => s.siteKey === normSiteKey && !s.deleted && !localOnlyTrackIds.has(s.trackId),
+      );
+      for (const rec of siteSs) {
+        await this.emitLocalSessionStorageDelete(rt, rec, 'user_delete', 'all_devices');
+      }
+
+      const siteIdb = Object.values(rt.indexedDb).filter(
+        (d) => d.siteKey === normSiteKey && !d.deleted && !localOnlyTrackIds.has(d.trackId),
+      );
+      for (const rec of siteIdb) {
+        await this.emitLocalIndexedDbDelete(rt, rec, 'user_delete', 'all_devices');
+      }
+
+      for (const tid of localOnlyTrackIds) {
+        this.purgeTrackRecordsLocally(rt, tid);
+        delete rt.tracks[tid];
+      }
+
       for (const [tid, tr] of Object.entries(rt.tracks)) {
         if (tr.siteKey === normSiteKey) {
           rt.meta.removedTracks[tid] = Math.max(nowMs, tr.updatedAt + 1);
@@ -8057,7 +11164,7 @@ export class SyncEngine {
   }): Promise<SpaceSettings> {
     await this.ensureInitialized();
     return this.enqueueOp(async () => {
-      const rt = this.requireRuntime();
+      const rt = this.requireUnlockedRuntime();
       const nextUpdatedAt = Math.max(this.now(), rt.meta.space.updatedAt + 1);
 
       rt.meta.space.settings = {
@@ -8067,7 +11174,7 @@ export class SyncEngine {
           params.authorityMode === 'primary_device' ? params.primaryDeviceId : undefined,
       };
       rt.meta.space.updatedAt = nextUpdatedAt;
-      rt.rulesEngine.update(rt.meta.space.settings, rt.meta.rules, rt.meta.deviceBlacklist);
+      this.syncRulesEngineState(rt);
 
       await this.updateRemoteSpaceMetaIfPossible(rt, (desc) => ({
         ...desc,
@@ -8091,7 +11198,7 @@ export class SyncEngine {
   async upsertDevicePolicy(policy: PerDeviceSyncPolicy): Promise<void> {
     await this.ensureInitialized();
     return this.enqueueOp(async () => {
-      const rt = this.requireRuntime();
+      const rt = this.requireUnlockedRuntime();
       const nowMs = this.now();
       const nextUpdatedAt = Math.max(nowMs, rt.meta.space.updatedAt + 1);
 
@@ -8125,7 +11232,7 @@ export class SyncEngine {
         },
       };
       rt.meta.space.updatedAt = nextUpdatedAt;
-      rt.rulesEngine.update(rt.meta.space.settings, rt.meta.rules, rt.meta.deviceBlacklist);
+      this.syncRulesEngineState(rt);
 
       await this.updateRemoteSpaceMetaIfPossible(rt, (desc) => ({
         ...desc,
@@ -8149,7 +11256,7 @@ export class SyncEngine {
   async removeDevicePolicy(deviceId: string): Promise<void> {
     await this.ensureInitialized();
     return this.enqueueOp(async () => {
-      const rt = this.requireRuntime();
+      const rt = this.requireUnlockedRuntime();
       const nextUpdatedAt = Math.max(this.now(), rt.meta.space.updatedAt + 1);
 
       const nextPolicies = { ...(rt.meta.space.settings.devicePolicies ?? {}) };
@@ -8160,7 +11267,7 @@ export class SyncEngine {
         devicePolicies: nextPolicies,
       };
       rt.meta.space.updatedAt = nextUpdatedAt;
-      rt.rulesEngine.update(rt.meta.space.settings, rt.meta.rules, rt.meta.deviceBlacklist);
+      this.syncRulesEngineState(rt);
 
       await this.updateRemoteSpaceMetaIfPossible(rt, (desc) => ({
         ...desc,
@@ -8219,6 +11326,7 @@ export class SyncEngine {
         rt.meta.latestError = null;
         rt.meta.consecutiveTransientFailures = 0;
         rt.meta.storageFullHalted = false;
+        this.localDirPermissionNeededBySpace.delete(rt.spaceId);
         if (rt.meta.space.status === 'AUTH_ERROR') {
           rt.meta.space.status = 'SYNCED';
         }
@@ -8229,6 +11337,21 @@ export class SyncEngine {
         rt.meta.dismissedCorruptedPaths = rt.meta.dismissedCorruptedPaths ?? {};
         for (const p of rt.meta.corruptedPaths) {
           rt.meta.dismissedCorruptedPaths[p] = true;
+        }
+        rt.meta.dismissedQuotaOrigins = rt.meta.dismissedQuotaOrigins ?? {};
+        for (const [origin, qInfo] of Object.entries(rt.meta.quotaExceededOrigins ?? {})) {
+          rt.meta.dismissedQuotaOrigins[origin] = qInfo.detectedAt;
+        }
+        rt.meta.dismissedExpiryAlerts = rt.meta.dismissedExpiryAlerts ?? {};
+        const expiryMap = this.evaluateSiteExpiryMap(rt, this.now());
+        for (const [siteKey, health] of expiryMap.entries()) {
+          if (health.status !== 'healthy') {
+            rt.meta.dismissedExpiryAlerts[siteKey] = health.status;
+          }
+        }
+        rt.meta.dismissedEphemeralExpiredAlerts = rt.meta.dismissedEphemeralExpiredAlerts ?? {};
+        for (const notif of rt.meta.expiredEphemeralNotifications ?? []) {
+          rt.meta.dismissedEphemeralExpiredAlerts[notif.id] = true;
         }
         for (const t of rt.retryTasks) {
           if (t.status === 'RETRYING' || t.status === 'FAILED') {
@@ -8248,6 +11371,14 @@ export class SyncEngine {
         }
         if (rt.meta.space.status === 'AUTH_ERROR') {
           rt.meta.space.status = 'SYNCED';
+        }
+      } else if (itemId === 'local_dir_permission_needed') {
+        this.localDirPermissionNeededBySpace.delete(rt.spaceId);
+        if (
+          rt.meta.latestError?.code === 'ERR_LOCAL_DIR_PERMISSION' ||
+          rt.meta.latestError?.code === 'ERR_LOCAL_DIR_MISSING'
+        ) {
+          rt.meta.latestError = null;
         }
       } else if (itemId === 'storage_full') {
         rt.meta.storageFullHalted = false;
@@ -8272,10 +11403,85 @@ export class SyncEngine {
             rt.meta.dismissedApplyFailures[c.logicalId] = cookieContentCanonicalHash(c);
           }
         }
+      } else if (itemId.startsWith('quota:')) {
+        const origin = itemId.slice('quota:'.length);
+        rt.meta.dismissedQuotaOrigins = rt.meta.dismissedQuotaOrigins ?? {};
+        rt.meta.dismissedQuotaOrigins[origin] =
+          rt.meta.quotaExceededOrigins?.[origin]?.detectedAt ?? this.now();
+      } else if (itemId.startsWith('expiry:')) {
+        const targetSiteKey = itemId.slice('expiry:'.length);
+        const health = this.evaluateSiteExpiryMap(rt, this.now()).get(targetSiteKey);
+        rt.meta.dismissedExpiryAlerts = rt.meta.dismissedExpiryAlerts ?? {};
+        rt.meta.dismissedExpiryAlerts[targetSiteKey] = health?.status ?? 'expiring_soon';
+      } else if (itemId.startsWith('ephemeral_expired:')) {
+        const notifId = itemId.slice('ephemeral_expired:'.length);
+        rt.meta.dismissedEphemeralExpiredAlerts = rt.meta.dismissedEphemeralExpiredAlerts ?? {};
+        rt.meta.dismissedEphemeralExpiredAlerts[notifId] = true;
       }
 
       rt.meta.space.status = this.computeStatus(rt);
       await this.persistRuntime(rt);
+    });
+  }
+
+  async toggleWatchedCookie(
+    siteKey: string,
+    cookieName: string,
+    watched: boolean,
+  ): Promise<string[]> {
+    await this.ensureInitialized();
+    const cleanName = cookieName.trim();
+    if (!cleanName) {
+      throw new Error('Cookie name cannot be empty');
+    }
+
+    return this.enqueueOp(async () => {
+      const rt = this.requireRuntime();
+      const nowMs = this.now();
+      const normSiteKey =
+        resolveSiteKey(siteKey, rt.meta.rules.ssoGroups) || normalizeDomain(siteKey) || siteKey;
+
+      const existing = rt.meta.rules.siteOverrides[normSiteKey];
+      const currentList = existing?.watchedCookieNames ?? [];
+      const filtered = currentList.filter(
+        (n) => n.trim().toLowerCase() !== cleanName.toLowerCase(),
+      );
+      if (watched) {
+        filtered.push(cleanName);
+      }
+
+      const nextOverride: SiteRuleOverride = existing
+        ? {
+            ...existing,
+            watchedCookieNames: filtered.length > 0 ? filtered : undefined,
+            updatedAt: nowMs,
+          }
+        : {
+            siteKey: normSiteKey,
+            pattern: normSiteKey,
+            direction: 'inherit',
+            syncCookies: rt.meta.space.settings.syncCookies,
+            syncLocalStorage: rt.meta.space.settings.syncLocalStorage,
+            watchedCookieNames: filtered.length > 0 ? filtered : undefined,
+            autoRefresh: rt.meta.space.settings.autoRefresh,
+            updatedAt: nowMs,
+          };
+
+      rt.meta.rules.siteOverrides[normSiteKey] = nextOverride;
+      rt.meta.rules.updatedAt = nowMs;
+      if (watched && rt.meta.dismissedExpiryAlerts?.[normSiteKey]) {
+        delete rt.meta.dismissedExpiryAlerts[normSiteKey];
+      }
+      this.syncRulesEngineState(rt);
+
+      await this.updateRemoteSpaceMetaIfPossible(rt, (desc) => ({
+        ...desc,
+        rules: rt.meta.rules,
+        updatedAt: nowMs,
+      }));
+      await this.uploadDeviceManifestIfOnline(rt);
+      await this.persistRuntime(rt);
+      return [...(nextOverride.watchedCookieNames ?? [])];
     });
   }
 
@@ -8345,7 +11551,7 @@ export class SyncEngine {
   ): Promise<CookieRecord> {
     await this.ensureInitialized();
     return this.enqueueOp(async () => {
-      const rt = this.requireRuntime();
+      const rt = this.requireUnlockedRuntime();
       const emitted = await this.upsertCookieInternal(rt, siteKey, cookie, trackId);
 
       rt.meta.space.status = this.computeStatus(rt);
@@ -8369,56 +11575,12 @@ export class SyncEngine {
     const nowMs = this.now();
     const effectiveSiteKey = siteKey || resolveSiteKey(cookie.domain, rt.meta.rules.ssoGroups);
 
-    const boundTrackId = rt.meta.localDevice.siteBindings[effectiveSiteKey]?.trackId;
-    let trackId: string | undefined;
-    if (explicitTrackId) {
-      const targetTrack = rt.tracks[explicitTrackId];
-      if (!targetTrack || targetTrack.siteKey !== effectiveSiteKey) {
-        throw new Error(`Track "${explicitTrackId}" not found for site "${effectiveSiteKey}"`);
-      }
-      trackId = explicitTrackId;
-    } else {
-      trackId = boundTrackId;
-    }
-
-    if (!trackId) {
-      const existingTracks = Object.values(rt.tracks).filter(
-        (t) => t.siteKey === effectiveSiteKey,
-      );
-      if (existingTracks.length === 1) {
-        trackId = existingTracks[0].trackId;
-        rt.meta.localDevice.siteBindings[effectiveSiteKey] = {
-          siteKey: effectiveSiteKey,
-          state: 'USER_BOUND',
-          trackId,
-          hasLocalBaseline: true,
-          decidedAt: nowMs,
-          decidedBy: 'user',
-        };
-      } else {
-        trackId = randomId('trk');
-        rt.tracks[trackId] = {
-          trackId,
-          siteKey: effectiveSiteKey,
-          label: `${rt.meta.localDevice.name} 的版本`,
-          originDeviceId: rt.meta.localDevice.deviceId,
-          originDeviceName: rt.meta.localDevice.name,
-          cookieCount: 0,
-          localStorageCount: 0,
-          updatedAt: nowMs,
-          memberDeviceIds: [rt.meta.localDevice.deviceId],
-          revision: 1,
-        };
-        rt.meta.localDevice.siteBindings[effectiveSiteKey] = {
-          siteKey: effectiveSiteKey,
-          state: 'USER_BOUND',
-          trackId,
-          hasLocalBaseline: true,
-          decidedAt: nowMs,
-          decidedBy: 'user',
-        };
-      }
-    }
+    const trackId = this.resolveOrCreateTrackIdForOriginWrite(
+      rt,
+      effectiveSiteKey,
+      explicitTrackId,
+      nowMs,
+    );
 
     const isActiveBoundTrack =
       !explicitTrackId ||
@@ -8486,7 +11648,7 @@ export class SyncEngine {
   async applyCookieToBrowser(logicalId: string): Promise<CookieRecord> {
     await this.ensureInitialized();
     return this.enqueueOp(async () => {
-      const rt = this.requireRuntime();
+      const rt = this.requireUnlockedRuntime();
       const rec = rt.cookies[logicalId];
       if (!rec) {
         throw new Error(`Cookie record not found: ${logicalId}`);
@@ -8523,7 +11685,7 @@ export class SyncEngine {
   ): Promise<void> {
     await this.ensureInitialized();
     return this.enqueueOp(async () => {
-      const rt = this.requireRuntime();
+      const rt = this.requireUnlockedRuntime();
       const nowMs = this.now();
       let pushedNeeded = false;
 
@@ -8574,7 +11736,7 @@ export class SyncEngine {
   ): Promise<number> {
     await this.ensureInitialized();
     return this.enqueueOp(async () => {
-      const rt = this.requireRuntime();
+      const rt = this.requireUnlockedRuntime();
       let count = 0;
       for (const c of cookies) {
         const targetSite = siteKey || resolveSiteKey(c.domain, rt.meta.rules.ssoGroups);
@@ -8664,50 +11826,16 @@ export class SyncEngine {
     if (!normOrigin) throw new Error(`Invalid origin: ${origin}`);
 
     return this.enqueueOp(async () => {
-      const rt = this.requireRuntime();
+      const rt = this.requireUnlockedRuntime();
       const nowMs = this.now();
       const siteKey = resolveSiteKey(normOrigin, rt.meta.rules.ssoGroups);
 
-      const boundTrackId = rt.meta.localDevice.siteBindings[siteKey]?.trackId;
-      let trackId: string | undefined;
-      if (explicitTrackId) {
-        const targetTrack = rt.tracks[explicitTrackId];
-        if (!targetTrack || targetTrack.siteKey !== siteKey) {
-          throw new Error(`Track "${explicitTrackId}" not found for site "${siteKey}"`);
-        }
-        trackId = explicitTrackId;
-      } else {
-        trackId = boundTrackId;
-      }
-
-      if (!trackId) {
-        const existingTracks = Object.values(rt.tracks).filter((t) => t.siteKey === siteKey);
-        if (existingTracks.length === 1) {
-          trackId = existingTracks[0].trackId;
-        } else {
-          trackId = randomId('trk');
-          rt.tracks[trackId] = {
-            trackId,
-            siteKey,
-            label: `${rt.meta.localDevice.name} 的版本`,
-            originDeviceId: rt.meta.localDevice.deviceId,
-            originDeviceName: rt.meta.localDevice.name,
-            cookieCount: 0,
-            localStorageCount: 0,
-            updatedAt: nowMs,
-            memberDeviceIds: [rt.meta.localDevice.deviceId],
-            revision: 1,
-          };
-        }
-        rt.meta.localDevice.siteBindings[siteKey] = {
-          siteKey,
-          state: 'USER_BOUND',
-          trackId,
-          hasLocalBaseline: true,
-          decidedAt: nowMs,
-          decidedBy: 'user',
-        };
-      }
+      const trackId = this.resolveOrCreateTrackIdForOriginWrite(
+        rt,
+        siteKey,
+        explicitTrackId,
+        nowMs,
+      );
 
       const isActiveBoundTrack =
         !explicitTrackId || rt.meta.localDevice.siteBindings[siteKey]?.trackId === trackId;
@@ -8724,6 +11852,9 @@ export class SyncEngine {
         rt.localStorage[buildLocalStorageLogicalId(trackId, normOrigin, key)];
 
       rec.contextAvailable = contextAvailable;
+      if (!contextAvailable) {
+        delete rt.meta.appliedLsHashes[rec.logicalId];
+      }
       await this.persistRuntime(rt);
 
       if (rt.meta.space.settings.autoSync) {
@@ -8738,7 +11869,7 @@ export class SyncEngine {
   async applyLocalStorageItem(logicalId: string): Promise<LocalStorageRecord> {
     await this.ensureInitialized();
     return this.enqueueOp(async () => {
-      const rt = this.requireRuntime();
+      const rt = this.requireUnlockedRuntime();
       const rec = rt.localStorage[logicalId];
       if (!rec) throw new Error(`LocalStorage record not found: ${logicalId}`);
 
@@ -8757,7 +11888,7 @@ export class SyncEngine {
   async deleteLocalStorageItems(logicalIds: string[], scope: DeleteScope): Promise<void> {
     await this.ensureInitialized();
     return this.enqueueOp(async () => {
-      const rt = this.requireRuntime();
+      const rt = this.requireUnlockedRuntime();
       const nowMs = this.now();
       let pushNeeded = false;
 
@@ -8856,7 +11987,7 @@ export class SyncEngine {
   async addBlacklistEntry(entry: Omit<BlacklistEntry, 'id' | 'createdAt'>): Promise<BlacklistEntry> {
     await this.ensureInitialized();
     return this.enqueueOp(async () => {
-      const rt = this.requireRuntime();
+      const rt = this.requireUnlockedRuntime();
       const created = await this.addBlacklistEntryInternal(rt, entry);
       await this.persistRuntime(rt);
       return created;
@@ -8881,7 +12012,7 @@ export class SyncEngine {
       rt.meta.deviceBlacklist.push(created);
     }
 
-    rt.rulesEngine.update(rt.meta.space.settings, rt.meta.rules, rt.meta.deviceBlacklist);
+    this.syncRulesEngineState(rt);
     this.reconcileBlacklistBindings(rt);
 
     if (entry.scope === 'space') {
@@ -8918,7 +12049,7 @@ export class SyncEngine {
   async removeBlacklistEntry(id: string, scope: 'space' | 'device'): Promise<void> {
     await this.ensureInitialized();
     return this.enqueueOp(async () => {
-      const rt = this.requireRuntime();
+      const rt = this.requireUnlockedRuntime();
       const nowMs = this.now();
 
       if (scope === 'space') {
@@ -8928,7 +12059,7 @@ export class SyncEngine {
         rt.meta.deviceBlacklist = rt.meta.deviceBlacklist.filter((b) => b.id !== id);
       }
 
-      rt.rulesEngine.update(rt.meta.space.settings, rt.meta.rules, rt.meta.deviceBlacklist);
+      this.syncRulesEngineState(rt);
 
       // Restore previously bound sites (or clear stale BLACKLISTED bindings) once no longer blacklisted
       for (const [siteKey, binding] of Object.entries(rt.meta.localDevice.siteBindings)) {
@@ -8960,11 +12091,11 @@ export class SyncEngine {
   async upsertSiteRule(rule: SiteRuleOverride): Promise<void> {
     await this.ensureInitialized();
     return this.enqueueOp(async () => {
-      const rt = this.requireRuntime();
+      const rt = this.requireUnlockedRuntime();
       const nowMs = this.now();
       rt.meta.rules.siteOverrides[rule.siteKey] = { ...rule, updatedAt: nowMs };
       rt.meta.rules.updatedAt = nowMs;
-      rt.rulesEngine.update(rt.meta.space.settings, rt.meta.rules, rt.meta.deviceBlacklist);
+      this.syncRulesEngineState(rt);
 
       await this.updateRemoteSpaceMetaIfPossible(rt, (desc) => ({
         ...desc,
@@ -8979,11 +12110,11 @@ export class SyncEngine {
   async removeSiteRule(siteKey: string): Promise<void> {
     await this.ensureInitialized();
     return this.enqueueOp(async () => {
-      const rt = this.requireRuntime();
+      const rt = this.requireUnlockedRuntime();
       const nowMs = this.now();
       delete rt.meta.rules.siteOverrides[siteKey];
       rt.meta.rules.updatedAt = nowMs;
-      rt.rulesEngine.update(rt.meta.space.settings, rt.meta.rules, rt.meta.deviceBlacklist);
+      this.syncRulesEngineState(rt);
 
       await this.updateRemoteSpaceMetaIfPossible(rt, (desc) => ({
         ...desc,
@@ -8998,7 +12129,7 @@ export class SyncEngine {
   async upsertSsoGroup(group: SsoDomainGroup): Promise<void> {
     await this.ensureInitialized();
     return this.enqueueOp(async () => {
-      const rt = this.requireRuntime();
+      const rt = this.requireUnlockedRuntime();
       const nowMs = this.now();
       const idx = rt.meta.rules.ssoGroups.findIndex((g) => g.groupId === group.groupId);
       if (idx >= 0) {
@@ -9007,7 +12138,7 @@ export class SyncEngine {
         rt.meta.rules.ssoGroups.push({ ...group });
       }
       rt.meta.rules.updatedAt = nowMs;
-      rt.rulesEngine.update(rt.meta.space.settings, rt.meta.rules, rt.meta.deviceBlacklist);
+      this.syncRulesEngineState(rt);
 
       await this.updateRemoteSpaceMetaIfPossible(rt, (desc) => ({
         ...desc,
@@ -9022,7 +12153,7 @@ export class SyncEngine {
   async removeSsoGroup(groupId: string): Promise<void> {
     await this.ensureInitialized();
     return this.enqueueOp(async () => {
-      const rt = this.requireRuntime();
+      const rt = this.requireUnlockedRuntime();
       const nowMs = this.now();
       rt.meta.rules.ssoGroups = rt.meta.rules.ssoGroups.filter((g) => g.groupId !== groupId);
       rt.meta.rules.updatedAt = nowMs;
@@ -9063,12 +12194,18 @@ export class SyncEngine {
 
       const syncCookies = input.syncCookies ?? true;
       const syncLocalStorage = input.syncLocalStorage ?? false;
-      if (!syncCookies && !syncLocalStorage) {
-        throw new Error('请至少开启 Cookie 或 LocalStorage 之一进行跨环境同步');
+      const syncSessionStorage = input.syncSessionStorage ?? false;
+      if (!syncCookies && !syncLocalStorage && !syncSessionStorage) {
+        throw new Error('请至少开启 Cookie、LocalStorage 或 SessionStorage 之一进行跨环境同步');
       }
 
-      if (isBlockedWebdavSelfTarget(rt.webdav.url, parsedTarget)) {
-        throw new Error('禁止将目标环境指向当前 WebDAV 存储服务器自身域名');
+      const selfUrl = getBlockedSelfUrlForStorage(rt.storage);
+      if (selfUrl && isBlockedWebdavSelfTarget(selfUrl, parsedTarget)) {
+        throw new Error(
+          rt.storage.provider === 'webdav'
+            ? '禁止将目标环境指向当前 WebDAV 存储服务器自身域名'
+            : '禁止将目标环境指向当前远程存储服务器自身域名',
+        );
       }
 
       const canonicalTargetUrl = parsedTarget.explicitWildcardDomain
@@ -9131,6 +12268,7 @@ export class SyncEngine {
         targetUrl: canonicalTargetUrl,
         syncCookies,
         syncLocalStorage,
+        syncSessionStorage,
         adaptForHttp: input.adaptForHttp ?? true,
         cleanTargetBeforeSync: input.cleanTargetBeforeSync ?? false,
         autoSync: input.autoSync ?? true,
@@ -9219,7 +12357,7 @@ export class SyncEngine {
   private async runAutoEnvSyncForSourceSites(
     rt: LoadedSpaceRuntime,
     sourceSites: Iterable<string>,
-    options?: { onlyWithLocalStorage?: boolean },
+    options?: { onlyWithLocalStorage?: boolean; onlyWithSessionStorage?: boolean },
   ): Promise<void> {
     if (this.inAutoEnvSync || rt.meta.globalPaused) return;
     const siteSet = new Set(sourceSites);
@@ -9232,6 +12370,7 @@ export class SyncEngine {
     const matchingRules = allRules.filter((r) => {
       if (!r.enabled || !r.autoSync) return false;
       if (options?.onlyWithLocalStorage && !r.syncLocalStorage) return false;
+      if (options?.onlyWithSessionStorage && !r.syncSessionStorage) return false;
       const normSrc =
         resolveSiteKey(r.sourceSiteKey, rt.meta.rules.ssoGroups) ||
         normalizeDomain(r.sourceSiteKey);
@@ -9266,7 +12405,8 @@ export class SyncEngine {
     }
   }
 
-  private async applyEnvLsEntriesToOpenOrigin(
+  private async applyEnvOriginKvEntries(
+    kind: 'localStorage' | 'sessionStorage',
     targetOrigin: string,
     currentItems: Record<string, string>,
     targetEntries: Array<[string, string]>,
@@ -9274,13 +12414,21 @@ export class SyncEngine {
     excludeSet: Set<string>,
     nowMs: number,
   ): Promise<{ applied: boolean; mutated: boolean }> {
+    const echoOrigin = kind === 'sessionStorage' ? `__ss__${targetOrigin}` : targetOrigin;
+    const applyFn =
+      kind === 'sessionStorage'
+        ? this.browser.applySessionStorage?.bind(this.browser)
+        : this.browser.applyLocalStorage.bind(this.browser);
+    if (!applyFn) {
+      return { applied: false, mutated: false };
+    }
     const mutations: Array<{ key: string; value?: string; deleted?: boolean }> = [];
     if (cleanTargetBeforeSync) {
       const keepKeys = new Set(targetEntries.map(([k]) => k));
       for (const existingKey of Object.keys(currentItems)) {
         if (!keepKeys.has(existingKey) && !excludeSet.has(existingKey)) {
           this.echoSuppressor.registerLocalStorageMutation(
-            targetOrigin,
+            echoOrigin,
             existingKey,
             'remove',
             '',
@@ -9293,15 +12441,15 @@ export class SyncEngine {
     for (const [k, v] of targetEntries) {
       const hasOwnKey = Object.prototype.hasOwnProperty.call(currentItems, k);
       if (!hasOwnKey || currentItems[k] !== v) {
-        this.echoSuppressor.registerLocalStorageMutation(targetOrigin, k, 'set', v, nowMs);
+        this.echoSuppressor.registerLocalStorageMutation(echoOrigin, k, 'set', v, nowMs);
         mutations.push({ key: k, value: v });
       }
     }
     if (mutations.length === 0) {
       return { applied: true, mutated: false };
     }
-    const lsApply = await this.browser.applyLocalStorage(targetOrigin, mutations);
-    return { applied: lsApply.applied, mutated: lsApply.applied };
+    const applyRes = await applyFn(targetOrigin, mutations);
+    return { applied: applyRes.applied, mutated: applyRes.applied };
   }
 
   private async hydrateAutoEnvTargetsOnMount(
@@ -9318,11 +12466,12 @@ export class SyncEngine {
       (r) =>
         r.enabled &&
         r.autoSync &&
-        r.syncLocalStorage &&
+        (r.syncLocalStorage || Boolean(r.syncSessionStorage)) &&
         envRuleMatchesUrl(r, mountedOrigin, rt.meta.rules.ssoGroups) === 'target',
     );
-    const pendingAdhoc = rt.meta.pendingEnvLsByOrigin?.[mountedOrigin];
-    if (matchingTargetRules.length === 0 && !pendingAdhoc) return;
+    const pendingAdhocLs = rt.meta.pendingEnvLsByOrigin?.[mountedOrigin];
+    const pendingAdhocSs = rt.meta.pendingEnvSsByOrigin?.[mountedOrigin];
+    if (matchingTargetRules.length === 0 && !pendingAdhocLs && !pendingAdhocSs) return;
 
     this.inAutoEnvSync = true;
     let executedAny = false;
@@ -9343,29 +12492,52 @@ export class SyncEngine {
         }
       }
 
-      const remainingAdhoc = rt.meta.pendingEnvLsByOrigin?.[mountedOrigin];
-      if (remainingAdhoc) {
-        delete rt.meta.pendingEnvLsByOrigin![mountedOrigin];
+      let reloadMounted = false;
+      const adhocTargets: Array<{
+        kind: 'localStorage' | 'sessionStorage';
+        pendingMap: typeof rt.meta.pendingEnvLsByOrigin;
+        readFn?: (origin: string) => Promise<{ available: boolean; items: Record<string, string> }>;
+      }> = [
+        {
+          kind: 'localStorage',
+          pendingMap: rt.meta.pendingEnvLsByOrigin,
+          readFn: this.browser.getLocalStorage.bind(this.browser),
+        },
+        {
+          kind: 'sessionStorage',
+          pendingMap: rt.meta.pendingEnvSsByOrigin,
+          readFn: this.browser.getSessionStorage?.bind(this.browser),
+        },
+      ];
+
+      for (const target of adhocTargets) {
+        const remainingAdhoc = target.pendingMap?.[mountedOrigin];
+        if (!remainingAdhoc || !target.readFn) continue;
+        delete target.pendingMap![mountedOrigin];
         executedAny = true;
-        const targetLs = await this.browser.getLocalStorage(mountedOrigin);
-        if (targetLs.available) {
-          const entries = Object.entries(remainingAdhoc.items);
-          const applyRes = await this.applyEnvLsEntriesToOpenOrigin(
+        const currentState = await target.readFn(mountedOrigin);
+        if (currentState.available) {
+          const applyRes = await this.applyEnvOriginKvEntries(
+            target.kind,
             mountedOrigin,
-            targetLs.items,
-            entries,
+            currentState.items,
+            Object.entries(remainingAdhoc.items),
             remainingAdhoc.cleanTargetBeforeSync,
             new Set(remainingAdhoc.excludeKeys),
             this.now(),
           );
           if (applyRes.mutated && remainingAdhoc.autoReloadTarget) {
-            this.postTrackSwitchLeaveMuteUntil.set(
-              resolveSiteKey(mountedOrigin, rt.meta.rules.ssoGroups) || mountedOrigin,
-              this.now() + 2_500,
-            );
-            await this.reloadTabsForUserAction(rt, (tabUrl) => normalizeOriginSafe(tabUrl) === mountedOrigin);
+            reloadMounted = true;
           }
         }
+      }
+
+      if (reloadMounted) {
+        this.postTrackSwitchLeaveMuteUntil.set(
+          resolveSiteKey(mountedOrigin, rt.meta.rules.ssoGroups) || mountedOrigin,
+          this.now() + 2_500,
+        );
+        await this.reloadTabsForUserAction(rt, (tabUrl) => normalizeOriginSafe(tabUrl) === mountedOrigin);
       }
 
       if (executedAny) {
@@ -9436,8 +12608,13 @@ export class SyncEngine {
       throw new Error(`无效的目标环境地址: ${rawTarget}`);
     }
 
-    if (isBlockedWebdavSelfTarget(rt.webdav.url, parsedTarget)) {
-      throw new Error('禁止覆盖当前 WebDAV 服务器自身域名的 Cookie');
+    const selfUrl = getBlockedSelfUrlForStorage(rt.storage);
+    if (selfUrl && isBlockedWebdavSelfTarget(selfUrl, parsedTarget)) {
+      throw new Error(
+        rt.storage.provider === 'webdav'
+          ? '禁止覆盖当前 WebDAV 服务器自身域名的 Cookie'
+          : '禁止覆盖当前远程存储服务器自身域名的 Cookie',
+      );
     }
 
     // Block sensitive banking / password_manager / webdav_self blacklists on source (allow localhost preset;
@@ -9451,7 +12628,7 @@ export class SyncEngine {
       !(
         srcBl.entry.presetCategory === 'webdav_self' &&
         parsedSourceTarget &&
-        !isBlockedWebdavSelfTarget(rt.webdav.url, parsedSourceTarget)
+        (!selfUrl || !isBlockedWebdavSelfTarget(selfUrl, parsedSourceTarget))
       )
     ) {
       throw new Error(`源站点 "${srcSiteKey}" 属于受保护敏感黑名单 (${srcBl.entry.presetCategory})，禁止跨环境导出`);
@@ -9463,6 +12640,9 @@ export class SyncEngine {
     const syncLocalStorage = matchedRule
       ? matchedRule.syncLocalStorage
       : (input.adHoc?.syncLocalStorage ?? false);
+    const syncSessionStorage = matchedRule
+      ? Boolean(matchedRule.syncSessionStorage)
+      : Boolean(input.adHoc?.syncSessionStorage);
     const adaptForHttp = matchedRule
       ? matchedRule.adaptForHttp
       : (input.adHoc?.adaptForHttp ?? true);
@@ -9511,9 +12691,10 @@ export class SyncEngine {
     let failedCookies = 0;
     let removedStaleCookies = 0;
     let appliedLocalStorage = 0;
+    let appliedSessionStorage = 0;
     let skippedCookies = 0;
     let actuallyMutatedTarget = false;
-    let pendingLsUpdated = false;
+    let pendingEnvUpdated = false;
     let reverseMutatedManagedState = false;
     const errors: string[] = [];
 
@@ -9529,6 +12710,8 @@ export class SyncEngine {
       } else {
         const fallbackTrackId =
           activeBoundTrackId ??
+          Object.values(rt.tracks).find((t) => t.siteKey === srcSiteKey && !t.ephemeral?.localOnly)
+            ?.trackId ??
           Object.values(rt.tracks).find((t) => t.siteKey === srcSiteKey)?.trackId;
         if (fallbackTrackId) {
           for (const rec of Object.values(rt.cookies)) {
@@ -9672,15 +12855,24 @@ export class SyncEngine {
       }
     }
 
-    if (syncLocalStorage) {
-      const sourceLsMap = new Map<string, string>();
+    const syncEnvOriginKvKind = async (
+      kind: 'localStorage' | 'sessionStorage',
+    ): Promise<number> => {
+      const isSs = kind === 'sessionStorage';
+      const reader = isSs
+        ? this.browser.getSessionStorage?.bind(this.browser)
+        : this.browser.getLocalStorage.bind(this.browser);
+      if (!reader) return 0;
+
+      const collection = isSs ? rt.sessionStorage : rt.localStorage;
+      const sourceKvMap = new Map<string, string>();
       const includeSet =
         includeCookieNames && includeCookieNames.length > 0
           ? new Set(includeCookieNames.map((n) => n.trim()).filter(Boolean))
           : null;
       const excludeSet = new Set((excludeCookieNames ?? []).map((n) => n.trim()).filter(Boolean));
 
-      const originMatchesSourceLsFilter = (origin: string): boolean => {
+      const originMatchesSourceFilter = (origin: string): boolean => {
         if (origin === parsedTarget.origin) return false;
         if (input.reverse && parsedSourceTarget?.port) {
           return origin === parsedSourceTarget.origin;
@@ -9696,41 +12888,47 @@ export class SyncEngine {
       };
 
       if (isPinnedBackgroundTrack) {
-        for (const rec of Object.values(rt.localStorage)) {
+        for (const rec of Object.values(collection)) {
           if (
             rec.trackId === effectiveSourceTrackId &&
             !rec.deleted &&
-            originMatchesSourceLsFilter(rec.origin)
+            originMatchesSourceFilter(rec.origin)
           ) {
-            sourceLsMap.set(rec.key, rec.value);
+            sourceKvMap.set(rec.key, rec.value);
           }
         }
       } else {
         const fallbackTrackId =
           activeBoundTrackId ??
+          Object.values(rt.tracks).find((t) => t.siteKey === srcSiteKey && !t.ephemeral?.localOnly)
+            ?.trackId ??
           Object.values(rt.tracks).find((t) => t.siteKey === srcSiteKey)?.trackId;
         if (fallbackTrackId) {
-          for (const rec of Object.values(rt.localStorage)) {
+          for (const rec of Object.values(collection)) {
             if (
               rec.trackId === fallbackTrackId &&
               !rec.deleted &&
-              originMatchesSourceLsFilter(rec.origin)
+              originMatchesSourceFilter(rec.origin)
             ) {
-              sourceLsMap.set(rec.key, rec.value);
+              sourceKvMap.set(rec.key, rec.value);
             }
           }
         }
 
-        // Overlay live localStorage from open source tabs if available
+        // Overlay live KV storage from open source tabs if available
         try {
           const tabs = await this.browser.queryTabs();
           const candidateOrigins = new Set<string>();
-          if (parsedSourceTarget?.origin && input.reverse && originMatchesSourceLsFilter(parsedSourceTarget.origin)) {
+          if (
+            parsedSourceTarget?.origin &&
+            input.reverse &&
+            originMatchesSourceFilter(parsedSourceTarget.origin)
+          ) {
             candidateOrigins.add(parsedSourceTarget.origin);
           }
           for (const tab of tabs) {
             const origin = tab.url ? normalizeOriginSafe(tab.url) : null;
-            if (!origin || !originMatchesSourceLsFilter(origin)) continue;
+            if (!origin || !originMatchesSourceFilter(origin)) continue;
             if (
               resolveSiteKey(origin, rt.meta.rules.ssoGroups) === srcSiteKey ||
               normalizeDomain(origin) === srcHost
@@ -9739,25 +12937,25 @@ export class SyncEngine {
             }
           }
           for (const origin of candidateOrigins) {
-            const lsState = await this.browser.getLocalStorage(origin);
-            if (lsState.available) {
-              for (const [k, v] of Object.entries(lsState.items)) {
-                sourceLsMap.set(k, v);
+            const state = await reader(origin);
+            if (state.available) {
+              for (const [k, v] of Object.entries(state.items)) {
+                sourceKvMap.set(k, v);
               }
             }
           }
         } catch {
-          // ignore live tab LS errors
+          // ignore live tab KV read errors
         }
       }
 
-      const filteredEntries = Array.from(sourceLsMap.entries()).filter(([k]) => {
+      const filteredEntries = Array.from(sourceKvMap.entries()).filter(([k]) => {
         if (includeSet && !includeSet.has(k)) return false;
         if (excludeSet.has(k)) return false;
         return true;
       });
 
-      const targetLsOrigins = new Set<string>();
+      const targetOrigins = new Set<string>();
       try {
         const tabs = await this.browser.queryTabs();
         const baseTargetSiteKey =
@@ -9776,106 +12974,171 @@ export class SyncEngine {
             : parsedTab.host === parsedTarget.host;
           const portOk = !parsedTarget.port || parsedTab.port === parsedTarget.port;
           if (hostOk && portOk) {
-            targetLsOrigins.add(tabOrigin);
+            targetOrigins.add(tabOrigin);
           }
         }
       } catch {
         // ignore tab query errors
       }
-      if (targetLsOrigins.size === 0 && parsedTarget.origin !== parsedSourceTarget?.origin) {
-        targetLsOrigins.add(parsedTarget.origin);
+      if (targetOrigins.size === 0 && parsedTarget.origin !== parsedSourceTarget?.origin) {
+        targetOrigins.add(parsedTarget.origin);
       }
 
-      const succeededLsKeys = new Set<string>();
-      if (isPinnedInactiveReverseTarget && reverseTargetTrackId && reverseDestSiteKey) {
-        const inactiveDestOrigins = new Set<string>();
-        for (const rec of Object.values(rt.localStorage)) {
-          if (
-            (rec.trackId === reverseTargetTrackId || rec.siteKey === reverseDestSiteKey) &&
-            !rec.deleted
-          ) {
-            inactiveDestOrigins.add(rec.origin);
+      const emitReverseUpsert = async (
+        destOrigin: string,
+        k: string,
+        v: string,
+        contextAvailable = true,
+      ) => {
+        if (!reverseTargetTrackId || !reverseDestSiteKey) return;
+        if (isSs) {
+          const existingSs =
+            rt.sessionStorage[buildSessionStorageLogicalId(reverseTargetTrackId, destOrigin, k)];
+          const emitted = await this.emitLocalSessionStorageUpsert(
+            rt,
+            reverseDestSiteKey,
+            reverseTargetTrackId,
+            destOrigin,
+            k,
+            v,
+            existingSs && !existingSs.deleted ? 'UPDATE' : 'CREATE',
+            undefined,
+            { contextAvailable },
+          );
+          if (emitted) reverseMutatedManagedState = true;
+        } else {
+          const existingLs =
+            rt.localStorage[buildLocalStorageLogicalId(reverseTargetTrackId, destOrigin, k)];
+          const emitted = await this.emitLocalStorageUpsert(
+            rt,
+            reverseDestSiteKey,
+            reverseTargetTrackId,
+            destOrigin,
+            k,
+            v,
+            existingLs && !existingLs.deleted ? 'UPDATE' : 'CREATE',
+            undefined,
+            { contextAvailable },
+          );
+          if (emitted) reverseMutatedManagedState = true;
+        }
+      };
+
+      const resolveStoredReverseOrigins = (): string[] => {
+        const origins = new Set<string>();
+        const targetFilterOrigins = new Set<string>();
+        for (const rec of Object.values(collection)) {
+          if (rec.deleted) continue;
+          const matchesTrack = reverseTargetTrackId && rec.trackId === reverseTargetTrackId;
+          const matchesSite = isPinnedInactiveReverseTarget
+            ? matchesTrack || rec.siteKey === reverseDestSiteKey
+            : matchesTrack;
+          if (!matchesSite) continue;
+          origins.add(rec.origin);
+          const parsedRec = parseEnvTarget(rec.origin);
+          if (parsedRec) {
+            const hostMatch = parsedTarget.explicitWildcardDomain
+              ? parsedRec.host === parsedTarget.host ||
+                parsedRec.host.endsWith(`.${parsedTarget.host}`)
+              : parsedRec.host === parsedTarget.host;
+            if (hostMatch && (!parsedTarget.port || parsedRec.port === parsedTarget.port)) {
+              targetFilterOrigins.add(rec.origin);
+            }
           }
         }
-        if (inactiveDestOrigins.size === 0) {
-          const fallbackHost = baseSourceHostFilter || reverseDestSiteKey;
-          inactiveDestOrigins.add(
-            isLocalOrSingleLabelHost(fallbackHost)
-              ? `http://${fallbackHost}`
-              : `https://${fallbackHost}`,
-          );
+        if (targetFilterOrigins.size > 0) {
+          return Array.from(targetFilterOrigins);
         }
+        if (origins.size > 0) {
+          return Array.from(origins);
+        }
+        const fallbackHost = baseSourceHostFilter || reverseDestSiteKey;
+        return [
+          isLocalOrSingleLabelHost(fallbackHost)
+            ? `http://${fallbackHost}`
+            : `https://${fallbackHost}`,
+        ];
+      };
+
+      const succeededKeys = new Set<string>();
+      if (isPinnedInactiveReverseTarget && reverseTargetTrackId && reverseDestSiteKey) {
+        const inactiveDestOrigins = resolveStoredReverseOrigins();
         for (const destOrigin of inactiveDestOrigins) {
           for (const [k, v] of filteredEntries) {
-            const existingLs =
-              rt.localStorage[buildLocalStorageLogicalId(reverseTargetTrackId, destOrigin, k)];
-            const emitted = await this.emitLocalStorageUpsert(
-              rt,
-              reverseDestSiteKey,
-              reverseTargetTrackId,
-              destOrigin,
-              k,
-              v,
-              existingLs && !existingLs.deleted ? 'UPDATE' : 'CREATE',
-            );
-            if (emitted) reverseMutatedManagedState = true;
-            succeededLsKeys.add(k);
+            await emitReverseUpsert(destOrigin, k, v, false);
+            succeededKeys.add(k);
           }
         }
       } else {
-        for (const targetOrigin of targetLsOrigins) {
-          const targetLs = await this.browser.getLocalStorage(targetOrigin);
-          if (!targetLs.available) {
+        const pendingMap = isSs
+          ? (rt.meta.pendingEnvSsByOrigin = rt.meta.pendingEnvSsByOrigin ?? {})
+          : (rt.meta.pendingEnvLsByOrigin = rt.meta.pendingEnvLsByOrigin ?? {});
+        let appliedToAnyOpenTargetTab = false;
+        for (const targetOrigin of targetOrigins) {
+          const targetState = await reader(targetOrigin);
+          if (!targetState.available) {
             if (!input.reverse && (filteredEntries.length > 0 || cleanTargetBeforeSync)) {
-              rt.meta.pendingEnvLsByOrigin = rt.meta.pendingEnvLsByOrigin ?? {};
-              rt.meta.pendingEnvLsByOrigin[targetOrigin] = {
+              pendingMap[targetOrigin] = {
                 items: Object.fromEntries(filteredEntries),
                 cleanTargetBeforeSync,
                 excludeKeys: Array.from(excludeSet),
                 autoReloadTarget,
               };
-              pendingLsUpdated = true;
+              pendingEnvUpdated = true;
             }
             continue;
           }
 
-          if (rt.meta.pendingEnvLsByOrigin?.[targetOrigin]) {
-            delete rt.meta.pendingEnvLsByOrigin[targetOrigin];
-            pendingLsUpdated = true;
+          appliedToAnyOpenTargetTab = true;
+          if (pendingMap[targetOrigin]) {
+            delete pendingMap[targetOrigin];
+            pendingEnvUpdated = true;
           }
-          const lsApplyRes = await this.applyEnvLsEntriesToOpenOrigin(
+          const applyRes = await this.applyEnvOriginKvEntries(
+            kind,
             targetOrigin,
-            targetLs.items,
+            targetState.items,
             filteredEntries,
             cleanTargetBeforeSync,
             excludeSet,
             nowMs,
           );
-          if (lsApplyRes.mutated) {
+          if (applyRes.mutated) {
             actuallyMutatedTarget = true;
           }
-          if (lsApplyRes.applied) {
+          if (applyRes.applied) {
             for (const [k, v] of filteredEntries) {
               if (input.reverse && reverseTargetTrackId && reverseDestSiteKey) {
-                const existingLs =
-                  rt.localStorage[buildLocalStorageLogicalId(reverseTargetTrackId, targetOrigin, k)];
-                const emitted = await this.emitLocalStorageUpsert(
-                  rt,
-                  reverseDestSiteKey,
-                  reverseTargetTrackId,
-                  targetOrigin,
-                  k,
-                  v,
-                  existingLs && !existingLs.deleted ? 'UPDATE' : 'CREATE',
-                );
-                if (emitted) reverseMutatedManagedState = true;
+                await emitReverseUpsert(targetOrigin, k, v, true);
               }
-              succeededLsKeys.add(k);
+              succeededKeys.add(k);
+            }
+          }
+        }
+        if (
+          input.reverse &&
+          !appliedToAnyOpenTargetTab &&
+          reverseTargetTrackId &&
+          reverseDestSiteKey &&
+          filteredEntries.length > 0
+        ) {
+          const offlineDestOrigins = resolveStoredReverseOrigins();
+          for (const destOrigin of offlineDestOrigins) {
+            for (const [k, v] of filteredEntries) {
+              await emitReverseUpsert(destOrigin, k, v, false);
+              succeededKeys.add(k);
             }
           }
         }
       }
-      appliedLocalStorage = succeededLsKeys.size;
+      return succeededKeys.size;
+    };
+
+    if (syncLocalStorage) {
+      appliedLocalStorage = await syncEnvOriginKvKind('localStorage');
+    }
+    if (syncSessionStorage) {
+      appliedSessionStorage = await syncEnvOriginKvKind('sessionStorage');
     }
 
     let reloadedTabs = 0;
@@ -9893,12 +13156,12 @@ export class SyncEngine {
 
     if (matchedRule) {
       matchedRule.lastSyncedAt = nowMs;
-      matchedRule.lastSyncedCount = appliedCookies + appliedLocalStorage;
+      matchedRule.lastSyncedCount = appliedCookies + appliedLocalStorage + appliedSessionStorage;
     }
     if (reverseMutatedManagedState) {
       rt.meta.space.status = this.computeStatus(rt);
     }
-    if (persistAfter && (matchedRule || pendingLsUpdated || reverseMutatedManagedState)) {
+    if (persistAfter && (matchedRule || pendingEnvUpdated || reverseMutatedManagedState)) {
       await this.persistRuntime(rt);
     }
     if (reverseMutatedManagedState && rt.meta.space.settings.autoSync) {
@@ -9914,6 +13177,7 @@ export class SyncEngine {
       failedCookies,
       removedStaleCookies,
       appliedLocalStorage,
+      appliedSessionStorage,
       skippedCookies,
       reloadedTabs,
       errors,
@@ -9923,10 +13187,11 @@ export class SyncEngine {
   async importRulesJson(jsonOrObj: unknown): Promise<void> {
     await this.ensureInitialized();
     return this.enqueueOp(async () => {
-      const rt = this.requireRuntime();
+      const rt = this.requireUnlockedRuntime();
       const nowMs = this.now();
       const rawJson = typeof jsonOrObj === 'string' ? jsonOrObj : JSON.stringify(jsonOrObj);
       const parsed = RulesEngine.parseRulesJson(rawJson);
+      const selfUrl = getBlockedSelfUrlForStorage(rt.storage);
 
       if (parsed.spaceRules.spaceBlacklist) {
         rt.meta.rules.spaceBlacklist = parsed.spaceRules.spaceBlacklist;
@@ -9941,7 +13206,7 @@ export class SyncEngine {
         const seenIds = new Set<string>();
         rt.meta.rules.envSyncRules = parsed.spaceRules.envSyncRules.filter((r) => {
           const pt = parseEnvTarget(r.targetUrl);
-          if (!pt || isBlockedWebdavSelfTarget(rt.webdav.url, pt) || seenIds.has(r.id)) {
+          if (!pt || (selfUrl && isBlockedWebdavSelfTarget(selfUrl, pt)) || seenIds.has(r.id)) {
             return false;
           }
           seenIds.add(r.id);
@@ -9955,7 +13220,7 @@ export class SyncEngine {
         const seenDevIds = new Set<string>();
         rt.meta.deviceEnvSyncRules = parsed.deviceEnvSyncRules.filter((r) => {
           const pt = parseEnvTarget(r.targetUrl);
-          if (!pt || isBlockedWebdavSelfTarget(rt.webdav.url, pt) || seenDevIds.has(r.id)) {
+          if (!pt || (selfUrl && isBlockedWebdavSelfTarget(selfUrl, pt)) || seenDevIds.has(r.id)) {
             return false;
           }
           seenDevIds.add(r.id);
@@ -9978,7 +13243,7 @@ export class SyncEngine {
 
   async exportRulesJson(): Promise<string> {
     await this.ensureInitialized();
-    const rt = this.requireRuntime();
+    const rt = this.requireUnlockedRuntime();
     return rt.rulesEngine.exportRulesJson();
   }
 
@@ -10013,7 +13278,7 @@ export class SyncEngine {
   async renameDevice(deviceId: string, name: string): Promise<void> {
     await this.ensureInitialized();
     return this.enqueueOp(async () => {
-      const rt = this.requireRuntime();
+      const rt = this.requireUnlockedRuntime();
       const trimmed = name.trim();
       if (!trimmed) throw new Error('Device name cannot be empty');
 
@@ -10040,7 +13305,7 @@ export class SyncEngine {
   ): Promise<void> {
     await this.ensureInitialized();
     return this.enqueueOp(async () => {
-      const rt = this.requireRuntime();
+      const rt = this.requireUnlockedRuntime();
       const nowMs = this.now();
 
       if (deviceId === rt.meta.localDevice.deviceId) {
@@ -10096,13 +13361,15 @@ export class SyncEngine {
   async restoreHistoricalEvent(eventId: string): Promise<void> {
     await this.ensureInitialized();
     return this.enqueueOp(async () => {
-      const rt = this.requireRuntime();
+      const rt = this.requireUnlockedRuntime();
       const target = rt.eventsHistory.find((e) => e.eventId === eventId);
       if (!target) {
         throw new Error(`Historical event not found: ${eventId}`);
       }
 
       const nowMs = this.now();
+      const isActiveBoundTrack =
+        rt.meta.localDevice.siteBindings[target.siteKey]?.trackId === target.trackId;
       if (target.objectType === 'cookie' && target.cookieData) {
         const cookieInput: BrowserCookieInput = {
           domain: target.cookieData.domain,
@@ -10137,7 +13404,7 @@ export class SyncEngine {
           'RESTORE',
           forceVc,
         );
-        if (emitted) {
+        if (emitted && isActiveBoundTrack) {
           const hash = cookieContentCanonicalHash(emitted);
           this.changeDetector.discardCookieKey(buildEchoCookieKey(emitted));
           this.echoSuppressor.registerCookieMutation(emitted, 'set', hash, nowMs);
@@ -10159,7 +13426,7 @@ export class SyncEngine {
           forceVc = mergeVectorClocks(forceVc, existingTomb.deleteVersion.vectorClock);
         }
 
-        await this.emitLocalStorageUpsert(
+        const emittedLs = await this.emitLocalStorageUpsert(
           rt,
           target.siteKey,
           target.trackId,
@@ -10169,16 +13436,103 @@ export class SyncEngine {
           'RESTORE',
           forceVc,
         );
-        this.echoSuppressor.registerLocalStorageMutation(
-          target.localStorageData.origin,
-          target.localStorageData.key,
-          'set',
-          target.localStorageData.value,
-          nowMs,
+        let appliedLs = false;
+        if (isActiveBoundTrack) {
+          this.echoSuppressor.registerLocalStorageMutation(
+            target.localStorageData.origin,
+            target.localStorageData.key,
+            'set',
+            target.localStorageData.value,
+            nowMs,
+          );
+          const applyRes = await this.browser.applyLocalStorage(target.localStorageData.origin, [
+            { key: target.localStorageData.key, value: target.localStorageData.value },
+          ]);
+          appliedLs = applyRes.applied;
+        }
+        if (emittedLs) {
+          emittedLs.contextAvailable = appliedLs;
+          if (!appliedLs) {
+            delete rt.meta.appliedLsHashes[emittedLs.logicalId];
+          }
+        }
+      } else if (target.objectType === 'sessionStorage' && target.sessionStorageData) {
+        const existing = rt.sessionStorage[target.objectId];
+        const existingTomb = rt.tombstones[target.objectId];
+        let forceVc = existing?.version.vectorClock ?? {};
+        if (existingTomb) {
+          forceVc = mergeVectorClocks(forceVc, existingTomb.deleteVersion.vectorClock);
+        }
+
+        const emittedSs = await this.emitLocalSessionStorageUpsert(
+          rt,
+          target.siteKey,
+          target.trackId,
+          target.sessionStorageData.origin,
+          target.sessionStorageData.key,
+          target.sessionStorageData.value,
+          'RESTORE',
+          forceVc,
         );
-        await this.browser.applyLocalStorage(target.localStorageData.origin, [
-          { key: target.localStorageData.key, value: target.localStorageData.value },
-        ]);
+        let appliedSs = false;
+        if (isActiveBoundTrack && this.browser.applySessionStorage) {
+          this.echoSuppressor.registerLocalStorageMutation(
+            `__ss__${target.sessionStorageData.origin}`,
+            target.sessionStorageData.key,
+            'set',
+            target.sessionStorageData.value,
+            nowMs,
+          );
+          const applyRes = await this.browser.applySessionStorage(target.sessionStorageData.origin, [
+            { key: target.sessionStorageData.key, value: target.sessionStorageData.value },
+          ]);
+          appliedSs = applyRes.applied;
+        }
+        if (emittedSs) {
+          emittedSs.contextAvailable = appliedSs;
+          if (!appliedSs && rt.meta.appliedSsHashes) {
+            delete rt.meta.appliedSsHashes[emittedSs.logicalId];
+          }
+        }
+      } else if (target.objectType === 'indexedDb' && target.indexedDbData) {
+        const existing = rt.indexedDb[target.objectId];
+        const existingTomb = rt.tombstones[target.objectId];
+        let forceVc = existing?.version.vectorClock ?? {};
+        if (existingTomb) {
+          forceVc = mergeVectorClocks(forceVc, existingTomb.deleteVersion.vectorClock);
+        }
+
+        const {
+          logicalId: _lid,
+          siteKey: _sk,
+          trackId: _tid,
+          sourceDevice: _sd,
+          sourceDeviceName: _sdn,
+          deleted: _del,
+          updatedAt: _uat,
+          ...idbItem
+        } = target.indexedDbData;
+        await this.emitLocalIndexedDbUpsert(
+          rt,
+          target.siteKey,
+          target.trackId,
+          idbItem,
+          'RESTORE',
+          forceVc,
+        );
+        if (this.browser.applyIndexedDbMutations) {
+          await this.browser.applyIndexedDbMutations(idbItem.origin, [
+            {
+              dbName: idbItem.dbName,
+              dbVersion: idbItem.dbVersion,
+              storeName: idbItem.storeName,
+              keyPath: idbItem.keyPath,
+              autoIncrement: idbItem.autoIncrement,
+              encodedKey: idbItem.encodedKey,
+              encodedValue: idbItem.encodedValue,
+            },
+          ]);
+        }
       }
 
       await this.persistRuntime(rt);
@@ -10200,7 +13554,7 @@ export class SyncEngine {
   async resolveConflict(conflictId: string, choose: 'local' | 'remote'): Promise<void> {
     await this.ensureInitialized();
     return this.enqueueOp(async () => {
-      const rt = this.requireRuntime();
+      const rt = this.requireUnlockedRuntime();
       const conflict = rt.conflicts[conflictId];
       if (!conflict) {
         throw new Error(`Conflict not found: ${conflictId}`);
@@ -10249,6 +13603,69 @@ export class SyncEngine {
             emitted.syncStatus = 'EXPIRED';
           } else {
             emitted.syncStatus = 'APPLY_FAILED';
+          }
+          conflict.resolvedRecord = emitted;
+        }
+      } else if (conflict.objectType === 'sessionStorage') {
+        const rec = chosen as SessionStorageRecord;
+        const emitted = await this.emitLocalSessionStorageUpsert(
+          rt,
+          conflict.siteKey,
+          conflict.trackId,
+          rec.origin,
+          rec.key,
+          rec.value,
+          'RESTORE',
+          mergedVc,
+        );
+        if (emitted) {
+          if (this.browser.applySessionStorage) {
+            this.echoSuppressor.registerLocalStorageMutation(
+              `__ss__${rec.origin}`,
+              rec.key,
+              'set',
+              rec.value,
+              nowMs,
+            );
+            await this.browser.applySessionStorage(rec.origin, [{ key: rec.key, value: rec.value }]);
+          }
+          conflict.resolvedRecord = emitted;
+        }
+      } else if (conflict.objectType === 'indexedDb') {
+        const rec = chosen as IndexedDbRecord;
+        const {
+          logicalId: _lid,
+          siteKey: _sk,
+          trackId: _tid,
+          version: _v,
+          sourceDevice: _sd,
+          sourceDeviceName: _sdn,
+          deleted: _del,
+          updatedAt: _uat,
+          syncStatus: _st,
+          ...idbItem
+        } = rec;
+        const emitted = await this.emitLocalIndexedDbUpsert(
+          rt,
+          conflict.siteKey,
+          conflict.trackId,
+          idbItem,
+          'RESTORE',
+          mergedVc,
+        );
+        if (emitted) {
+          if (this.browser.applyIndexedDbMutations) {
+            await this.browser.applyIndexedDbMutations(rec.origin, [
+              {
+                dbName: rec.dbName,
+                dbVersion: rec.dbVersion,
+                storeName: rec.storeName,
+                keyPath: rec.keyPath,
+                autoIncrement: rec.autoIncrement,
+                encodedKey: rec.encodedKey,
+                encodedValue: rec.encodedValue,
+              },
+            ]);
           }
           conflict.resolvedRecord = emitted;
         }
@@ -10301,7 +13718,7 @@ export class SyncEngine {
   async applyUndoPoint(undoId: string): Promise<void> {
     await this.ensureInitialized();
     return this.enqueueOp(async () => {
-      const rt = this.requireRuntime();
+      const rt = this.requireUnlockedRuntime();
       const idx = rt.undoPoints.findIndex((u) => u.undoId === undoId);
       if (idx < 0) {
         throw new Error(`Undo point not found: ${undoId}`);
@@ -10414,61 +13831,123 @@ export class SyncEngine {
         await applyCookieWithVerification(this.browser, c, nowMs);
       }
 
-      // Clear any deferred clean-switch marker for this site before restoring the undo point
+      // Clear any deferred clean-switch markers for this site before restoring the undo point
       if (rt.meta.pendingCleanLsBySite?.[point.siteKey]) {
         delete rt.meta.pendingCleanLsBySite[point.siteKey];
       }
-
-      // Restore snapshotted LocalStorage (including clearing stale LS on open & closed origins)
-      const lsTargets = new Map<string, Record<string, string>>(
-        Object.entries(point.localStorageByOrigin),
-      );
-      for (const lsRec of Object.values(rt.localStorage)) {
-        if (lsRec.siteKey === point.siteKey && !lsTargets.has(lsRec.origin)) {
-          lsTargets.set(lsRec.origin, {});
-        }
+      if (rt.meta.pendingCleanSsBySite?.[point.siteKey]) {
+        delete rt.meta.pendingCleanSsBySite[point.siteKey];
       }
+      if (rt.meta.pendingCleanIdbBySite?.[point.siteKey]) {
+        delete rt.meta.pendingCleanIdbBySite[point.siteKey];
+      }
+
+      // Restore snapshotted LocalStorage and SessionStorage (including clearing stale entries)
+      let changedOpenKv = false;
+      const openTabOrigins: string[] = [];
       try {
         const tabs = await this.browser.queryTabs();
         for (const tab of tabs) {
           const origin = tab.url ? normalizeOriginSafe(tab.url) : null;
-          if (
-            origin &&
-            resolveSiteKey(origin, rt.meta.rules.ssoGroups) === point.siteKey &&
-            !lsTargets.has(origin)
-          ) {
-            lsTargets.set(origin, {});
+          if (origin && resolveSiteKey(origin, rt.meta.rules.ssoGroups) === point.siteKey) {
+            openTabOrigins.push(origin);
           }
         }
       } catch {
         // ignore tab query errors
       }
-      let changedOpenLs = false;
-      for (const [origin, items] of lsTargets.entries()) {
-        const currentLs = await this.browser.getLocalStorage(origin);
-        if (!currentLs.available) {
-          rt.meta.pendingEnvLsByOrigin = rt.meta.pendingEnvLsByOrigin ?? {};
-          rt.meta.pendingEnvLsByOrigin[origin] = {
-            items: { ...items },
-            cleanTargetBeforeSync: true,
-            excludeKeys: [],
-            autoReloadTarget: true,
-          };
-          continue;
+
+      const restoreKvOriginMap = async (
+        kind: 'localStorage' | 'sessionStorage',
+        snapshotMap: Record<string, Record<string, string>> | undefined,
+        collection: Record<string, LocalStorageRecord | SessionStorageRecord>,
+        readFn: ((origin: string) => Promise<{ available: boolean; items: Record<string, string> }>) | undefined,
+      ) => {
+        if (!readFn) return;
+        const targets = new Map<string, Record<string, string>>(Object.entries(snapshotMap ?? {}));
+        for (const rec of Object.values(collection)) {
+          if (rec.siteKey === point.siteKey && !targets.has(rec.origin)) {
+            targets.set(rec.origin, {});
+          }
         }
-        if (rt.meta.pendingEnvLsByOrigin?.[origin]) {
-          delete rt.meta.pendingEnvLsByOrigin[origin];
+        for (const origin of openTabOrigins) {
+          if (!targets.has(origin) && kind === 'localStorage') {
+            targets.set(origin, {});
+          } else if (!targets.has(origin) && Object.keys(snapshotMap ?? {}).length > 0) {
+            targets.set(origin, {});
+          }
         }
-        const applyRes = await this.applyEnvLsEntriesToOpenOrigin(
-          origin,
-          currentLs.items,
-          Object.entries(items),
-          true,
-          new Set(),
-          nowMs,
-        );
-        if (applyRes.mutated) {
-          changedOpenLs = true;
+        const pendingMap =
+          kind === 'sessionStorage'
+            ? (rt.meta.pendingEnvSsByOrigin = rt.meta.pendingEnvSsByOrigin ?? {})
+            : (rt.meta.pendingEnvLsByOrigin = rt.meta.pendingEnvLsByOrigin ?? {});
+
+        for (const [origin, items] of targets.entries()) {
+          const currentState = await readFn(origin);
+          if (!currentState.available) {
+            pendingMap[origin] = {
+              items: { ...items },
+              cleanTargetBeforeSync: true,
+              excludeKeys: [],
+              autoReloadTarget: true,
+            };
+            continue;
+          }
+          if (pendingMap[origin]) {
+            delete pendingMap[origin];
+          }
+          const applyRes = await this.applyEnvOriginKvEntries(
+            kind,
+            origin,
+            currentState.items,
+            Object.entries(items),
+            true,
+            new Set(),
+            nowMs,
+          );
+          if (applyRes.mutated) {
+            changedOpenKv = true;
+          }
+        }
+      };
+
+      await restoreKvOriginMap(
+        'localStorage',
+        point.localStorageByOrigin,
+        rt.localStorage,
+        this.browser.getLocalStorage.bind(this.browser),
+      );
+      await restoreKvOriginMap(
+        'sessionStorage',
+        point.sessionStorageByOrigin,
+        rt.sessionStorage,
+        this.browser.getSessionStorage?.bind(this.browser),
+      );
+
+      if (point.indexedDbRecords && point.indexedDbRecords.length > 0 && this.browser.applyIndexedDbMutations) {
+        const byOrigin = new Map<string, IndexedDbRecord[]>();
+        for (const rec of point.indexedDbRecords) {
+          const arr = byOrigin.get(rec.origin) ?? [];
+          arr.push(rec);
+          byOrigin.set(rec.origin, arr);
+        }
+        for (const [origin, recs] of byOrigin.entries()) {
+          const clearPairs = Array.from(
+            new Map(recs.map((r) => [`${r.dbName}::${r.storeName}`, { dbName: r.dbName, storeName: r.storeName }])).values(),
+          );
+          const muts: IndexedDbMutation[] = recs.map((r) => ({
+            dbName: r.dbName,
+            dbVersion: r.dbVersion,
+            storeName: r.storeName,
+            keyPath: r.keyPath,
+            autoIncrement: r.autoIncrement,
+            encodedKey: r.encodedKey,
+            encodedValue: r.encodedValue,
+          }));
+          const idbRes = await this.browser.applyIndexedDbMutations(origin, muts, clearPairs);
+          if (idbRes.applied) {
+            changedOpenKv = true;
+          }
         }
       }
 
@@ -10486,7 +13965,7 @@ export class SyncEngine {
       if (
         !(sitePolicy.autoRefresh && rt.meta.space.settings.autoRefresh) &&
         refreshRes.reloadedTabIds.length === 0 &&
-        (changedOpenLs || point.cookies.length > 0 || currentCookies.some((c) => domainMatchesSiteKey(c.domain, point.siteKey, rt.meta.rules.ssoGroups)))
+        (changedOpenKv || point.cookies.length > 0 || currentCookies.some((c) => domainMatchesSiteKey(c.domain, point.siteKey, rt.meta.rules.ssoGroups)))
       ) {
         const reloaded = await this.reloadTabsForUserAction(rt, this.siteTabMatcher(rt, point.siteKey));
         if (reloaded > 0) {
@@ -10504,23 +13983,83 @@ export class SyncEngine {
   // WebDAV Maintenance, Integrity, Snapshots, GC & Backups
   // =========================================================================
 
+  private toWebDAVResourceStat(s: RemoteObjectStat): WebDAVResourceStat {
+    return {
+      path: s.path,
+      href: s.href ?? s.path,
+      name: s.name,
+      isCollection: s.isCollection,
+      etag: s.etag,
+      size: s.size,
+      lastModified: s.lastModified,
+      status: s.status ?? 200,
+      quotaUsedBytes: s.quotaUsedBytes,
+      quotaAvailableBytes: s.quotaAvailableBytes,
+    };
+  }
+
+  private buildSyncableSnapshotPayload(
+    rt: LoadedSpaceRuntime,
+    snapshotId: string,
+    nowMs: number,
+  ): SnapshotPayload {
+    const tracks: Record<string, SiteTrack> = {};
+    const excludedTrackIds = new Set<string>();
+    for (const [tid, tr] of Object.entries(rt.tracks)) {
+      if (tr.ephemeral?.localOnly) {
+        excludedTrackIds.add(tid);
+        continue;
+      }
+      tracks[tid] = { ...tr, memberDeviceIds: [...tr.memberDeviceIds] };
+    }
+
+    const filterSyncable = <T extends { trackId: string }>(
+      source: Record<string, T>,
+    ): Record<string, T> => {
+      const out: Record<string, T> = {};
+      for (const [id, rec] of Object.entries(source)) {
+        if (!excludedTrackIds.has(rec.trackId)) {
+          out[id] = { ...rec };
+        }
+      }
+      return out;
+    };
+
+    return {
+      snapshotId,
+      spaceId: rt.spaceId,
+      createdAt: nowMs,
+      createdByDevice: rt.meta.localDevice.deviceId,
+      coveredVectorClock: { ...rt.meta.localDevice.checkpoint.processedVectorClock },
+      cookies: filterSyncable(rt.cookies),
+      localStorage: filterSyncable(rt.localStorage),
+      sessionStorage: filterSyncable(rt.sessionStorage),
+      indexedDb: filterSyncable(rt.indexedDb),
+      tombstones: filterSyncable(rt.tombstones),
+      tracks,
+      rules: { ...rt.meta.rules },
+    };
+  }
+
   async listRemoteDir(subPath?: string): Promise<WebDAVResourceStat[]> {
     await this.ensureInitialized();
-    const rt = this.requireRuntime();
+    const rt = this.requireUnlockedRuntime();
     const base = spaceBasePath(rt.meta.space.opaqueId);
     const target = subPath ? `${base}/${subPath.replace(/^\/+/, '')}` : base;
     const targetNorm = target.replace(/^\/+|\/+$/g, '');
-    const entries = await rt.client.propfind(target, 1);
-    return entries.filter((entry) => {
-      const entryNorm = entry.path.replace(/^\/+|\/+$/g, '');
-      return Boolean(entryNorm) && entryNorm !== targetNorm && !entryNorm.endsWith(`/${targetNorm}`);
-    });
+    const entries = await rt.client.list(target, 1);
+    return entries
+      .filter((entry) => {
+        const entryNorm = entry.path.replace(/^\/+|\/+$/g, '');
+        return Boolean(entryNorm) && entryNorm !== targetNorm && !entryNorm.endsWith(`/${targetNorm}`);
+      })
+      .map((entry) => this.toWebDAVResourceStat(entry));
   }
 
   async checkIntegrity(): Promise<IntegrityReport> {
     await this.ensureInitialized();
     return this.enqueueOp(async () => {
-      const rt = this.requireRuntime();
+      const rt = this.requireUnlockedRuntime();
       const checkedAt = this.now();
       const corruptedPaths: string[] = [];
       const missingSeqGaps: string[] = [];
@@ -10554,7 +14093,7 @@ export class SyncEngine {
       let deviceFilesCount = 0;
       const devIds: string[] = [];
       try {
-        const stats = await rt.client.propfind(devicesDir(rt.meta.space.opaqueId), 1);
+        const stats = await rt.client.list(devicesDir(rt.meta.space.opaqueId), 1);
         for (const s of stats) {
           if (s.isCollection) continue;
           const name = s.name || extractFilename(s.path);
@@ -10578,12 +14117,49 @@ export class SyncEngine {
         details.push(`Failed listing devices: ${err instanceof Error ? err.message : String(err)}`);
       }
 
-      // 3. Check events/{devId}/*.enc & sequence gaps
+      // 3. Check snapshots/*.enc first so event sequence gaps already consolidated
+      // into a verified snapshot are not reported as unrecoverable data loss.
+      let snapshotFilesCount = 0;
+      const snapshotCoveredByDev: Record<string, number> = {};
+      try {
+        const stats = await rt.client.list(snapshotsDir(rt.meta.space.opaqueId), 1);
+        for (const s of stats) {
+          if (s.isCollection) continue;
+          const name = s.name || extractFilename(s.path);
+          if (!name.endsWith('.enc')) continue;
+          snapshotFilesCount += 1;
+          const p = snapshotFilePath(rt.meta.space.opaqueId, name);
+          try {
+            const fetched = await rt.client.getBytes(p);
+            const { data: snapData, header } = await decryptWithDek<SnapshotPayload>(
+              fetched.bytes,
+              rt.dekKeyring,
+              `${rt.spaceId}|`,
+            );
+            if (header.aad !== buildFileAad(rt.spaceId, header.keyEpoch, 'snapshot', p)) {
+              throw new Error('AAD mismatch');
+            }
+            for (const [dId, seq] of Object.entries(snapData.coveredVectorClock ?? {})) {
+              if (seq > (snapshotCoveredByDev[dId] ?? 0)) {
+                snapshotCoveredByDev[dId] = seq;
+              }
+            }
+          } catch (err) {
+            corruptedPaths.push(p);
+            details.push(`Corrupted snapshot ${p}: ${err instanceof Error ? err.message : String(err)}`);
+          }
+        }
+      } catch {
+        // Snapshots dir might be empty
+      }
+
+      // 4. Check events/{devId}/*.enc & sequence gaps (after any snapshot floor)
       let eventFilesCount = 0;
       for (const devId of devIds) {
         const dir = deviceEventsDir(rt.meta.space.opaqueId, devId);
+        const snapFloor = snapshotCoveredByDev[devId] ?? 0;
         try {
-          const stats = await rt.client.propfind(dir, 1);
+          const stats = await rt.client.list(dir, 1);
           const files = stats
             .filter((s) => !s.isCollection && (s.name || extractFilename(s.path)).endsWith('.enc'))
             .sort((a, b) => {
@@ -10607,14 +14183,15 @@ export class SyncEngine {
               if (header.aad !== buildFileAad(rt.spaceId, header.keyEpoch, 'event_batch', p)) {
                 throw new Error('AAD mismatch');
               }
-              if (prevToSeq > 0 && batch.fromSeq > prevToSeq + 1) {
+              const coveredUpTo = Math.max(prevToSeq, snapFloor);
+              if (prevToSeq > 0 && batch.fromSeq > coveredUpTo + 1) {
                 const isLocalDeferredOnly =
                   devId === rt.meta.localDevice.deviceId &&
                   rt.pendingOutboundEvents.some(
-                    (pe) => pe.deviceSeq > prevToSeq && pe.deviceSeq < batch.fromSeq,
+                    (pe) => pe.deviceSeq > coveredUpTo && pe.deviceSeq < batch.fromSeq,
                   );
                 if (!isLocalDeferredOnly) {
-                  missingSeqGaps.push(`${devId}:${prevToSeq + 1}..${batch.fromSeq - 1}`);
+                  missingSeqGaps.push(`${devId}:${coveredUpTo + 1}..${batch.fromSeq - 1}`);
                 }
               }
               prevToSeq = Math.max(prevToSeq, batch.toSeq);
@@ -10626,31 +14203,6 @@ export class SyncEngine {
         } catch {
           // Device may have no event files yet
         }
-      }
-
-      // 4. Check snapshots/*.enc
-      let snapshotFilesCount = 0;
-      try {
-        const stats = await rt.client.propfind(snapshotsDir(rt.meta.space.opaqueId), 1);
-        for (const s of stats) {
-          if (s.isCollection) continue;
-          const name = s.name || extractFilename(s.path);
-          if (!name.endsWith('.enc')) continue;
-          snapshotFilesCount += 1;
-          const p = snapshotFilePath(rt.meta.space.opaqueId, name);
-          try {
-            const fetched = await rt.client.getBytes(p);
-            const { header } = await decryptWithDek(fetched.bytes, rt.dekKeyring, `${rt.spaceId}|`);
-            if (header.aad !== buildFileAad(rt.spaceId, header.keyEpoch, 'snapshot', p)) {
-              throw new Error('AAD mismatch');
-            }
-          } catch (err) {
-            corruptedPaths.push(p);
-            details.push(`Corrupted snapshot ${p}: ${err instanceof Error ? err.message : String(err)}`);
-          }
-        }
-      } catch {
-        // Snapshots dir might be empty
       }
 
       rt.meta.corruptedPaths = [...corruptedPaths];
@@ -10673,7 +14225,7 @@ export class SyncEngine {
   async rebuildIndex(): Promise<void> {
     await this.ensureInitialized();
     return this.enqueueOp(async () => {
-      const rt = this.requireRuntime();
+      const rt = this.requireUnlockedRuntime();
       const nowMs = this.now();
       const localDevId = rt.meta.localDevice.deviceId;
       const boundTrackIds = new Set(
@@ -10681,18 +14233,36 @@ export class SyncEngine {
           .map((b) => b.trackId)
           .filter((id): id is string => Boolean(id)),
       );
+      const preservedLocalOnlyTracks = Object.values(rt.tracks)
+        .filter((tr) => Boolean(tr.ephemeral?.localOnly))
+        .map((tr) => ({ ...tr, memberDeviceIds: [...tr.memberDeviceIds] }));
+      const localOnlyIds = new Set(preservedLocalOnlyTracks.map((t) => t.trackId));
+      const preservedLocalOnlyCookies = Object.entries(rt.cookies)
+        .filter(([, c]) => localOnlyIds.has(c.trackId))
+        .map(([k, v]) => [k, { ...v }] as const);
+      const preservedLocalOnlyLs = Object.entries(rt.localStorage)
+        .filter(([, r]) => localOnlyIds.has(r.trackId))
+        .map(([k, v]) => [k, { ...v }] as const);
+      const preservedLocalOnlySs = Object.entries(rt.sessionStorage)
+        .filter(([, r]) => localOnlyIds.has(r.trackId))
+        .map(([k, v]) => [k, { ...v }] as const);
+      const preservedLocalOnlyIdb = Object.entries(rt.indexedDb)
+        .filter(([, r]) => localOnlyIds.has(r.trackId))
+        .map(([k, v]) => [k, { ...v }] as const);
+
       const pendingTrackIds = new Set(rt.pendingOutboundEvents.map((ev) => ev.trackId));
       const preservedLocalTracks = Object.values(rt.tracks)
         .filter(
           (tr) =>
-            boundTrackIds.has(tr.trackId) ||
-            pendingTrackIds.has(tr.trackId) ||
-            tr.memberDeviceIds.includes(localDevId),
+            !tr.ephemeral?.localOnly &&
+            (boundTrackIds.has(tr.trackId) ||
+              pendingTrackIds.has(tr.trackId) ||
+              tr.memberDeviceIds.includes(localDevId)),
         )
         .map((tr) => ({ ...tr, memberDeviceIds: [...tr.memberDeviceIds] }));
-      const pendingEventsSnapshot = [...rt.pendingOutboundEvents].sort(
-        (a, b) => a.deviceSeq - b.deviceSeq,
-      );
+      const pendingEventsSnapshot = [...rt.pendingOutboundEvents]
+        .filter((ev) => !localOnlyIds.has(ev.trackId))
+        .sort((a, b) => a.deviceSeq - b.deviceSeq);
 
       rt.meta.peerDeviceEtags = {};
       rt.meta.processedEventPaths = {};
@@ -10700,6 +14270,8 @@ export class SyncEngine {
       rt.meta.dismissedCorruptedPaths = {};
       rt.cookies = {};
       rt.localStorage = {};
+      rt.sessionStorage = {};
+      rt.indexedDb = {};
       rt.tombstones = {};
       rt.tracks = {};
       rt.conflicts = {};
@@ -10720,6 +14292,15 @@ export class SyncEngine {
         });
       }
 
+      // Restore strictly local-only ephemeral tracks and their local records
+      for (const tr of preservedLocalOnlyTracks) {
+        rt.tracks[tr.trackId] = tr;
+      }
+      for (const [k, v] of preservedLocalOnlyCookies) rt.cookies[k] = v;
+      for (const [k, v] of preservedLocalOnlyLs) rt.localStorage[k] = v;
+      for (const [k, v] of preservedLocalOnlySs) rt.sessionStorage[k] = v;
+      for (const [k, v] of preservedLocalOnlyIdb) rt.indexedDb[k] = v;
+
       await this.pullRemoteInternal(rt, { applyToBrowser: true });
 
       rt.meta.localDevice.pendingEvents = rt.pendingOutboundEvents.length;
@@ -10730,9 +14311,9 @@ export class SyncEngine {
 
   private async replayDeviceEvents(rt: LoadedSpaceRuntime, devId: string): Promise<void> {
     const dir = deviceEventsDir(rt.meta.space.opaqueId, devId);
-    let stats: WebDAVResourceStat[] = [];
+    let stats: RemoteObjectStat[] = [];
     try {
-      stats = await rt.client.propfind(dir, 1);
+      stats = await rt.client.list(dir, 1);
     } catch {
       return;
     }
@@ -10777,9 +14358,9 @@ export class SyncEngine {
 
   private async loadLatestSnapshotIfAvailable(rt: LoadedSpaceRuntime): Promise<boolean> {
     const dir = snapshotsDir(rt.meta.space.opaqueId);
-    let stats: WebDAVResourceStat[] = [];
+    let stats: RemoteObjectStat[] = [];
     try {
-      stats = await rt.client.propfind(dir, 1);
+      stats = await rt.client.list(dir, 1);
     } catch {
       return false;
     }
@@ -10801,9 +14382,15 @@ export class SyncEngine {
         if (header.aad !== buildFileAad(rt.spaceId, header.keyEpoch, 'snapshot', p)) {
           throw new Error('Snapshot AAD mismatch');
         }
-        Object.assign(rt.tracks, snap.tracks ?? {});
+        for (const [tid, tr] of Object.entries(snap.tracks ?? {})) {
+          if (!tr.ephemeral?.localOnly) {
+            rt.tracks[tid] = tr;
+          }
+        }
         Object.assign(rt.cookies, snap.cookies ?? {});
         Object.assign(rt.localStorage, snap.localStorage ?? {});
+        Object.assign(rt.sessionStorage, snap.sessionStorage ?? {});
+        Object.assign(rt.indexedDb, snap.indexedDb ?? {});
         Object.assign(rt.tombstones, snap.tombstones ?? {});
         if (snap.rules && snap.rules.updatedAt > rt.meta.rules.updatedAt) {
           rt.meta.rules = { ...snap.rules, envSyncRules: snap.rules.envSyncRules ?? [] };
@@ -10826,24 +14413,12 @@ export class SyncEngine {
   async createSnapshot(): Promise<{ snapshotId: string }> {
     await this.ensureInitialized();
     return this.enqueueOp(async () => {
-      const rt = this.requireRuntime();
+      const rt = this.requireUnlockedRuntime();
       const dek = this.getCurrentDek(rt);
       const nowMs = this.now();
       const snapshotId = `snap_${String(nowMs).padStart(14, '0')}_${bytesToHex(generateRandomBytes(4))}`;
 
-      const payload: SnapshotPayload = {
-        snapshotId,
-        spaceId: rt.spaceId,
-        createdAt: nowMs,
-        createdByDevice: rt.meta.localDevice.deviceId,
-        coveredVectorClock: { ...rt.meta.localDevice.checkpoint.processedVectorClock },
-        cookies: { ...rt.cookies },
-        localStorage: { ...rt.localStorage },
-        tombstones: { ...rt.tombstones },
-        tracks: { ...rt.tracks },
-        rules: { ...rt.meta.rules },
-      };
-
+      const payload = this.buildSyncableSnapshotPayload(rt, snapshotId, nowMs);
       const p = snapshotFilePath(rt.meta.space.opaqueId, snapshotId);
       const aad = buildFileAad(rt.spaceId, rt.meta.space.keyEpoch, 'snapshot', p);
       const encrypted = await encryptWithDek(payload, dek, rt.meta.space.keyEpoch, aad, {
@@ -10871,7 +14446,7 @@ export class SyncEngine {
   }> {
     await this.ensureInitialized();
     return this.enqueueOp(async () => {
-      const rt = this.requireRuntime();
+      const rt = this.requireUnlockedRuntime();
       const nowMs = this.now();
 
       // Load all checkpoints
@@ -10879,7 +14454,7 @@ export class SyncEngine {
         [rt.meta.localDevice.deviceId]: rt.meta.localDevice.checkpoint,
       };
       try {
-        const chkStats = await rt.client.propfind(checkpointsDir(rt.meta.space.opaqueId), 1);
+        const chkStats = await rt.client.list(checkpointsDir(rt.meta.space.opaqueId), 1);
         for (const s of chkStats) {
           if (s.isCollection) continue;
           const name = s.name || extractFilename(s.path);
@@ -10915,6 +14490,8 @@ export class SyncEngine {
           delete rt.tombstones[objId];
           if (rt.cookies[objId]?.deleted) delete rt.cookies[objId];
           if (rt.localStorage[objId]?.deleted) delete rt.localStorage[objId];
+          if (rt.sessionStorage[objId]?.deleted) delete rt.sessionStorage[objId];
+          if (rt.indexedDb[objId]?.deleted) delete rt.indexedDb[objId];
           reclaimedTombstones += 1;
         } else {
           rt.tombstones[objId] = updated;
@@ -10934,7 +14511,7 @@ export class SyncEngine {
           if (coveredSeq <= 0) continue;
           const dir = deviceEventsDir(rt.meta.space.opaqueId, devId);
           try {
-            const evStats = await rt.client.propfind(dir, 1);
+            const evStats = await rt.client.list(dir, 1);
             for (const s of evStats) {
               if (s.isCollection) continue;
               const name = s.name || extractFilename(s.path);
@@ -10964,24 +14541,12 @@ export class SyncEngine {
   async createBackup(): Promise<{ backupId: string }> {
     await this.ensureInitialized();
     return this.enqueueOp(async () => {
-      const rt = this.requireRuntime();
+      const rt = this.requireUnlockedRuntime();
       const dek = this.getCurrentDek(rt);
       const nowMs = this.now();
       const backupId = `backup_${String(nowMs).padStart(14, '0')}_${bytesToHex(generateRandomBytes(4))}`;
 
-      const payload: SnapshotPayload = {
-        snapshotId: backupId,
-        spaceId: rt.spaceId,
-        createdAt: nowMs,
-        createdByDevice: rt.meta.localDevice.deviceId,
-        coveredVectorClock: { ...rt.meta.localDevice.checkpoint.processedVectorClock },
-        cookies: { ...rt.cookies },
-        localStorage: { ...rt.localStorage },
-        tombstones: { ...rt.tombstones },
-        tracks: { ...rt.tracks },
-        rules: { ...rt.meta.rules },
-      };
-
+      const payload = this.buildSyncableSnapshotPayload(rt, backupId, nowMs);
       const p = backupFilePath(rt.meta.space.opaqueId, backupId);
       const aad = buildFileAad(rt.spaceId, rt.meta.space.keyEpoch, 'backup', p);
       const encrypted = await encryptWithDek(payload, dek, rt.meta.space.keyEpoch, aad, {
@@ -11000,12 +14565,13 @@ export class SyncEngine {
 
   async listBackups(): Promise<WebDAVResourceStat[]> {
     await this.ensureInitialized();
-    const rt = this.requireRuntime();
+    const rt = this.requireUnlockedRuntime();
     try {
-      const stats = await rt.client.propfind(backupsDir(rt.meta.space.opaqueId), 1);
+      const stats = await rt.client.list(backupsDir(rt.meta.space.opaqueId), 1);
       return stats
         .filter((s) => !s.isCollection && (s.name || extractFilename(s.path)).endsWith('.enc'))
-        .sort((a, b) => (b.name || extractFilename(b.path)).localeCompare(a.name || extractFilename(a.path)));
+        .sort((a, b) => (b.name || extractFilename(b.path)).localeCompare(a.name || extractFilename(a.path)))
+        .map((s) => this.toWebDAVResourceStat(s));
     } catch (err) {
       const se = toStructuredError(err, 'list_backups');
       if (se.status === 404) return [];
@@ -11013,10 +14579,236 @@ export class SyncEngine {
     }
   }
 
+  private async replaceFromSnapshotPayload(
+    rt: LoadedSpaceRuntime,
+    snapshot: SnapshotPayload,
+    reasonPrefix: string,
+    affectedSites: Set<string>,
+  ): Promise<{
+    importedCookies: number;
+    importedLocalStorage: number;
+    importedSessionStorage: number;
+    importedIndexedDb: number;
+    importedTracks: number;
+  }> {
+    const restoreNow = this.now();
+    let importedTracks = 0;
+    const importedTrackIds = new Set<string>();
+
+    for (const [tid, tr] of Object.entries(snapshot.tracks ?? {})) {
+      if (tr.ephemeral?.localOnly) continue;
+      if (rt.meta.removedTracks) {
+        delete rt.meta.removedTracks[tid];
+      }
+      rt.tracks[tid] = {
+        ...tr,
+        memberDeviceIds: Array.from(new Set([...(tr.memberDeviceIds ?? []), rt.meta.localDevice.deviceId])),
+        updatedAt: Math.max(restoreNow, tr.updatedAt + 1),
+        revision: (tr.revision ?? 0) + 1,
+      };
+      importedTrackIds.add(tid);
+      importedTracks += 1;
+    }
+
+    // Remove stale non-localOnly tracks belonging to affected sites that are absent from the snapshot
+    for (const [tid, tr] of Object.entries(rt.tracks)) {
+      if (tr.ephemeral?.localOnly || importedTrackIds.has(tid)) continue;
+      if (affectedSites.has(tr.siteKey)) {
+        rt.meta.removedTracks = rt.meta.removedTracks ?? {};
+        rt.meta.removedTracks[tid] = Math.max(restoreNow, tr.updatedAt + 1);
+        delete rt.tracks[tid];
+      }
+    }
+
+    if (snapshot.rules) {
+      rt.meta.rules = {
+        ...snapshot.rules,
+        envSyncRules: snapshot.rules.envSyncRules ?? [],
+        updatedAt: Math.max(restoreNow, (rt.meta.rules.updatedAt ?? 0) + 1),
+      };
+      this.syncRulesEngineState(rt);
+    }
+
+    let importedCookies = 0;
+    const liveCookieIds = new Set<string>();
+    for (const c of Object.values(snapshot.cookies ?? {})) {
+      if (c.deleted || this.isLocalOnlyTrack(rt, c.trackId)) continue;
+      liveCookieIds.add(c.logicalId);
+      const existingVc = rt.cookies[c.logicalId]?.version.vectorClock;
+      const tombVc = rt.tombstones[c.logicalId]?.deleteVersion.vectorClock;
+      let forceVc = existingVc ?? {};
+      if (tombVc) forceVc = mergeVectorClocks(forceVc, tombVc);
+
+      await this.emitLocalCookieUpsert(
+        rt,
+        c.siteKey,
+        c.trackId,
+        {
+          domain: c.domain,
+          name: c.name,
+          value: c.value,
+          path: c.path,
+          secure: c.secure,
+          httpOnly: c.httpOnly,
+          sameSite: c.sameSite,
+          session: c.session,
+          expirationDate: c.expirationDate,
+          hostOnly: c.hostOnly,
+          storeId: c.storeScope && c.storeScope !== 'default' ? c.storeScope : undefined,
+          partitionKey: c.partitionKey,
+        },
+        'RESTORE',
+        forceVc,
+      );
+      importedCookies += 1;
+    }
+
+    for (const cur of Object.values(rt.cookies)) {
+      if (
+        !cur.deleted &&
+        !this.isLocalOnlyTrack(rt, cur.trackId) &&
+        affectedSites.has(cur.siteKey) &&
+        !liveCookieIds.has(cur.logicalId)
+      ) {
+        await this.emitLocalCookieDelete(rt, cur, 'explicit', reasonPrefix);
+      }
+    }
+
+    let importedLocalStorage = 0;
+    const liveLsIds = new Set<string>();
+    for (const ls of Object.values(snapshot.localStorage ?? {})) {
+      if (ls.deleted || this.isLocalOnlyTrack(rt, ls.trackId)) continue;
+      liveLsIds.add(ls.logicalId);
+      const existingVc = rt.localStorage[ls.logicalId]?.version.vectorClock;
+      const tombVc = rt.tombstones[ls.logicalId]?.deleteVersion.vectorClock;
+      let forceVc = existingVc ?? {};
+      if (tombVc) forceVc = mergeVectorClocks(forceVc, tombVc);
+      await this.emitLocalStorageUpsert(
+        rt,
+        ls.siteKey,
+        ls.trackId,
+        ls.origin,
+        ls.key,
+        ls.value,
+        'RESTORE',
+        forceVc,
+      );
+      importedLocalStorage += 1;
+    }
+    for (const cur of Object.values(rt.localStorage)) {
+      if (
+        !cur.deleted &&
+        !this.isLocalOnlyTrack(rt, cur.trackId) &&
+        affectedSites.has(cur.siteKey) &&
+        !liveLsIds.has(cur.logicalId)
+      ) {
+        await this.emitLocalStorageDelete(rt, cur, 'explicit', reasonPrefix);
+      }
+    }
+
+    let importedSessionStorage = 0;
+    const liveSsIds = new Set<string>();
+    for (const ss of Object.values(snapshot.sessionStorage ?? {})) {
+      if (ss.deleted || this.isLocalOnlyTrack(rt, ss.trackId)) continue;
+      liveSsIds.add(ss.logicalId);
+      const existingVc = rt.sessionStorage[ss.logicalId]?.version.vectorClock;
+      const tombVc = rt.tombstones[ss.logicalId]?.deleteVersion.vectorClock;
+      let forceVc = existingVc ?? {};
+      if (tombVc) forceVc = mergeVectorClocks(forceVc, tombVc);
+      await this.emitLocalSessionStorageUpsert(
+        rt,
+        ss.siteKey,
+        ss.trackId,
+        ss.origin,
+        ss.key,
+        ss.value,
+        'RESTORE',
+        forceVc,
+      );
+      importedSessionStorage += 1;
+    }
+    for (const cur of Object.values(rt.sessionStorage)) {
+      if (
+        !cur.deleted &&
+        !this.isLocalOnlyTrack(rt, cur.trackId) &&
+        affectedSites.has(cur.siteKey) &&
+        !liveSsIds.has(cur.logicalId)
+      ) {
+        await this.emitLocalSessionStorageDelete(rt, cur, 'explicit', reasonPrefix);
+      }
+    }
+
+    let importedIndexedDb = 0;
+    const liveIdbIds = new Set<string>();
+    for (const idb of Object.values(snapshot.indexedDb ?? {})) {
+      if (idb.deleted || this.isLocalOnlyTrack(rt, idb.trackId)) continue;
+      liveIdbIds.add(idb.logicalId);
+      const existingVc = rt.indexedDb[idb.logicalId]?.version.vectorClock;
+      const tombVc = rt.tombstones[idb.logicalId]?.deleteVersion.vectorClock;
+      let forceVc = existingVc ?? {};
+      if (tombVc) forceVc = mergeVectorClocks(forceVc, tombVc);
+      const {
+        logicalId: _lid,
+        siteKey: _sk,
+        trackId: _tid,
+        version: _v,
+        sourceDevice: _sd,
+        sourceDeviceName: _sdn,
+        deleted: _del,
+        updatedAt: _uat,
+        syncStatus: _st,
+        ...item
+      } = idb;
+      await this.emitLocalIndexedDbUpsert(
+        rt,
+        idb.siteKey,
+        idb.trackId,
+        item,
+        'RESTORE',
+        forceVc,
+      );
+      importedIndexedDb += 1;
+    }
+    for (const cur of Object.values(rt.indexedDb)) {
+      if (
+        !cur.deleted &&
+        !this.isLocalOnlyTrack(rt, cur.trackId) &&
+        affectedSites.has(cur.siteKey) &&
+        !liveIdbIds.has(cur.logicalId)
+      ) {
+        await this.emitLocalIndexedDbDelete(rt, cur, 'explicit', reasonPrefix);
+      }
+    }
+
+    return {
+      importedCookies,
+      importedLocalStorage,
+      importedSessionStorage,
+      importedIndexedDb,
+      importedTracks,
+    };
+  }
+
+  private collectAffectedSitesFromSnapshot(
+    snapshot: SnapshotPayload,
+    extraSites?: Iterable<string>,
+  ): Set<string> {
+    const affectedSites = new Set<string>(extraSites);
+    for (const tr of Object.values(snapshot.tracks ?? {})) {
+      if (!tr.ephemeral?.localOnly) affectedSites.add(tr.siteKey);
+    }
+    for (const c of Object.values(snapshot.cookies ?? {})) affectedSites.add(c.siteKey);
+    for (const l of Object.values(snapshot.localStorage ?? {})) affectedSites.add(l.siteKey);
+    for (const s of Object.values(snapshot.sessionStorage ?? {})) affectedSites.add(s.siteKey);
+    for (const d of Object.values(snapshot.indexedDb ?? {})) affectedSites.add(d.siteKey);
+    for (const t of Object.values(snapshot.tombstones ?? {})) affectedSites.add(t.siteKey);
+    return affectedSites;
+  }
+
   async restoreBackup(backupId: string): Promise<void> {
     await this.ensureInitialized();
     return this.enqueueOp(async () => {
-      const rt = this.requireRuntime();
+      const rt = this.requireUnlockedRuntime();
       const cleanId = backupId.endsWith('.enc') ? backupId.slice(0, -4) : backupId;
       const p = backupFilePath(rt.meta.space.opaqueId, cleanId);
 
@@ -11030,92 +14822,14 @@ export class SyncEngine {
         throw new Error('Backup AAD verification failed');
       }
 
-      const affectedSites = new Set<string>();
-      for (const tr of Object.values(backup.tracks ?? {})) affectedSites.add(tr.siteKey);
-      for (const c of Object.values(backup.cookies ?? {})) affectedSites.add(c.siteKey);
+      const affectedSites = this.collectAffectedSitesFromSnapshot(backup);
 
       // Save SafetyUndoPoints before restoring backup!
       for (const siteKey of affectedSites) {
         await this.captureSafetyUndoPoint(rt, siteKey, `restore_backup:${cleanId}`);
       }
 
-      // Restore tracks & rules (clearing removedTracks tombstones and bumping timestamps/revisions
-      // so peer devices accept the resurrected tracks instead of re-deleting them!)
-      const restoreNow = this.now();
-      for (const [tid, tr] of Object.entries(backup.tracks ?? {})) {
-        if (rt.meta.removedTracks) {
-          delete rt.meta.removedTracks[tid];
-        }
-        rt.tracks[tid] = {
-          ...tr,
-          updatedAt: Math.max(restoreNow, tr.updatedAt + 1),
-          revision: (tr.revision ?? 0) + 1,
-        };
-      }
-      if (backup.rules) {
-        rt.meta.rules = {
-          ...backup.rules,
-          envSyncRules: backup.rules.envSyncRules ?? [],
-          updatedAt: restoreNow,
-        };
-        this.syncRulesEngineState(rt);
-      }
-
-      // Emit new causal successor RESTORE events for all live cookies in the backup
-      const backupLiveCookieIds = new Set<string>();
-      for (const c of Object.values(backup.cookies ?? {})) {
-        if (c.deleted) continue;
-        backupLiveCookieIds.add(c.logicalId);
-        const existingVc = rt.cookies[c.logicalId]?.version.vectorClock;
-        const tombVc = rt.tombstones[c.logicalId]?.deleteVersion.vectorClock;
-        let forceVc = existingVc ?? {};
-        if (tombVc) forceVc = mergeVectorClocks(forceVc, tombVc);
-
-        await this.emitLocalCookieUpsert(
-          rt,
-          c.siteKey,
-          c.trackId,
-          {
-            domain: c.domain,
-            name: c.name,
-            value: c.value,
-            path: c.path,
-            secure: c.secure,
-            httpOnly: c.httpOnly,
-            sameSite: c.sameSite,
-            session: c.session,
-            expirationDate: c.expirationDate,
-            hostOnly: c.hostOnly,
-            storeId: c.storeScope && c.storeScope !== 'default' ? c.storeScope : undefined,
-            partitionKey: c.partitionKey,
-          },
-          'RESTORE',
-          forceVc,
-        );
-      }
-
-      // Delete cookies on affected sites that didn't exist in the backup
-      for (const cur of Object.values(rt.cookies)) {
-        if (!cur.deleted && affectedSites.has(cur.siteKey) && !backupLiveCookieIds.has(cur.logicalId)) {
-          await this.emitLocalCookieDelete(rt, cur, 'explicit', 'restore_backup');
-        }
-      }
-
-      // Restore LocalStorage records from backup
-      for (const ls of Object.values(backup.localStorage ?? {})) {
-        if (ls.deleted) continue;
-        const existingVc = rt.localStorage[ls.logicalId]?.version.vectorClock;
-        await this.emitLocalStorageUpsert(
-          rt,
-          ls.siteKey,
-          ls.trackId,
-          ls.origin,
-          ls.key,
-          ls.value,
-          'RESTORE',
-          existingVc,
-        );
-      }
+      await this.replaceFromSnapshotPayload(rt, backup, 'restore_backup', affectedSites);
 
       // Discard any stale debounced cookie events on affected sites before applying restored backup tracks
       this.changeDetector.discardWhere((c) =>
@@ -11124,9 +14838,12 @@ export class SyncEngine {
 
       // Apply restored tracks to local browser cleanly
       for (const siteKey of affectedSites) {
+        const currentTrackId = rt.meta.localDevice.siteBindings[siteKey]?.trackId;
         const trackId =
-          rt.meta.localDevice.siteBindings[siteKey]?.trackId ??
-          Object.values(rt.tracks).find((t) => t.siteKey === siteKey)?.trackId;
+          currentTrackId && rt.tracks[currentTrackId] && !rt.tracks[currentTrackId].ephemeral?.localOnly
+            ? currentTrackId
+            : Object.values(rt.tracks).find((t) => t.siteKey === siteKey && !t.ephemeral?.localOnly)
+                ?.trackId;
         if (trackId) {
           rt.meta.localDevice.siteBindings[siteKey] = {
             siteKey,
@@ -11148,6 +14865,1067 @@ export class SyncEngine {
       }
       await this.uploadDeviceManifestIfOnline(rt);
       await this.persistRuntime(rt);
+    });
+  }
+
+  // =========================================================================
+  // v1.3 Archive Backup (.smesh-backup), Ephemeral Shares, Debug Export & Expiry Cleanup
+  // =========================================================================
+
+  async exportArchiveBackup(passphrase?: string): Promise<{
+    bytes: Uint8Array;
+    base64: string;
+    suggestedFilename: string;
+    byteLength: number;
+  }> {
+    await this.ensureInitialized();
+    const rt = this.requireUnlockedRuntime();
+    const effectivePass = passphrase?.trim() || rt.encryptionPassword;
+    if (!effectivePass) {
+      throw new Error('请输入备份加密口令以生成独立加密备份包');
+    }
+
+    const nowMs = this.now();
+    const snapshot = this.buildSyncableSnapshotPayload(rt, `archive_${nowMs}`, nowMs);
+    const payload: ArchiveBackupPayload = {
+      format: 'sessionmesh_archive',
+      version: 1,
+      exportedAt: nowMs,
+      spaceName: rt.meta.space.name,
+      snapshot,
+    };
+    const bytes = await encodeArchiveBackup(payload, effectivePass, {
+      iterations: this.pbkdf2Iterations,
+    });
+    const base64 = bytesToBase64(bytes);
+    const safeSpace = (rt.meta.space.name || rt.spaceId)
+      .replace(/[^a-z0-9\u4e00-\u9fa5._-]+/gi, '_')
+      .slice(0, 40) || 'space';
+    const stamp = new Date(nowMs).toISOString().replace(/[:T]/g, '-').slice(0, 19);
+    return {
+      bytes,
+      base64,
+      suggestedFilename: `sessionmesh-${safeSpace}-${stamp}.smesh-backup`,
+      byteLength: bytes.byteLength,
+    };
+  }
+
+  async importArchiveBackup(params: {
+    bytes?: Uint8Array;
+    base64?: string;
+    passphrase?: string;
+    mode: ImportArchiveBackupMode;
+  }): Promise<ImportArchiveBackupResult> {
+    await this.ensureInitialized();
+    return this.enqueueOp(async () => {
+      const rt = this.requireUnlockedRuntime();
+      const effectivePass = params.passphrase?.trim() || rt.encryptionPassword;
+      if (!effectivePass) {
+        throw new Error('请输入该备份包的解密口令');
+      }
+      const rawBytes =
+        params.bytes ?? (params.base64?.trim() ? base64ToBytes(params.base64.trim()) : null);
+      if (!rawBytes || rawBytes.byteLength === 0) {
+        throw new Error('备份文件内容为空');
+      }
+
+      const archive = await decodeArchiveBackup(rawBytes, effectivePass);
+      const snap = archive.snapshot;
+      const nowMs = this.now();
+
+      const existingNonLocalSites =
+        params.mode === 'replace'
+          ? Object.entries(rt.meta.localDevice.siteBindings)
+              .filter(
+                ([, b]) =>
+                  b?.trackId && rt.tracks[b.trackId] && !rt.tracks[b.trackId].ephemeral?.localOnly,
+              )
+              .map(([sk]) => sk)
+          : [];
+      const affectedSites = this.collectAffectedSitesFromSnapshot(snap, existingNonLocalSites);
+
+      for (const siteKey of affectedSites) {
+        await this.captureSafetyUndoPoint(rt, siteKey, `import_archive:${params.mode}`);
+      }
+
+      let counts = {
+        importedCookies: 0,
+        importedLocalStorage: 0,
+        importedSessionStorage: 0,
+        importedIndexedDb: 0,
+        importedTracks: 0,
+      };
+
+      if (params.mode === 'replace') {
+        counts = await this.replaceFromSnapshotPayload(rt, snap, 'import_archive_replace', affectedSites);
+      } else {
+        // Causal merge across tracks, rules, tombstones, and all 4 record collections
+        for (const [tid, tr] of Object.entries(snap.tracks ?? {})) {
+          if (tr.ephemeral?.localOnly) continue;
+          const prevTrack = rt.tracks[tid];
+          this.mergeRemoteTrack(rt, tid, tr);
+          if (
+            rt.tracks[tid] &&
+            (!prevTrack || (rt.tracks[tid].revision ?? 0) > (prevTrack.revision ?? 0) || rt.tracks[tid].updatedAt > prevTrack.updatedAt)
+          ) {
+            counts.importedTracks += 1;
+          }
+        }
+
+        const primaryDeviceId =
+          rt.meta.space.settings.authorityMode === 'primary_device'
+            ? rt.meta.space.settings.primaryDeviceId
+            : undefined;
+
+        const mergeCollection = async <
+          T extends CookieRecord | LocalStorageRecord | SessionStorageRecord | IndexedDbRecord,
+        >(
+          kind: 'cookie' | 'localStorage' | 'sessionStorage' | 'indexedDb',
+          localCol: Record<string, T>,
+          snapCol: Record<string, T> | undefined,
+        ): Promise<number> => {
+          let importedCount = 0;
+          const candidateIds = new Set<string>(Object.keys(snapCol ?? {}));
+          for (const [tid, t] of Object.entries(snap.tombstones ?? {})) {
+            if (t.objectType === kind) candidateIds.add(tid);
+          }
+
+          for (const lid of candidateIds) {
+            const snapRec = snapCol?.[lid];
+            const snapTomb = snap.tombstones?.[lid];
+            const trackId = snapRec?.trackId ?? snapTomb?.trackId;
+            if (!trackId || this.isLocalOnlyTrack(rt, trackId)) continue;
+
+            const localRec = localCol[lid];
+            const localTomb = rt.tombstones[lid];
+            const outcome = resolveItemMerge<T>({
+              spaceId: rt.spaceId,
+              localRecord: localRec && !localRec.deleted ? localRec : undefined,
+              localTombstone: localTomb,
+              remoteRecord: snapRec && !snapRec.deleted ? snapRec : undefined,
+              remoteTombstone: snapTomb,
+              primaryDeviceId,
+            });
+
+            if (outcome.winner === 'tombstone' && outcome.tombstone) {
+              if (localRec && !localRec.deleted) {
+                if (kind === 'cookie') {
+                  await this.emitLocalCookieDelete(rt, localRec as CookieRecord, outcome.tombstone.reason, 'import_archive_merge');
+                } else if (kind === 'localStorage') {
+                  await this.emitLocalStorageDelete(rt, localRec as LocalStorageRecord, outcome.tombstone.reason, 'import_archive_merge');
+                } else if (kind === 'sessionStorage') {
+                  await this.emitLocalSessionStorageDelete(rt, localRec as SessionStorageRecord, outcome.tombstone.reason, 'import_archive_merge');
+                } else {
+                  await this.emitLocalIndexedDbDelete(rt, localRec as IndexedDbRecord, outcome.tombstone.reason, 'import_archive_merge');
+                }
+              } else {
+                rt.tombstones[lid] = {
+                  ...outcome.tombstone,
+                  acknowledgedDevices: Array.from(
+                    new Set([...(outcome.tombstone.acknowledgedDevices ?? []), rt.meta.localDevice.deviceId]),
+                  ),
+                };
+              }
+              continue;
+            }
+
+            if (outcome.winner === 'remote' && outcome.record) {
+              const forceVc = mergeVectorClocks(
+                mergeVectorClocks(
+                  localRec?.version?.vectorClock ?? {},
+                  localTomb?.deleteVersion?.vectorClock ?? {},
+                ),
+                outcome.record.version.vectorClock,
+              );
+              if (kind === 'cookie') {
+                const c = outcome.record as CookieRecord;
+                await this.emitLocalCookieUpsert(
+                  rt,
+                  c.siteKey,
+                  c.trackId,
+                  {
+                    domain: c.domain,
+                    name: c.name,
+                    value: c.value,
+                    path: c.path,
+                    secure: c.secure,
+                    httpOnly: c.httpOnly,
+                    sameSite: c.sameSite,
+                    session: c.session,
+                    expirationDate: c.expirationDate,
+                    hostOnly: c.hostOnly,
+                    storeId: c.storeScope && c.storeScope !== 'default' ? c.storeScope : undefined,
+                    partitionKey: c.partitionKey,
+                  },
+                  'RESTORE',
+                  forceVc,
+                );
+              } else if (kind === 'localStorage') {
+                const ls = outcome.record as LocalStorageRecord;
+                await this.emitLocalStorageUpsert(
+                  rt,
+                  ls.siteKey,
+                  ls.trackId,
+                  ls.origin,
+                  ls.key,
+                  ls.value,
+                  'RESTORE',
+                  forceVc,
+                );
+              } else if (kind === 'sessionStorage') {
+                const ss = outcome.record as SessionStorageRecord;
+                await this.emitLocalSessionStorageUpsert(
+                  rt,
+                  ss.siteKey,
+                  ss.trackId,
+                  ss.origin,
+                  ss.key,
+                  ss.value,
+                  'RESTORE',
+                  forceVc,
+                );
+              } else {
+                const idb = outcome.record as IndexedDbRecord;
+                const {
+                  logicalId: _lid,
+                  siteKey: _sk,
+                  trackId: _tid,
+                  version: _v,
+                  sourceDevice: _sd,
+                  sourceDeviceName: _sdn,
+                  deleted: _del,
+                  updatedAt: _uat,
+                  syncStatus: _st,
+                  ...item
+                } = idb;
+                await this.emitLocalIndexedDbUpsert(
+                  rt,
+                  idb.siteKey,
+                  idb.trackId,
+                  item,
+                  'RESTORE',
+                  forceVc,
+                );
+              }
+              importedCount += 1;
+            }
+          }
+          return importedCount;
+        };
+
+        counts.importedCookies = await mergeCollection('cookie', rt.cookies, snap.cookies);
+        counts.importedLocalStorage = await mergeCollection('localStorage', rt.localStorage, snap.localStorage);
+        counts.importedSessionStorage = await mergeCollection('sessionStorage', rt.sessionStorage, snap.sessionStorage);
+        counts.importedIndexedDb = await mergeCollection('indexedDb', rt.indexedDb, snap.indexedDb);
+
+        if (snap.rules) {
+          const existingBlIds = new Set(rt.meta.rules.spaceBlacklist.map((b) => b.id));
+          for (const bl of snap.rules.spaceBlacklist ?? []) {
+            if (!existingBlIds.has(bl.id)) {
+              rt.meta.rules.spaceBlacklist.push({ ...bl });
+            }
+          }
+          for (const [sk, ov] of Object.entries(snap.rules.siteOverrides ?? {})) {
+            const cur = rt.meta.rules.siteOverrides[sk];
+            if (!cur || ov.updatedAt > cur.updatedAt) {
+              rt.meta.rules.siteOverrides[sk] = { ...ov };
+            }
+          }
+          const existingGroupIds = new Set(rt.meta.rules.ssoGroups.map((g) => g.groupId));
+          for (const g of snap.rules.ssoGroups ?? []) {
+            if (!existingGroupIds.has(g.groupId)) {
+              rt.meta.rules.ssoGroups.push({ ...g });
+            }
+          }
+          const existingEnvIds = new Set((rt.meta.rules.envSyncRules ?? []).map((r) => r.id));
+          rt.meta.rules.envSyncRules = rt.meta.rules.envSyncRules ?? [];
+          for (const r of snap.rules.envSyncRules ?? []) {
+            if (!existingEnvIds.has(r.id)) {
+              rt.meta.rules.envSyncRules.push({ ...r });
+            }
+          }
+          rt.meta.rules.updatedAt = Math.max(nowMs, rt.meta.rules.updatedAt, snap.rules.updatedAt);
+          this.syncRulesEngineState(rt);
+        }
+      }
+
+      this.changeDetector.discardWhere((c) =>
+        affectedSites.has(resolveSiteKey(c.domain, rt.meta.rules.ssoGroups)),
+      );
+
+      for (const siteKey of affectedSites) {
+        const curTrackId = rt.meta.localDevice.siteBindings[siteKey]?.trackId;
+        if (curTrackId && rt.tracks[curTrackId]?.ephemeral?.localOnly) {
+          continue;
+        }
+        const nonLocalTracks = this.ensureSiteTrackSortOrders(rt, siteKey).filter(
+          (t) => !t.ephemeral?.localOnly,
+        );
+        const targetTrackId =
+          curTrackId && rt.tracks[curTrackId] ? curTrackId : nonLocalTracks[0]?.trackId;
+
+        if (targetTrackId) {
+          const targetTrack = rt.tracks[targetTrackId];
+          if (targetTrack && !targetTrack.memberDeviceIds.includes(rt.meta.localDevice.deviceId)) {
+            targetTrack.memberDeviceIds.push(rt.meta.localDevice.deviceId);
+          }
+          rt.meta.localDevice.siteBindings[siteKey] = {
+            siteKey,
+            state: 'USER_BOUND',
+            trackId: targetTrackId,
+            availableTrackIds: nonLocalTracks.map((t) => t.trackId),
+            hasLocalBaseline: true,
+            decidedAt: nowMs,
+            decidedBy: 'user',
+          };
+          await this.applyTrackToBrowser(rt, siteKey, targetTrackId, {
+            cleanStale: params.mode === 'replace',
+            triggerRefresh: true,
+            allowLocalTrackSwitch: true,
+          });
+        } else if (params.mode === 'replace') {
+          await this.wipeBrowserStateForSite(rt, siteKey, nowMs);
+          rt.meta.localDevice.siteBindings[siteKey] = {
+            siteKey,
+            state: 'UNMANAGED',
+            trackId: undefined,
+            hasLocalBaseline: false,
+            decidedAt: nowMs,
+            decidedBy: 'user',
+          };
+        }
+      }
+
+      rt.meta.space.status = this.computeStatus(rt);
+      if (this.isOnline() && !rt.meta.storageFullHalted) {
+        await this.tryPushOutboundBestEffort(rt, 'import_archive_backup');
+        await this.uploadDeviceManifestIfOnline(rt);
+      }
+      await this.persistRuntime(rt);
+
+      return {
+        mode: params.mode,
+        spaceName: archive.spaceName,
+        ...counts,
+      };
+    });
+  }
+
+  async cleanupExpiredEphemeralTracks(): Promise<number> {
+    await this.ensureInitialized();
+    return this.enqueueOp(async () => {
+      const rt = this.runtime;
+      if (!rt) return 0;
+
+      const nowMs = this.now();
+      const expiredTracks = Object.values(rt.tracks).filter(
+        (tr) => tr.ephemeral?.expiresAt !== undefined && tr.ephemeral.expiresAt <= nowMs,
+      );
+      if (expiredTracks.length === 0) return 0;
+
+      const isUnlocked = Boolean(rt.dekKeyring[rt.meta.space.keyEpoch]);
+      let cleanedSyncableTrack = false;
+
+      for (const track of expiredTracks) {
+        const wasLocalOnly = Boolean(track.ephemeral?.localOnly);
+        const wasActive = rt.meta.localDevice.siteBindings[track.siteKey]?.trackId === track.trackId;
+
+        if (wasLocalOnly || !isUnlocked) {
+          this.purgeTrackRecordsLocally(rt, track.trackId);
+          if (!wasLocalOnly) {
+            rt.meta.removedTracks = rt.meta.removedTracks ?? {};
+            rt.meta.removedTracks[track.trackId] = Math.max(nowMs, track.updatedAt + 1);
+          }
+          delete rt.tracks[track.trackId];
+        } else {
+          for (const rec of Object.values(rt.cookies)) {
+            if (rec.trackId === track.trackId && !rec.deleted) {
+              await this.emitLocalCookieDelete(rt, rec, 'expired', 'ephemeral_expired');
+            }
+          }
+          for (const rec of Object.values(rt.localStorage)) {
+            if (rec.trackId === track.trackId && !rec.deleted) {
+              await this.emitLocalStorageDelete(rt, rec, 'expired', 'ephemeral_expired');
+            }
+          }
+          for (const rec of Object.values(rt.sessionStorage)) {
+            if (rec.trackId === track.trackId && !rec.deleted) {
+              await this.emitLocalSessionStorageDelete(rt, rec, 'expired', 'ephemeral_expired');
+            }
+          }
+          for (const rec of Object.values(rt.indexedDb)) {
+            if (rec.trackId === track.trackId && !rec.deleted) {
+              await this.emitLocalIndexedDbDelete(rt, rec, 'expired', 'ephemeral_expired');
+            }
+          }
+          rt.meta.removedTracks = rt.meta.removedTracks ?? {};
+          rt.meta.removedTracks[track.trackId] = Math.max(nowMs, track.updatedAt + 1);
+          delete rt.tracks[track.trackId];
+          cleanedSyncableTrack = true;
+        }
+
+        rt.meta.expiredEphemeralNotifications = rt.meta.expiredEphemeralNotifications ?? [];
+        const notifId = track.ephemeral?.shareId
+          ? `${track.trackId}:${track.ephemeral.shareId}`
+          : track.trackId;
+        if (!rt.meta.expiredEphemeralNotifications.some((n) => n.id === notifId)) {
+          rt.meta.expiredEphemeralNotifications.push({
+            id: notifId,
+            siteKey: track.siteKey,
+            trackId: track.trackId,
+            label: track.label,
+            expiredAt: nowMs,
+          });
+          if (rt.meta.expiredEphemeralNotifications.length > 20) {
+            rt.meta.expiredEphemeralNotifications = rt.meta.expiredEphemeralNotifications.slice(-20);
+          }
+        }
+
+        const remaining = this.ensureSiteTrackSortOrders(rt, track.siteKey);
+        const curBinding = rt.meta.localDevice.siteBindings[track.siteKey];
+        if (wasActive) {
+          if (remaining.length > 0) {
+            const nextTrack = remaining[0];
+            if (!nextTrack.memberDeviceIds.includes(rt.meta.localDevice.deviceId)) {
+              nextTrack.memberDeviceIds.push(rt.meta.localDevice.deviceId);
+            }
+            nextTrack.updatedAt = nowMs;
+            nextTrack.lastUsedAt = nowMs;
+            rt.meta.localDevice.siteBindings[track.siteKey] = {
+              siteKey: track.siteKey,
+              state: 'USER_BOUND',
+              trackId: nextTrack.trackId,
+              availableTrackIds: remaining.map((t) => t.trackId),
+              hasLocalBaseline: true,
+              decidedAt: nowMs,
+              decidedBy: 'user',
+            };
+            this.changeDetector.discardWhere((c) =>
+              domainMatchesSiteKey(c.domain, track.siteKey, rt.meta.rules.ssoGroups),
+            );
+            this.postTrackSwitchLeaveMuteUntil.set(track.siteKey, this.now() + 2_500);
+            await this.applyTrackToBrowser(rt, track.siteKey, nextTrack.trackId, {
+              cleanStale: true,
+              triggerRefresh: true,
+              allowLocalTrackSwitch: true,
+            });
+          } else {
+            await this.wipeBrowserStateForSite(rt, track.siteKey, nowMs);
+            rt.meta.localDevice.siteBindings[track.siteKey] = {
+              siteKey: track.siteKey,
+              state: 'UNMANAGED',
+              trackId: undefined,
+              hasLocalBaseline: false,
+              decidedAt: nowMs,
+              decidedBy: 'user',
+            };
+            await this.reloadTabsForUserAction(rt, this.siteTabMatcher(rt, track.siteKey));
+          }
+        } else if (curBinding) {
+          curBinding.availableTrackIds = remaining.map((t) => t.trackId);
+        }
+      }
+
+      rt.meta.space.status = this.computeStatus(rt);
+      if (cleanedSyncableTrack && isUnlocked) {
+        await this.tryPushOutboundBestEffort(rt, 'cleanup_expired_ephemeral');
+        await this.uploadDeviceManifestIfOnline(rt);
+      }
+      await this.persistRuntime(rt);
+      return expiredTracks.length;
+    });
+  }
+
+  private async collectLiveKvMapsForSite(
+    rt: LoadedSpaceRuntime | null,
+    siteKey: string,
+    extraOrigins: Iterable<string>,
+    options: { includeLocalStorage: boolean; includeSessionStorage: boolean },
+  ): Promise<{
+    localStorageByOrigin: Record<string, Record<string, string>>;
+    sessionStorageByOrigin: Record<string, Record<string, string>>;
+  }> {
+    const ssoGroups = rt?.meta.rules.ssoGroups ?? [];
+    const origins = new Set<string>(extraOrigins);
+    try {
+      const tabs = await this.browser.queryTabs();
+      for (const tab of tabs) {
+        const origin = tab.url ? normalizeOriginSafe(tab.url) : null;
+        if (!origin) continue;
+        const tabSite = resolveSiteKey(origin, ssoGroups) || normalizeDomain(origin);
+        if (tabSite === siteKey || domainMatchesSiteKey(origin, siteKey, ssoGroups)) {
+          origins.add(origin);
+        }
+      }
+    } catch {
+      // ignore tab query failures
+    }
+
+    const localStorageByOrigin: Record<string, Record<string, string>> = {};
+    const sessionStorageByOrigin: Record<string, Record<string, string>> = {};
+    for (const origin of origins) {
+      if (options.includeLocalStorage) {
+        const ls = await this.browser.getLocalStorage(origin).catch(() => ({ available: false, items: {} }));
+        if (ls.available && Object.keys(ls.items).length > 0) {
+          localStorageByOrigin[origin] = { ...ls.items };
+        }
+      }
+      if (options.includeSessionStorage && this.browser.getSessionStorage) {
+        const ss = await this.browser.getSessionStorage(origin).catch(() => ({ available: false, items: {} }));
+        if (ss.available && Object.keys(ss.items).length > 0) {
+          sessionStorageByOrigin[origin] = { ...ss.items };
+        }
+      }
+    }
+    return { localStorageByOrigin, sessionStorageByOrigin };
+  }
+
+  async exportDebugState(request: DebugExportRequest): Promise<DebugExportResult> {
+    await this.ensureInitialized();
+    const rt = this.runtime;
+    const ssoGroups = rt?.meta.rules.ssoGroups ?? [];
+    const rawTargetUrl = request.targetUrl?.trim();
+    const siteKey = request.siteKey?.trim()
+      ? resolveSiteKey(request.siteKey.trim(), ssoGroups) ||
+        normalizeDomain(request.siteKey.trim()) ||
+        request.siteKey.trim()
+      : rawTargetUrl
+        ? resolveSiteKey(rawTargetUrl, ssoGroups) || normalizeDomain(rawTargetUrl)
+        : '';
+
+    if (!siteKey) {
+      throw new Error('请提供有效的目标站点或 URL 以便导出调试状态');
+    }
+
+    const parsedTargetOrigin = rawTargetUrl ? normalizeOriginSafe(rawTargetUrl) : null;
+    const isUnlocked = Boolean(rt && rt.dekKeyring[rt.meta.space.keyEpoch]);
+    const includeLs = request.includeLocalStorage !== false;
+    const includeSs = request.includeSessionStorage !== false;
+    const boundTrackId = rt?.meta.localDevice.siteBindings[siteKey]?.trackId;
+    const resolvedTrackId = request.trackId ?? (boundTrackId && rt?.tracks[boundTrackId] ? boundTrackId : undefined);
+    const targetTrack = isUnlocked && resolvedTrackId ? rt?.tracks[resolvedTrackId] : undefined;
+
+    if (request.trackId && !isUnlocked) {
+      this.requireUnlockedRuntime();
+    }
+    if (request.trackId && !targetTrack) {
+      throw new Error(`Track "${request.trackId}" not found for site "${siteKey}"`);
+    }
+
+    const cookiesByIdentity = new Map<string, BrowserCookieInput | CookieRecord>();
+    const addCookieEntry = (c: BrowserCookieInput | CookieRecord) => {
+      const id = `${c.hostOnly ? 'h' : 'd'}::${normalizeCookieDomain(c.domain, c.hostOnly)}::${c.path || '/'}::${c.name}`;
+      cookiesByIdentity.set(id, c);
+    };
+
+    const localStorageByOrigin: Record<string, Record<string, string>> = {};
+    const sessionStorageByOrigin: Record<string, Record<string, string>> = {};
+    let liveFallback = false;
+
+    if (isUnlocked && rt && targetTrack) {
+      for (const c of Object.values(rt.cookies)) {
+        if (!c.deleted && c.trackId === targetTrack.trackId) {
+          addCookieEntry(c);
+        }
+      }
+      if (includeLs) {
+        for (const r of Object.values(rt.localStorage)) {
+          if (!r.deleted && r.trackId === targetTrack.trackId) {
+            localStorageByOrigin[r.origin] = localStorageByOrigin[r.origin] ?? {};
+            localStorageByOrigin[r.origin][r.key] = r.value;
+          }
+        }
+      }
+      if (includeSs) {
+        for (const r of Object.values(rt.sessionStorage)) {
+          if (!r.deleted && r.trackId === targetTrack.trackId) {
+            sessionStorageByOrigin[r.origin] = sessionStorageByOrigin[r.origin] ?? {};
+            sessionStorageByOrigin[r.origin][r.key] = r.value;
+          }
+        }
+      }
+
+      if (targetTrack.trackId === boundTrackId) {
+        const allLive = await this.browser.getAllCookies();
+        const targetHost = rawTargetUrl ? normalizeDomain(rawTargetUrl) : '';
+        for (const c of allLive) {
+          if (
+            domainMatchesSiteKey(c.domain, siteKey, ssoGroups) ||
+            (targetHost &&
+              (normalizeDomain(c.domain) === targetHost || targetHost.endsWith(`.${normalizeDomain(c.domain)}`)))
+          ) {
+            addCookieEntry(c);
+          }
+        }
+        const liveKv = await this.collectLiveKvMapsForSite(
+          rt,
+          siteKey,
+          parsedTargetOrigin ? [parsedTargetOrigin] : [],
+          { includeLocalStorage: includeLs, includeSessionStorage: includeSs },
+        );
+        for (const [origin, items] of Object.entries(liveKv.localStorageByOrigin)) {
+          localStorageByOrigin[origin] = { ...(localStorageByOrigin[origin] ?? {}), ...items };
+        }
+        for (const [origin, items] of Object.entries(liveKv.sessionStorageByOrigin)) {
+          sessionStorageByOrigin[origin] = { ...(sessionStorageByOrigin[origin] ?? {}), ...items };
+        }
+      }
+    } else {
+      liveFallback = true;
+      const allLive = await this.browser.getAllCookies();
+      const targetHost = rawTargetUrl ? normalizeDomain(rawTargetUrl) : '';
+      for (const c of allLive) {
+        if (
+          domainMatchesSiteKey(c.domain, siteKey, ssoGroups) ||
+          (targetHost &&
+            (normalizeDomain(c.domain) === targetHost || targetHost.endsWith(`.${normalizeDomain(c.domain)}`)))
+        ) {
+          addCookieEntry(c);
+        }
+      }
+      const liveKv = await this.collectLiveKvMapsForSite(
+        rt,
+        siteKey,
+        parsedTargetOrigin ? [parsedTargetOrigin] : [],
+        { includeLocalStorage: includeLs, includeSessionStorage: includeSs },
+      );
+      Object.assign(localStorageByOrigin, liveKv.localStorageByOrigin);
+      Object.assign(sessionStorageByOrigin, liveKv.sessionStorageByOrigin);
+    }
+
+    return buildDebugExportResult({
+      format: request.format,
+      siteKey,
+      trackId: targetTrack?.trackId,
+      trackLabel: targetTrack?.label,
+      targetUrl: rawTargetUrl,
+      cookies: Array.from(cookiesByIdentity.values()),
+      localStorageByOrigin: includeLs ? localStorageByOrigin : undefined,
+      sessionStorageByOrigin: includeSs ? sessionStorageByOrigin : undefined,
+      filterNoise:
+        request.filterNoise ?? rt?.meta.space.settings.filterAnalyticsNoiseCookies ?? true,
+      liveFallback,
+      nowMs: this.now(),
+    });
+  }
+
+  async createSessionShare(request: CreateSessionShareRequest): Promise<CreateSessionShareResult> {
+    await this.ensureInitialized();
+    const rt = this.requireUnlockedRuntime();
+    if (!request.passphrase?.trim()) {
+      throw new Error('请设置临时分享加密口令');
+    }
+    if (!Number.isFinite(request.ttlMs) || request.ttlMs <= 0) {
+      throw new Error('分享有效期 ttlMs 必须大于 0');
+    }
+
+    const nowMs = this.now();
+    const expiresAt = nowMs + request.ttlMs;
+    const ssoGroups = rt.meta.rules.ssoGroups;
+    const siteKey =
+      resolveSiteKey(request.siteKey, ssoGroups) || normalizeDomain(request.siteKey) || request.siteKey;
+    const boundTrackId = rt.meta.localDevice.siteBindings[siteKey]?.trackId;
+    const targetTrackId = request.trackId ?? boundTrackId;
+    const targetTrack = targetTrackId ? rt.tracks[targetTrackId] : undefined;
+    if (request.trackId && (!targetTrack || targetTrack.siteKey !== siteKey)) {
+      throw new Error(`Track "${request.trackId}" not found for site "${siteKey}"`);
+    }
+
+    const cookiesByIdentity = new Map<string, BrowserCookieInput>();
+    const addShareCookie = (c: BrowserCookieInput | CookieRecord) => {
+      if ('deleted' in c && c.deleted) return;
+      if (!c.session && c.expirationDate !== undefined) {
+        const expMs = c.expirationDate > 1e12 ? c.expirationDate : c.expirationDate * 1000;
+        if (!Number.isFinite(expMs) || expMs <= nowMs) return;
+      }
+      if (request.excludeHttpOnly && c.httpOnly) return;
+      if (request.filterNoise !== false && isAnalyticsNoiseCookie(c.name)) return;
+      const id = `${c.hostOnly ? 'h' : 'd'}::${normalizeCookieDomain(c.domain, c.hostOnly)}::${c.path || '/'}::${c.name}`;
+      cookiesByIdentity.set(id, {
+        domain: c.domain,
+        name: c.name,
+        value: c.value,
+        path: c.path,
+        secure: c.secure,
+        httpOnly: c.httpOnly,
+        sameSite: c.sameSite,
+        session: c.session,
+        expirationDate: c.expirationDate,
+        hostOnly: c.hostOnly,
+        storeId:
+          'storeScope' in c
+            ? c.storeScope && c.storeScope !== 'default'
+              ? c.storeScope
+              : undefined
+            : c.storeId,
+        partitionKey: c.partitionKey,
+      });
+    };
+
+    if (targetTrack) {
+      for (const c of Object.values(rt.cookies)) {
+        if (!c.deleted && c.trackId === targetTrack.trackId) {
+          addShareCookie(c);
+        }
+      }
+    }
+    if (!request.trackId || targetTrack?.trackId === boundTrackId) {
+      const liveJar = await this.browser.getAllCookies();
+      for (const c of liveJar) {
+        if (domainMatchesSiteKey(c.domain, siteKey, ssoGroups)) {
+          addShareCookie(c);
+        }
+      }
+    }
+
+    const includeSet =
+      request.includeCookieNames && request.includeCookieNames.length > 0
+        ? new Set(request.includeCookieNames.map((n) => n.trim()).filter(Boolean))
+        : null;
+    const excludeSet = new Set(
+      (request.excludeCookieNames ?? []).map((n) => n.trim()).filter(Boolean),
+    );
+    const filteredCookies = Array.from(cookiesByIdentity.values()).filter((c) => {
+      if (includeSet && !includeSet.has(c.name)) return false;
+      if (excludeSet.has(c.name)) return false;
+      return true;
+    });
+    const sharedCookies = clampSharedCookiesExpiry(
+      filteredCookies,
+      expiresAt,
+      request.clampCookieExpiry !== false,
+    );
+
+    const includeLs = request.includeLocalStorage !== false;
+    const includeSs = request.includeSessionStorage !== false;
+    const localStorageByOrigin: Record<string, Record<string, string>> = {};
+    const sessionStorageByOrigin: Record<string, Record<string, string>> = {};
+
+    if (targetTrack) {
+      if (includeLs) {
+        for (const r of Object.values(rt.localStorage)) {
+          if (!r.deleted && r.trackId === targetTrack.trackId) {
+            localStorageByOrigin[r.origin] = localStorageByOrigin[r.origin] ?? {};
+            localStorageByOrigin[r.origin][r.key] = r.value;
+          }
+        }
+      }
+      if (includeSs) {
+        for (const r of Object.values(rt.sessionStorage)) {
+          if (!r.deleted && r.trackId === targetTrack.trackId) {
+            sessionStorageByOrigin[r.origin] = sessionStorageByOrigin[r.origin] ?? {};
+            sessionStorageByOrigin[r.origin][r.key] = r.value;
+          }
+        }
+      }
+    }
+    if (!request.trackId || targetTrack?.trackId === boundTrackId) {
+      const liveKv = await this.collectLiveKvMapsForSite(rt, siteKey, [], {
+        includeLocalStorage: includeLs,
+        includeSessionStorage: includeSs,
+      });
+      for (const [origin, items] of Object.entries(liveKv.localStorageByOrigin)) {
+        localStorageByOrigin[origin] = { ...(localStorageByOrigin[origin] ?? {}), ...items };
+      }
+      for (const [origin, items] of Object.entries(liveKv.sessionStorageByOrigin)) {
+        sessionStorageByOrigin[origin] = { ...(sessionStorageByOrigin[origin] ?? {}), ...items };
+      }
+    }
+
+    const shareId = randomId('shr');
+    const accountLabel =
+      sanitizeShortLabel(request.accountLabel) || targetTrack?.label || siteKey;
+    const sharedBy = sanitizeShortLabel(request.sharedBy) || rt.meta.localDevice.name;
+    const payload: SessionSharePayload = {
+      version: 1,
+      shareId,
+      siteKey,
+      accountLabel,
+      note: request.note ? sanitizeShortLabel(request.note, 200) : undefined,
+      sharedBy,
+      createdAt: nowMs,
+      expiresAt,
+      clampCookieExpiry: request.clampCookieExpiry !== false,
+      cookies: sharedCookies,
+      localStorageByOrigin:
+        Object.keys(localStorageByOrigin).length > 0 ? localStorageByOrigin : undefined,
+      sessionStorageByOrigin:
+        Object.keys(sessionStorageByOrigin).length > 0 ? sessionStorageByOrigin : undefined,
+    };
+
+    const code = await encodeSessionShare(payload, request.passphrase.trim(), {
+      iterations: this.pbkdf2Iterations,
+    });
+    const preview = toSessionSharePreview(payload, nowMs);
+    return {
+      code,
+      shareId,
+      siteKey,
+      accountLabel,
+      expiresAt,
+      cookieCount: preview.cookieCount,
+      localStorageCount: preview.localStorageCount,
+      sessionStorageCount: preview.sessionStorageCount,
+    };
+  }
+
+  async previewSessionShare(code: string, passphrase: string): Promise<SessionSharePreview> {
+    const payload = await decodeSessionShare(code, passphrase, { nowMs: this.now() });
+    return toSessionSharePreview(payload, this.now());
+  }
+
+  async importSessionShare(request: ImportSessionShareRequest): Promise<ImportSessionShareResult> {
+    await this.ensureInitialized();
+    return this.enqueueOp(async () => {
+      const nowMs = this.now();
+      const payload = await decodeSessionShare(request.code, request.passphrase, { nowMs });
+      const siteKey = payload.siteKey;
+
+      if (request.mode === 'env_target') {
+        const parsedTarget = parseEnvTarget(request.targetUrl || '');
+        if (!parsedTarget) {
+          throw new Error('请提供有效的目标调试环境 URL');
+        }
+        const rt = this.runtime;
+        const selfUrl = rt ? getBlockedSelfUrlForStorage(rt.storage) : '';
+        if (selfUrl && isBlockedWebdavSelfTarget(selfUrl, parsedTarget)) {
+          throw new Error('禁止将临时会话注入到当前远程存储服务器自身域名');
+        }
+
+        const selection = selectAndMapEnvCookies({
+          candidates: payload.cookies.map((cookie) => ({ cookie, updatedAt: payload.createdAt })),
+          target: parsedTarget,
+          nowMs,
+          adaptForHttp: request.adaptForHttp ?? true,
+          filterNoise: false,
+        });
+
+        let appliedCookies = 0;
+        for (const mc of selection.mapped) {
+          const hash = cookieContentCanonicalHash(mc);
+          this.echoSuppressor.registerCookieMutation(mc, 'set', hash, nowMs);
+          const verification = await applyCookieWithVerification(this.browser, mc, nowMs);
+          if (verification.accepted) {
+            appliedCookies += 1;
+          }
+        }
+
+        const flattenEntries = (byOrigin?: Record<string, Record<string, string>>): Array<[string, string]> => {
+          const out = new Map<string, string>();
+          for (const entries of Object.values(byOrigin ?? {})) {
+            for (const [k, v] of Object.entries(entries)) {
+              out.set(k, v);
+            }
+          }
+          return Array.from(out.entries());
+        };
+
+        const lsEntries = flattenEntries(payload.localStorageByOrigin);
+        const ssEntries = flattenEntries(payload.sessionStorageByOrigin);
+        let appliedLocalStorage = 0;
+        let appliedSessionStorage = 0;
+
+        if (lsEntries.length > 0) {
+          const lsState = await this.browser.getLocalStorage(parsedTarget.origin);
+          if (lsState.available) {
+            const applyRes = await this.applyEnvOriginKvEntries(
+              'localStorage',
+              parsedTarget.origin,
+              lsState.items,
+              lsEntries,
+              false,
+              new Set(),
+              nowMs,
+            );
+            if (applyRes.applied) appliedLocalStorage = lsEntries.length;
+          } else if (rt) {
+            rt.meta.pendingEnvLsByOrigin = rt.meta.pendingEnvLsByOrigin ?? {};
+            rt.meta.pendingEnvLsByOrigin[parsedTarget.origin] = {
+              items: Object.fromEntries(lsEntries),
+              cleanTargetBeforeSync: false,
+              excludeKeys: [],
+              autoReloadTarget: false,
+            };
+          }
+        }
+
+        if (ssEntries.length > 0 && this.browser.getSessionStorage && this.browser.applySessionStorage) {
+          const ssState = await this.browser.getSessionStorage(parsedTarget.origin);
+          if (ssState.available) {
+            const applyRes = await this.applyEnvOriginKvEntries(
+              'sessionStorage',
+              parsedTarget.origin,
+              ssState.items,
+              ssEntries,
+              false,
+              new Set(),
+              nowMs,
+            );
+            if (applyRes.applied) appliedSessionStorage = ssEntries.length;
+          } else if (rt) {
+            rt.meta.pendingEnvSsByOrigin = rt.meta.pendingEnvSsByOrigin ?? {};
+            rt.meta.pendingEnvSsByOrigin[parsedTarget.origin] = {
+              items: Object.fromEntries(ssEntries),
+              cleanTargetBeforeSync: false,
+              excludeKeys: [],
+              autoReloadTarget: false,
+            };
+          }
+        }
+
+        if (rt && (lsEntries.length > 0 || ssEntries.length > 0)) {
+          await this.persistRuntime(rt);
+        }
+
+        return {
+          mode: 'env_target',
+          siteKey,
+          targetUrl: parsedTarget.origin,
+          appliedCookies,
+          appliedLocalStorage,
+          appliedSessionStorage,
+        };
+      }
+
+      const rt = this.requireUnlockedRuntime();
+      const normSiteKey =
+        resolveSiteKey(siteKey, rt.meta.rules.ssoGroups) || normalizeDomain(siteKey) || siteKey;
+      await this.captureSafetyUndoPoint(rt, normSiteKey, `import_share:${payload.shareId}`);
+
+      let targetTrackId: string;
+      const isEphemeral = request.mode === 'ephemeral_track';
+      if (isEphemeral) {
+        const existingTracks = this.ensureSiteTrackSortOrders(rt, normSiteKey);
+        const maxSort = existingTracks.reduce((m, t) => Math.max(m, t.sortOrder ?? 0), -1);
+        targetTrackId = randomId('trk');
+        const label =
+          sanitizeShortLabel(request.customLabel) ||
+          sanitizeShortLabel(payload.accountLabel) ||
+          `临时分享 (${payload.sharedBy || payload.shareId.slice(0, 8)})`;
+        rt.tracks[targetTrackId] = {
+          trackId: targetTrackId,
+          siteKey: normSiteKey,
+          label,
+          accountNote: payload.note,
+          color: '#7c3aed',
+          badgeText: 'TEMP',
+          originDeviceId: rt.meta.localDevice.deviceId,
+          originDeviceName: rt.meta.localDevice.name,
+          cookieCount: 0,
+          localStorageCount: 0,
+          sessionStorageCount: 0,
+          indexedDbCount: 0,
+          updatedAt: nowMs,
+          lastUsedAt: nowMs,
+          sortOrder: maxSort + 1,
+          memberDeviceIds: [rt.meta.localDevice.deviceId],
+          revision: 1,
+          ephemeral: {
+            shareId: payload.shareId,
+            expiresAt: payload.expiresAt,
+            localOnly: true,
+            sharedBy: payload.sharedBy,
+            note: payload.note,
+          },
+        };
+      } else {
+        targetTrackId = this.resolveOrCreateTrackIdForOriginWrite(
+          rt,
+          normSiteKey,
+          undefined,
+          nowMs,
+        );
+        // Remove existing records on this active track before overwriting
+        for (const c of Object.values(rt.cookies)) {
+          if (c.trackId === targetTrackId && !c.deleted) {
+            await this.emitLocalCookieDelete(rt, c, 'explicit', 'share_override');
+          }
+        }
+        for (const l of Object.values(rt.localStorage)) {
+          if (l.trackId === targetTrackId && !l.deleted) {
+            await this.emitLocalStorageDelete(rt, l, 'explicit', 'share_override');
+          }
+        }
+        for (const s of Object.values(rt.sessionStorage)) {
+          if (s.trackId === targetTrackId && !s.deleted) {
+            await this.emitLocalSessionStorageDelete(rt, s, 'explicit', 'share_override');
+          }
+        }
+      }
+
+      for (const c of payload.cookies) {
+        await this.emitLocalCookieUpsert(rt, normSiteKey, targetTrackId, c, 'RESTORE');
+      }
+      for (const [origin, entries] of Object.entries(payload.localStorageByOrigin ?? {})) {
+        for (const [k, v] of Object.entries(entries)) {
+          await this.emitLocalStorageUpsert(rt, normSiteKey, targetTrackId, origin, k, v, 'RESTORE');
+        }
+      }
+      for (const [origin, entries] of Object.entries(payload.sessionStorageByOrigin ?? {})) {
+        for (const [k, v] of Object.entries(entries)) {
+          await this.emitLocalSessionStorageUpsert(
+            rt,
+            normSiteKey,
+            targetTrackId,
+            origin,
+            k,
+            v,
+            'RESTORE',
+          );
+        }
+      }
+
+      const siteTracks = this.ensureSiteTrackSortOrders(rt, normSiteKey);
+      rt.meta.localDevice.siteBindings[normSiteKey] = {
+        siteKey: normSiteKey,
+        state: 'USER_BOUND',
+        trackId: targetTrackId,
+        availableTrackIds: siteTracks.map((t) => t.trackId),
+        hasLocalBaseline: true,
+        decidedAt: nowMs,
+        decidedBy: 'user',
+      };
+      delete rt.pendingDecisions[normSiteKey];
+
+      this.changeDetector.discardWhere((c) =>
+        domainMatchesSiteKey(c.domain, normSiteKey, rt.meta.rules.ssoGroups),
+      );
+      this.postTrackSwitchLeaveMuteUntil.set(normSiteKey, this.now() + 2_500);
+      await this.applyTrackToBrowser(rt, normSiteKey, targetTrackId, {
+        cleanStale: true,
+        triggerRefresh: true,
+        allowLocalTrackSwitch: true,
+      });
+
+      const appliedCookies = Object.values(rt.cookies).filter(
+        (c) =>
+          c.trackId === targetTrackId &&
+          !c.deleted &&
+          c.syncStatus !== 'APPLY_FAILED' &&
+          c.syncStatus !== 'EXPIRED',
+      ).length;
+      const appliedLocalStorage = Object.values(rt.localStorage).filter(
+        (r) => r.trackId === targetTrackId && !r.deleted,
+      ).length;
+      const appliedSessionStorage = Object.values(rt.sessionStorage).filter(
+        (r) => r.trackId === targetTrackId && !r.deleted,
+      ).length;
+
+      rt.meta.space.status = this.computeStatus(rt);
+      if (!isEphemeral && rt.meta.space.settings.autoSync) {
+        await this.tryPushOutboundBestEffort(rt, 'import_session_share');
+        await this.uploadDeviceManifestIfOnline(rt);
+      }
+      await this.persistRuntime(rt);
+
+      return {
+        mode: request.mode,
+        siteKey: normSiteKey,
+        track: { ...rt.tracks[targetTrackId] },
+        appliedCookies,
+        appliedLocalStorage,
+        appliedSessionStorage,
+      };
     });
   }
 

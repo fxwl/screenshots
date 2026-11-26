@@ -10,7 +10,14 @@ import {
   type SiteSummaryView,
   type SiteTrack,
 } from '@sessionmesh/core';
-import { unwrapCommand, useSessionMeshStatus, useTheme, withErrorBoundary, withSuspense } from '@sessionmesh/shared';
+import {
+  unwrapCommand,
+  useLocale,
+  useSessionMeshStatus,
+  useTheme,
+  withErrorBoundary,
+  withSuspense,
+} from '@sessionmesh/shared';
 import {
   Badge,
   Button,
@@ -20,6 +27,7 @@ import {
   DropdownMenuSeparator,
   DropdownMenuTrigger,
   Input,
+  LanguageDropdown,
   Switch,
   ThemeDropdown,
   Toaster,
@@ -28,13 +36,17 @@ import {
   ArrowLeftRight,
   ArrowRight,
   Ban,
+  BookOpen,
   ChevronDown,
+  ChevronUp,
   CloudDownload,
   CloudUpload,
   Cookie,
   Database,
   GitBranch,
   Globe,
+  HelpCircle,
+  Laptop,
   Layers,
   Loader2,
   Lock,
@@ -42,6 +54,7 @@ import {
   MoreHorizontal,
   PanelRightOpen,
   Plus,
+  QrCode,
   RefreshCw,
   Repeat,
   RotateCcw,
@@ -56,18 +69,69 @@ import {
 import { useEffect, useState } from 'react';
 import { toast } from 'sonner';
 import { AttentionCenter } from './components/AttentionCenter';
+import { DebugExportMenu } from './components/DebugExportMenu';
+import { PopupQuickTour } from './components/PopupQuickTour';
 import {
   extractErrorMessage,
   extractFallbackHost,
   formatRelativeTime,
+  formatRemainingDuration,
   getBindingBadge,
+  getExpiryBadgeMeta,
   getPopupStatusBadge,
+  usePopupUxPrefs,
   useUiBannerPrefs,
 } from './utils/helpers';
 
+function renderTrackBadgePills(track?: SiteTrack | null) {
+  if (!track) return null;
+  const hasEphemeral = Boolean(track.ephemeral);
+  const badgeText = track.badgeText?.trim();
+  const showCustomBadge = Boolean(badgeText && (!hasEphemeral || badgeText.toUpperCase() !== 'TEMP'));
+
+  return (
+    <>
+      {track.color || hasEphemeral ? (
+        <span
+          className="inline-block h-2 w-2 shrink-0 rounded-full border border-black/15 dark:border-white/25"
+          style={{ backgroundColor: track.color || '#7c3aed' }}
+        />
+      ) : null}
+      {showCustomBadge && badgeText ? (
+        <span
+          className={`inline-flex shrink-0 items-center rounded border px-1 py-0 text-[9px] font-bold leading-4 ${
+            track.color ? '' : 'border-primary/35 bg-primary/10 text-primary'
+          }`}
+          style={
+            track.color
+              ? {
+                  backgroundColor: `${track.color}1a`,
+                  borderColor: `${track.color}55`,
+                  color: track.color,
+                }
+              : undefined
+          }>
+          {badgeText}
+        </span>
+      ) : null}
+      {hasEphemeral && track.ephemeral ? (
+        <span
+          className="inline-flex shrink-0 items-center rounded border border-purple-500/35 bg-purple-500/15 px-1 py-0 text-[9px] font-bold leading-4 text-purple-700 dark:text-purple-300"
+          title={`临时分享账号 · ${formatRemainingDuration(track.ephemeral.expiresAt - Date.now())}`}>
+          TEMP
+        </span>
+      ) : null}
+    </>
+  );
+}
+
 const Popup = () => {
   const { theme, setTheme } = useTheme();
+  const { localePreference, locale, setLocalePreference } = useLocale();
   const { isBannerVisible, dismissBanner } = useUiBannerPrefs();
+  const { prefs: uxPrefs, ready: uxReady, updatePopupUxPrefs } = usePopupUxPrefs();
+  const [forceTourOpen, setForceTourOpen] = useState(false);
+  const [siteAdvExpanded, setSiteAdvExpanded] = useState(false);
   const [activeTabUrl, setActiveTabUrl] = useState<string | undefined>(undefined);
   const [activeFavIcon, setActiveFavIcon] = useState<string | undefined>(undefined);
 
@@ -119,9 +183,11 @@ const Popup = () => {
   const [envSourceSiteKey, setEnvSourceSiteKey] = useState('');
   const [envSourceTrackId, setEnvSourceTrackId] = useState('');
   const [envSyncLs, setEnvSyncLs] = useState(true);
+  const [envSyncSs, setEnvSyncSs] = useState(false);
   const [envBusy, setEnvBusy] = useState(false);
 
   const isDevTab = isDevLikeUrlOrHost(activeTabUrl);
+  const devToolsVisible = uxPrefs.popupDeveloperMode || siteAdvExpanded;
 
   useEffect(() => {
     if (!status?.configured || status.locked || (!isDevTab && !showEnvQuickPanel)) {
@@ -159,42 +225,72 @@ const Popup = () => {
       .catch(() => setLatestUndo(null));
   }, [status?.configured, status?.locked, status?.undoPointsCount]);
 
-  const openOnboarding = () => {
-    const onboardingUrl = chrome.runtime.getURL('options/index.html?onboarding=1');
+  const openOnboarding = (pairMode = false) => {
+    const qs = pairMode ? '?onboarding=1&mode=pair' : '?onboarding=1';
+    const onboardingUrl = chrome.runtime.getURL(`options/index.html${qs}`);
     chrome.tabs.create({ url: onboardingUrl });
   };
 
-  const openOptions = (tab?: string) => {
+  const openOptions = (tab?: string, sub?: string) => {
     if (tab && typeof chrome !== 'undefined' && chrome.runtime?.getURL && chrome.tabs?.create) {
-      chrome.tabs.create({ url: chrome.runtime.getURL(`options/index.html?tab=${encodeURIComponent(tab)}`) });
+      const params = new URLSearchParams({ tab });
+      if (sub) params.set('sub', sub);
+      chrome.tabs.create({ url: chrome.runtime.getURL(`options/index.html?${params.toString()}`) });
       return;
     }
     chrome.runtime.openOptionsPage();
   };
 
   const openSidePanel = () => {
-    chrome.windows.getCurrent(currentWindow => {
-      if (currentWindow?.id !== undefined && chrome.sidePanel) {
-        chrome.sidePanel
-          .open({ windowId: currentWindow.id })
-          .catch(err => toast.error(`无法打开侧边栏：${extractErrorMessage(err)}`));
-      }
-    });
+    const ffSidebar = (globalThis as unknown as { browser?: { sidebarAction?: { open?: () => Promise<void> } } })
+      .browser?.sidebarAction;
+    if (typeof chrome !== 'undefined' && typeof chrome.sidePanel?.open === 'function') {
+      chrome.windows.getCurrent(currentWindow => {
+        if (currentWindow?.id !== undefined) {
+          chrome.sidePanel
+            .open({ windowId: currentWindow.id })
+            .catch(err => toast.error(`无法打开侧边栏：${extractErrorMessage(err)}`));
+        }
+      });
+    } else if (typeof ffSidebar?.open === 'function') {
+      ffSidebar.open().catch(() => {
+        chrome.tabs?.create({ url: chrome.runtime.getURL('sidepanel/index.html') });
+      });
+    } else if (chrome.tabs?.create) {
+      chrome.tabs.create({ url: chrome.runtime.getURL('sidepanel/index.html') });
+    }
   };
 
   const openSidePanelTab = (tab: 'sites' | 'conflicts' | 'history' | 'rules') => {
-    chrome.windows.getCurrent(currentWindow => {
-      if (currentWindow?.id !== undefined && chrome.sidePanel) {
-        chrome.sidePanel
-          .open({ windowId: currentWindow.id })
-          .then(() => {
-            setTimeout(() => {
-              chrome.runtime.sendMessage({ type: 'OPEN_SIDEPANEL_TAB', tab }).catch(() => undefined);
-            }, 180);
-          })
-          .catch(err => toast.error(`无法打开侧边栏：${extractErrorMessage(err)}`));
-      }
-    });
+    const ffSidebar = (globalThis as unknown as { browser?: { sidebarAction?: { open?: () => Promise<void> } } })
+      .browser?.sidebarAction;
+    if (typeof chrome !== 'undefined' && typeof chrome.sidePanel?.open === 'function') {
+      chrome.windows.getCurrent(currentWindow => {
+        if (currentWindow?.id !== undefined) {
+          chrome.sidePanel
+            .open({ windowId: currentWindow.id })
+            .then(() => {
+              setTimeout(() => {
+                chrome.runtime.sendMessage({ type: 'OPEN_SIDEPANEL_TAB', tab }).catch(() => undefined);
+              }, 180);
+            })
+            .catch(err => toast.error(`无法打开侧边栏：${extractErrorMessage(err)}`));
+        }
+      });
+    } else if (typeof ffSidebar?.open === 'function') {
+      ffSidebar
+        .open()
+        .then(() => {
+          setTimeout(() => {
+            chrome.runtime.sendMessage({ type: 'OPEN_SIDEPANEL_TAB', tab }).catch(() => undefined);
+          }, 180);
+        })
+        .catch(() => {
+          chrome.tabs?.create({ url: chrome.runtime.getURL(`sidepanel/index.html?tab=${tab}`) });
+        });
+    } else if (chrome.tabs?.create) {
+      chrome.tabs.create({ url: chrome.runtime.getURL(`sidepanel/index.html?tab=${tab}`) });
+    }
   };
 
   const handleUnlock = async () => {
@@ -253,12 +349,12 @@ const Popup = () => {
         errorCode?: string;
       }>({ type: 'SYNC_NOW' });
       if (res?.errorMessage) {
-        toast.warning(`WebDAV 云端暂时繁忙，已加入后台自动退避重试：${res.errorMessage}`);
+        toast.warning(`云端暂时繁忙，已加入后台自动重试：${res.errorMessage}`);
       } else {
         const applied = res?.appliedCookies ?? 0;
         const refreshHint = applied > 0 && !settings?.autoRefresh ? '，刷新对应网页即可生效' : '';
         toast.success(
-          `全量同步完成：上传 ${res?.pushedEvents ?? 0}，拉取 ${res?.pulledEvents ?? 0}，应用 ${applied}${refreshHint}`,
+          `同步完成：上传 ${res?.pushedEvents ?? 0}，拉取 ${res?.pulledEvents ?? 0}，应用 ${applied}${refreshHint}`,
         );
       }
       await refresh();
@@ -303,7 +399,6 @@ const Popup = () => {
     setTogglingPause(true);
     try {
       await unwrapCommand({ type: 'SET_GLOBAL_PAUSED', paused: !enabled });
-      // Keep Popup toggle consistent with Options space-level autoSync setting
       if (enabled && settings?.autoSync === false) {
         await unwrapCommand({ type: 'UPDATE_SPACE_SETTINGS', settings: { autoSync: true } });
       }
@@ -320,10 +415,11 @@ const Popup = () => {
     setTrackBusy(true);
     try {
       await unwrapCommand({ type: 'SWITCH_SITE_TRACK', siteKey, targetTrackId: trackId });
-      toast.success(`已切换 ${siteKey} 跟随轨道「${label}」（已保存本地后悔药）`);
+      void updatePopupUxPrefs({ completedGuideTasks: { multi_account: true } });
+      toast.success(`已切换 ${siteKey} 使用账号「${label}」`);
       await refresh();
     } catch (err) {
-      toast.error(`切换轨道失败：${extractErrorMessage(err)}`);
+      toast.error(`切换账号失败：${extractErrorMessage(err)}`);
     } finally {
       setTrackBusy(false);
     }
@@ -333,10 +429,10 @@ const Popup = () => {
     setTrackBusy(true);
     try {
       await unwrapCommand({ type: 'SPLIT_SITE_INDEPENDENT', siteKey });
-      toast.success(`已将 ${siteKey} 拆分为本机独立轨道`);
+      toast.success(`已将 ${siteKey} 设为仅本机独立账号（不再与其他电脑互刷）`);
       await refresh();
     } catch (err) {
-      toast.error(`拆分独立轨道失败：${extractErrorMessage(err)}`);
+      toast.error(`设置独立账号失败：${extractErrorMessage(err)}`);
     } finally {
       setTrackBusy(false);
     }
@@ -350,10 +446,11 @@ const Popup = () => {
         siteKey,
         direction: 'next',
       });
-      toast.success(`已轮换至账号「${res.track.label}」(${res.index}/${res.total})`);
+      void updatePopupUxPrefs({ completedGuideTasks: { multi_account: true } });
+      toast.success(`已切换至账号「${res.track.label}」(${res.index}/${res.total})`);
       await refresh();
     } catch (err) {
-      toast.error(`轮换账号失败：${extractErrorMessage(err)}`);
+      toast.error(`切换账号失败：${extractErrorMessage(err)}`);
     } finally {
       setTrackBusy(false);
     }
@@ -373,10 +470,11 @@ const Popup = () => {
       });
       setNewAcctMode(null);
       setNewAcctLabel('');
+      void updatePopupUxPrefs({ completedGuideTasks: { multi_account: true } });
       toast.success(
         mode === 'clean_new'
-          ? `已保存原账号并切换至空白账号「${created.label}」，请在网页直接登录新账号`
-          : `已将当前登录态保存为账号「${created.label}」`,
+          ? `已保存原账号并切换至空白小号「${created.label}」，现在请在网页登录新号`
+          : `已将当前登录态另存为账号「${created.label}」`,
       );
       await refresh();
     } catch (err) {
@@ -407,8 +505,9 @@ const Popup = () => {
         input: { ruleId: rule.id, reverse },
       });
       const lsHint = res.appliedLocalStorage > 0 ? `、${res.appliedLocalStorage} 项 LS` : '';
+      const ssHint = (res.appliedSessionStorage ?? 0) > 0 ? `、${res.appliedSessionStorage} 项 SS` : '';
       toast.success(
-        `环境同步完成：写入 ${res.appliedCookies} 条 Cookie${lsHint}${res.reloadedTabs > 0 ? '，已刷新目标页' : ''}`,
+        `环境同步完成：写入 ${res.appliedCookies} 条 Cookie${lsHint}${ssHint}${res.reloadedTabs > 0 ? '，已刷新目标页' : ''}`,
       );
       await refresh();
     } catch (err) {
@@ -421,7 +520,7 @@ const Popup = () => {
   const handleQuickPullToDevTab = async (saveAsAutoRule: boolean) => {
     const trimmedSource = envSourceSiteKey.trim();
     if (!trimmedSource || !activeTabUrl) {
-      toast.warning('请先选择或输入源环境站点');
+      toast.warning('请先选择或输入线上源网站域名');
       return;
     }
     let targetOrigin = activeTabUrl;
@@ -444,6 +543,7 @@ const Popup = () => {
             targetUrl: targetOrigin,
             syncCookies: true,
             syncLocalStorage: envSyncLs,
+            syncSessionStorage: envSyncSs,
             adaptForHttp: true,
             cleanTargetBeforeSync: true,
             autoSync: true,
@@ -455,7 +555,7 @@ const Popup = () => {
           input: { ruleId: saved.id },
         });
         setShowEnvQuickPanel(false);
-        toast.success(`已注入 ${res.appliedCookies} 条 Cookie 到 ${res.targetHost} 并开启自动跟随同步`);
+        toast.success(`已注入 ${res.appliedCookies} 条 Cookie 到 ${res.targetHost} 并开启自动跟随`);
       } else {
         const res = await unwrapCommand<EnvCookieSyncResult>({
           type: 'EXECUTE_ENV_SYNC',
@@ -466,6 +566,7 @@ const Popup = () => {
               targetUrl: targetOrigin,
               syncCookies: true,
               syncLocalStorage: envSyncLs,
+              syncSessionStorage: envSyncSs,
               adaptForHttp: true,
               cleanTargetBeforeSync: false,
               autoReloadTarget: true,
@@ -491,14 +592,14 @@ const Popup = () => {
           pattern: siteKey,
           matchType: 'subdomain',
           scope,
-          reason: 'Popup 快捷拉黑',
+          reason: 'Popup 快捷排除',
           presetCategory: 'custom',
         },
       });
-      toast.success(`已将 ${siteKey} 加入${scope === 'space' ? '空间级' : '本机级'}黑名单`);
+      toast.success(`已将 ${siteKey} 加入${scope === 'space' ? '全空间' : '本机'}排除列表（不同步）`);
       await refresh();
     } catch (err) {
-      toast.error(`拉黑失败：${extractErrorMessage(err)}`);
+      toast.error(`排除失败：${extractErrorMessage(err)}`);
     } finally {
       setTrackBusy(false);
     }
@@ -511,10 +612,11 @@ const Popup = () => {
         type: 'ADD_MANAGED_SITES',
         siteKeys: [siteKey],
       });
-      toast.success(`已将 ${siteKey} 纳入同步管理并开始同步`);
+      void updatePopupUxPrefs({ completedGuideTasks: { first_site: true } });
+      toast.success(`已开启 ${siteKey} 的多端自动加密同步`);
       await refresh();
     } catch (err) {
-      toast.error(`纳入同步管理失败：${extractErrorMessage(err)}`);
+      toast.error(`开启同步失败：${extractErrorMessage(err)}`);
     } finally {
       setManagingSite(false);
     }
@@ -528,10 +630,10 @@ const Popup = () => {
         siteKey,
         scope,
       });
-      toast.success(scope === 'space_remove' ? `已从整个同步空间移除 ${siteKey}` : `已将 ${siteKey} 移出本机同步管理`);
+      toast.success(scope === 'space_remove' ? `已从所有电脑停止同步 ${siteKey}` : `已在本机停止同步 ${siteKey}`);
       await refresh();
     } catch (err) {
-      toast.error(`移出同步管理失败：${extractErrorMessage(err)}`);
+      toast.error(`停止同步失败：${extractErrorMessage(err)}`);
     } finally {
       setTrackBusy(false);
     }
@@ -542,16 +644,15 @@ const Popup = () => {
     setApplyingUndo(true);
     try {
       await unwrapCommand({ type: 'APPLY_UNDO_POINT', undoId: latestUndo.undoId });
-      toast.success(`已撤销 ${latestUndo.siteKey} 的上次覆盖并恢复原登录态`);
+      toast.success(`已恢复 ${latestUndo.siteKey} 覆盖前的登录状态`);
       await refresh();
     } catch (err) {
-      toast.error(`撤销失败：${extractErrorMessage(err)}`);
+      toast.error(`恢复失败：${extractErrorMessage(err)}`);
     } finally {
       setApplyingUndo(false);
     }
   };
 
-  // Loading initial skeleton (prevents flashing onboarding welcome on configured profiles)
   if (loading && !status.configured) {
     return (
       <div className="flex h-[280px] w-[420px] items-center justify-center gap-2 bg-background text-sm text-muted-foreground">
@@ -570,7 +671,14 @@ const Popup = () => {
             <img src={chrome.runtime.getURL('options/logo.png')} alt="SessionMesh" className="h-7 w-7 object-contain" />
             <span className="text-sm font-bold tracking-tight">SessionMesh</span>
           </div>
-          <ThemeDropdown setTheme={setTheme} />
+          <div className="flex items-center gap-1">
+            <LanguageDropdown
+              localePreference={localePreference}
+              resolvedLocale={locale}
+              setLocalePreference={setLocalePreference}
+            />
+            <ThemeDropdown setTheme={setTheme} />
+          </div>
         </header>
 
         <main className="p-5 text-center space-y-4">
@@ -578,21 +686,28 @@ const Popup = () => {
             <ShieldCheck className="h-8 w-8" />
           </div>
           <div className="space-y-1.5">
-            <h1 className="text-base font-bold">欢迎使用 SessionMesh</h1>
+            <h1 className="text-base font-bold">多台电脑自动共享网站登录状态</h1>
             <p className="text-xs leading-relaxed text-muted-foreground">
-              通过你的私有 WebDAV 实现多设备 Cookie 与 LocalStorage
-              端到端加密同步，支持多账号独立轨道隔离与自动识别决策。
+              支持 OneDrive / iCloud 本地同步盘、GitHub 私密 Gist、Cloudflare R2 与坚果云
+              WebDAV。所有数据本地加密，零第三方服务器。
             </p>
           </div>
           <div className="grid grid-cols-3 gap-2 text-[11px] text-muted-foreground">
-            <div className="rounded-lg border border-border bg-muted/30 p-2">AES-256-GCM 强制加密</div>
-            <div className="rounded-lg border border-border bg-muted/30 p-2">10 秒配对码接入</div>
-            <div className="rounded-lg border border-border bg-muted/30 p-2">多账号独立轨道</div>
+            <div className="rounded-lg border border-border bg-muted/30 p-2">免填密钥本地盘</div>
+            <div className="rounded-lg border border-border bg-muted/30 p-2">10 秒配对新电脑</div>
+            <div className="rounded-lg border border-border bg-muted/30 p-2">同网站多号秒切</div>
           </div>
-          <Button type="button" className="w-full" onClick={openOnboarding}>
-            开始 4 步快速配置
-            <ArrowRight className="ml-2 h-4 w-4" />
-          </Button>
+
+          <div className="space-y-2 pt-1">
+            <Button type="button" className="w-full" onClick={() => openOnboarding(false)}>
+              开始 3 步快速配置（第 1 台电脑）
+              <ArrowRight className="ml-2 h-4 w-4" />
+            </Button>
+            <Button type="button" variant="outline" className="w-full text-xs" onClick={() => openOnboarding(true)}>
+              <QrCode className="mr-1.5 h-3.5 w-3.5 text-primary" />
+              已有其他设备？粘贴配对码 10 秒接入
+            </Button>
+          </div>
         </main>
         <Toaster theme={theme} position="top-center" richColors visibleToasts={1} />
       </div>
@@ -620,6 +735,9 @@ const Popup = () => {
   const allTracks = summary?.allTracks ?? [];
   const activeTrack = summary?.activeTrack;
   const activeTrackIdx = activeTrack ? allTracks.findIndex(t => t.trackId === activeTrack.trackId) : -1;
+  const expiryHealth = summary?.expiryHealth;
+  const expiryBadgeMeta =
+    expiryHealth && expiryHealth.status !== 'healthy' ? getExpiryBadgeMeta(expiryHealth.status) : null;
   const matchingEnvRules = currentSite?.matchingEnvRules ?? [];
   const normalizedEnvSource = envSourceSiteKey
     .trim()
@@ -639,7 +757,7 @@ const Popup = () => {
     for (const s of managedSitesList) {
       if (s.siteKey === effectiveSiteKey || seen.has(s.siteKey)) continue;
       seen.add(s.siteKey);
-      items.push({ siteKey: s.siteKey, label: `${s.siteKey} (${s.cookieCount}条·已托管)` });
+      items.push({ siteKey: s.siteKey, label: `${s.siteKey} (${s.cookieCount}条·同步中)` });
     }
     for (const c of candidateSitesList) {
       if (c.siteKey === effectiveSiteKey || seen.has(c.siteKey)) continue;
@@ -649,6 +767,7 @@ const Popup = () => {
     return items;
   })();
   const favIcon = currentSite?.favIconUrl || summary?.favIconUrl || activeFavIcon;
+  const showQuickTour = forceTourOpen || (uxReady && !uxPrefs.popupTourDone);
 
   return (
     <div className="w-[420px] bg-background text-foreground">
@@ -698,25 +817,43 @@ const Popup = () => {
             </div>
             <div className="mt-0.5 flex items-center gap-1 text-[10px] text-muted-foreground">
               <Monitor className="h-2.5 w-2.5" />
-              <span className="truncate max-w-[160px]">{status.device?.name || '本机设备'}</span>
+              <span className="truncate max-w-[150px]">{status.device?.name || '本机设备'}</span>
             </div>
           </div>
         </div>
 
-        <div className="flex shrink-0 items-center gap-1">
-          <Badge variant={statusBadge.variant} className="px-2 py-0.5 text-[11px]">
+        <div className="flex shrink-0 items-center gap-0.5">
+          <Badge variant={statusBadge.variant} className="mr-0.5 px-2 py-0.5 text-[11px]">
             {statusBadge.label}
           </Badge>
           <Button
             type="button"
             variant="ghost"
             size="icon"
-            className="h-8 w-8"
-            title="打开综合管理后台"
+            className="h-7 w-7 text-muted-foreground hover:text-primary"
+            title="查看 30 秒快速引导"
+            onClick={() => setForceTourOpen(prev => !prev)}>
+            <HelpCircle className="h-4 w-4" />
+          </Button>
+          <Button
+            type="button"
+            variant="ghost"
+            size="icon"
+            className="h-7 w-7"
+            title="打开控制中心"
             onClick={() => openOptions('sites')}>
             <Settings className="h-4 w-4" />
           </Button>
-          <ThemeDropdown setTheme={setTheme} />
+          <div className="[&_button]:h-7 [&_button]:w-7">
+            <LanguageDropdown
+              localePreference={localePreference}
+              resolvedLocale={locale}
+              setLocalePreference={setLocalePreference}
+            />
+          </div>
+          <div className="[&_button]:h-7 [&_button]:w-7">
+            <ThemeDropdown setTheme={setTheme} />
+          </div>
         </div>
       </header>
 
@@ -725,7 +862,7 @@ const Popup = () => {
         <main className="p-4 space-y-3">
           {status.status === 'DECRYPT_ERROR' ? (
             <div className="rounded-lg border border-destructive/45 bg-destructive/10 px-3 py-2 text-xs text-destructive">
-              主密码已变更或校验未通过，请输入最新端到端主密码重新验证（本地与云端加密数据均完好保留）。
+              主密码已变更或校验未通过，请输入最新加密主密码重新验证（本地与云端加密数据均完好保留）。
             </div>
           ) : null}
           <div className="rounded-xl border border-amber-500/40 bg-amber-500/10 p-4 space-y-3">
@@ -733,11 +870,10 @@ const Popup = () => {
               <Lock className="mt-0.5 h-5 w-5 shrink-0 text-amber-600 dark:text-amber-400" />
               <div>
                 <div className="text-sm font-semibold">
-                  {status.status === 'DECRYPT_ERROR' ? '需要输入最新端到端主密码' : '同步会话已锁定'}
+                  {status.status === 'DECRYPT_ERROR' ? '需要输入最新加密主密码' : '同步会话已锁定'}
                 </div>
                 <p className="mt-0.5 text-xs text-muted-foreground">
-                  请输入空间「{status.activeSpaceName || status.activeSpaceId}
-                  」的端到端加密主密码以解锁。本地与云端数据均安全保留。
+                  请输入空间「{status.activeSpaceName || status.activeSpaceId}」的加密主密码以解锁恢复同步。
                 </p>
               </div>
             </div>
@@ -749,7 +885,7 @@ const Popup = () => {
                 onKeyDown={e => {
                   if (e.key === 'Enter') void handleUnlock();
                 }}
-                placeholder="输入端到端主密码"
+                placeholder="输入加密主密码"
                 className="h-9 text-xs"
               />
               <Button type="button" size="sm" disabled={unlocking} onClick={handleUnlock} className="h-9 shrink-0">
@@ -769,16 +905,16 @@ const Popup = () => {
               size="sm"
               onClick={() => openOptions('storage_settings')}
               className="text-xs">
-              前往综合管理后台
+              前往控制中心
             </Button>
           </div>
         </main>
       ) : (
         <main className="space-y-3 p-3.5">
-          {/* Switch Space Password Inline Prompt (if switching to locked space) */}
+          {/* Switch Space Password Inline Prompt */}
           {switchPassSpace ? (
             <div className="rounded-lg border border-primary/40 bg-primary/5 p-2.5 space-y-2 text-xs">
-              <div className="font-medium">输入空间「{switchPassSpace.name}」的端到端主密码：</div>
+              <div className="font-medium">输入空间「{switchPassSpace.name}」的加密主密码：</div>
               <div className="flex gap-1.5">
                 <Input
                   type="password"
@@ -790,7 +926,7 @@ const Popup = () => {
                     }
                   }}
                   className="h-8 text-xs"
-                  placeholder="主密码"
+                  placeholder="加密主密码"
                 />
                 <Button
                   type="button"
@@ -811,7 +947,27 @@ const Popup = () => {
             </div>
           ) : null}
 
-          {/* Direct Actionable Attention Center (Auto-Expanded whenever `!` / `?` / pending items exist) */}
+          {/* First-Open 3-Step Quick Coachmark Card */}
+          {showQuickTour ? (
+            <PopupQuickTour
+              onFinish={() => {
+                setForceTourOpen(false);
+                void updatePopupUxPrefs({ popupTourDone: true });
+              }}
+              onOpenFullTutorials={() => {
+                setForceTourOpen(false);
+                void updatePopupUxPrefs({ popupTourDone: true });
+                openOptions('tutorials');
+              }}
+              onOpenPairing={() => {
+                setForceTourOpen(false);
+                void updatePopupUxPrefs({ popupTourDone: true });
+                openOptions('devices_spaces', 'spaces');
+              }}
+            />
+          ) : null}
+
+          {/* Actionable Attention Center */}
           <AttentionCenter
             items={attentionItems}
             pendingDecisionsCount={status.pendingDecisionsCount}
@@ -823,10 +979,10 @@ const Popup = () => {
           />
 
           {/* Current Site Card */}
-          <section className="rounded-xl border border-border bg-card p-3.5 space-y-3 shadow-sm">
+          <section className="rounded-xl border border-border bg-card p-3.5 space-y-2.5 shadow-sm">
             {isHttpTab && effectiveSiteKey ? (
               isUnmanaged ? (
-                <div className="space-y-3">
+                <div className="space-y-2.5">
                   <div className="flex items-start justify-between gap-2">
                     <div className="flex min-w-0 items-center gap-2.5">
                       {favIcon ? (
@@ -844,58 +1000,56 @@ const Popup = () => {
                         <div className="flex items-center gap-1.5">
                           <h3 className="truncate text-sm font-bold text-foreground">{effectiveSiteKey}</h3>
                           <Badge variant="secondary" className="shrink-0 px-1.5 py-0 text-[10px]">
-                            未纳管
+                            未开启同步
                           </Badge>
                         </div>
-                        <div className="mt-0.5 text-[11px] text-muted-foreground">仅本地浏览 · 未开启云端同步</div>
+                        <div className="mt-0.5 text-[11px] text-muted-foreground">仅本机浏览，不会自动上传登录态</div>
                       </div>
                     </div>
+
+                    {uxPrefs.popupDeveloperMode ? (
+                      <div className="shrink-0">
+                        <DebugExportMenu siteKey={effectiveSiteKey} targetUrl={activeTabUrl} />
+                      </div>
+                    ) : null}
                   </div>
 
-                  <div className="rounded-lg border border-dashed border-border bg-muted/30 px-3 py-2.5 text-xs leading-relaxed text-muted-foreground">
-                    当前网站 <strong className="text-foreground">{effectiveSiteKey}</strong>{' '}
-                    未纳入同步管理（仅本地浏览，不上传同步）
-                  </div>
+                  <Button
+                    type="button"
+                    size="sm"
+                    disabled={managingSite || trackBusy}
+                    onClick={() => void handleAddManagedSite(effectiveSiteKey)}
+                    className="h-9 w-full text-xs font-semibold">
+                    {managingSite ? (
+                      <Loader2 className="mr-1.5 h-3.5 w-3.5 animate-spin" />
+                    ) : (
+                      <Plus className="mr-1.5 h-3.5 w-3.5" />
+                    )}
+                    开启 {effectiveSiteKey} 多端自动同步
+                  </Button>
 
-                  <div className="flex flex-col gap-2">
-                    <Button
-                      type="button"
-                      size="sm"
-                      disabled={managingSite || trackBusy}
-                      onClick={() => void handleAddManagedSite(effectiveSiteKey)}
-                      className="h-9 w-full text-xs font-semibold">
-                      {managingSite ? (
-                        <Loader2 className="mr-1.5 h-3.5 w-3.5 animate-spin" />
-                      ) : (
-                        <Plus className="mr-1.5 h-3.5 w-3.5" />
-                      )}
-                      将 {effectiveSiteKey} 纳入同步管理
-                    </Button>
-
-                    <div className="flex items-center justify-end">
-                      <DropdownMenu modal={false}>
-                        <DropdownMenuTrigger asChild>
-                          <Button
-                            type="button"
-                            variant="outline"
-                            size="sm"
-                            disabled={trackBusy || managingSite}
-                            className="h-7 px-2.5 text-[11px] text-muted-foreground hover:text-destructive">
-                            <Ban className="mr-1 h-3.5 w-3.5" />
-                            加入黑名单
-                            <ChevronDown className="ml-1 h-3 w-3" />
-                          </Button>
-                        </DropdownMenuTrigger>
-                        <DropdownMenuContent align="end">
-                          <DropdownMenuItem onClick={() => handleQuickBlacklist(effectiveSiteKey, 'device')}>
-                            加入本机黑名单（仅本电脑不同步）
-                          </DropdownMenuItem>
-                          <DropdownMenuItem onClick={() => handleQuickBlacklist(effectiveSiteKey, 'space')}>
-                            加入空间黑名单（全设备不同步）
-                          </DropdownMenuItem>
-                        </DropdownMenuContent>
-                      </DropdownMenu>
-                    </div>
+                  <div className="flex items-center justify-between text-[11px] text-muted-foreground">
+                    <span>开启后离开页面即自动加密同步到其他电脑</span>
+                    <DropdownMenu modal={false}>
+                      <DropdownMenuTrigger asChild>
+                        <button
+                          type="button"
+                          disabled={trackBusy || managingSite}
+                          className="inline-flex items-center gap-0.5 text-[11px] text-muted-foreground hover:text-destructive">
+                          <Ban className="h-3 w-3" />
+                          排除此网站
+                          <ChevronDown className="h-3 w-3" />
+                        </button>
+                      </DropdownMenuTrigger>
+                      <DropdownMenuContent align="end">
+                        <DropdownMenuItem onClick={() => handleQuickBlacklist(effectiveSiteKey, 'device')}>
+                          仅本电脑不同步（加入本机排除）
+                        </DropdownMenuItem>
+                        <DropdownMenuItem onClick={() => handleQuickBlacklist(effectiveSiteKey, 'space')}>
+                          所有电脑都不同步（加入全空间排除）
+                        </DropdownMenuItem>
+                      </DropdownMenuContent>
+                    </DropdownMenu>
                   </div>
                 </div>
               ) : (
@@ -914,66 +1068,90 @@ const Popup = () => {
                         </div>
                       )}
                       <div className="min-w-0">
-                        <div className="flex items-center gap-1.5">
+                        <div className="flex flex-wrap items-center gap-1.5">
                           <h3 className="truncate text-sm font-bold text-foreground">{effectiveSiteKey}</h3>
                           <Badge variant={bindingBadge.variant} className="shrink-0 px-1.5 py-0 text-[10px]">
                             {bindingBadge.label}
                           </Badge>
+                          {expiryBadgeMeta && expiryHealth ? (
+                            <Badge variant={expiryBadgeMeta.variant} className="shrink-0 px-1.5 py-0 text-[10px]">
+                              {expiryHealth.status === 'expired'
+                                ? '登录已过期'
+                                : `${expiryBadgeMeta.label}${
+                                    expiryHealth.remainingMs !== undefined
+                                      ? ` · ${formatRemainingDuration(expiryHealth.remainingMs)}`
+                                      : ''
+                                  }`}
+                            </Badge>
+                          ) : null}
                         </div>
                         <div className="mt-0.5 text-[11px] text-muted-foreground">
-                          最近同步：{formatRelativeTime(summary?.updatedAt || status.lastSyncAt)}
+                          上次同步：{formatRelativeTime(summary?.updatedAt || status.lastSyncAt)}
                         </div>
                       </div>
                     </div>
 
-                    {/* Site Management & Blacklist Dropdown */}
                     {!isBlacklisted ? (
-                      <DropdownMenu modal={false}>
-                        <DropdownMenuTrigger asChild>
-                          <Button
-                            type="button"
-                            variant="ghost"
-                            size="sm"
-                            disabled={trackBusy}
-                            className="h-7 px-2 text-[11px] text-muted-foreground hover:text-foreground">
-                            <MoreHorizontal className="mr-1 h-3.5 w-3.5" />
-                            管理
-                          </Button>
-                        </DropdownMenuTrigger>
-                        <DropdownMenuContent align="end">
-                          <DropdownMenuItem
-                            onClick={() => void handleRemoveManagedSite(effectiveSiteKey, 'device_unmanage')}>
-                            移出同步管理（仅本机停止）
-                          </DropdownMenuItem>
-                          <DropdownMenuItem
-                            className="text-destructive focus:text-destructive"
-                            onClick={() => void handleRemoveManagedSite(effectiveSiteKey, 'space_remove')}>
-                            从全空间移除该网站
-                          </DropdownMenuItem>
-                          <DropdownMenuSeparator />
-                          <DropdownMenuItem onClick={() => handleQuickBlacklist(effectiveSiteKey, 'device')}>
-                            加入本机黑名单（仅本电脑不同步）
-                          </DropdownMenuItem>
-                          <DropdownMenuItem onClick={() => handleQuickBlacklist(effectiveSiteKey, 'space')}>
-                            加入空间黑名单（全设备不同步）
-                          </DropdownMenuItem>
-                        </DropdownMenuContent>
-                      </DropdownMenu>
+                      <div className="flex shrink-0 items-center gap-1">
+                        {devToolsVisible ? (
+                          <DebugExportMenu
+                            siteKey={effectiveSiteKey}
+                            trackId={activeTrack?.trackId}
+                            targetUrl={activeTabUrl}
+                          />
+                        ) : null}
+                        <DropdownMenu modal={false}>
+                          <DropdownMenuTrigger asChild>
+                            <Button
+                              type="button"
+                              variant="ghost"
+                              size="sm"
+                              disabled={trackBusy}
+                              className="h-7 px-1.5 text-[11px] text-muted-foreground hover:text-foreground">
+                              <MoreHorizontal className="mr-0.5 h-3.5 w-3.5" />
+                              管理
+                            </Button>
+                          </DropdownMenuTrigger>
+                          <DropdownMenuContent align="end">
+                            <DropdownMenuItem
+                              onClick={() => void handleRemoveManagedSite(effectiveSiteKey, 'device_unmanage')}>
+                              停止在本机同步此网站
+                            </DropdownMenuItem>
+                            <DropdownMenuItem
+                              className="text-destructive focus:text-destructive"
+                              onClick={() => void handleRemoveManagedSite(effectiveSiteKey, 'space_remove')}>
+                              从所有电脑移除此网站同步
+                            </DropdownMenuItem>
+                            <DropdownMenuSeparator />
+                            <DropdownMenuItem onClick={() => handleQuickBlacklist(effectiveSiteKey, 'device')}>
+                              加入本机排除列表（仅本电脑不同步）
+                            </DropdownMenuItem>
+                            <DropdownMenuItem onClick={() => handleQuickBlacklist(effectiveSiteKey, 'space')}>
+                              加入空间排除列表（所有电脑不同步）
+                            </DropdownMenuItem>
+                            <DropdownMenuSeparator />
+                            <DropdownMenuItem
+                              onClick={() =>
+                                void updatePopupUxPrefs({ popupDeveloperMode: !uxPrefs.popupDeveloperMode })
+                              }>
+                              {uxPrefs.popupDeveloperMode ? '切换为简洁视图（隐藏调试面板）' : '常驻开启开发者工具视图'}
+                            </DropdownMenuItem>
+                          </DropdownMenuContent>
+                        </DropdownMenu>
+                      </div>
                     ) : null}
                   </div>
 
-                  {/* Rolling-token damper notice (closable & persistent) */}
+                  {/* Rolling-token damper notice */}
                   {summary?.rollingTokenDamped && isBannerVisible('popup_rolling_token_warn', 'degraded') ? (
                     <div className="relative flex items-start gap-2 rounded-lg border border-amber-500/35 bg-amber-500/10 px-2.5 py-2 pr-14 text-[11px] text-amber-900 dark:text-amber-200">
                       <ShieldAlert className="mt-0.5 h-3.5 w-3.5 shrink-0 text-amber-600" />
-                      <span>
-                        检测到该站点高频滚动令牌交替抢写，已自动开启防互踢阻尼保护（优先保留当前前台设备提交）。
-                      </span>
+                      <span>检测到该网站自动刷新登录令牌，已开启防互踢保护（优先保留当前电脑登录态）。</span>
                       <button
                         type="button"
                         onClick={() => void dismissBanner('popup_rolling_token_warn')}
                         className="absolute right-1.5 top-1.5 inline-flex items-center gap-0.5 rounded px-1 py-0.5 text-[10px] hover:bg-amber-500/20">
-                        不再提示
+                        知道了
                         <X className="h-3 w-3" />
                       </button>
                     </div>
@@ -984,20 +1162,24 @@ const Popup = () => {
                     <div className="rounded-lg bg-muted/40 px-2.5 py-2 text-xs space-y-2">
                       <div className="flex flex-wrap items-center justify-between gap-1.5">
                         <div className="min-w-0 flex-1">
-                          <span className="text-[11px] text-muted-foreground">当前账号：</span>
-                          <span className="font-medium text-foreground break-words">
-                            {activeTrack?.label ||
-                              (summary?.binding?.state === 'PENDING_CHOICE' ? '待选择账号轨道' : '默认主账号')}
-                          </span>
-                          {allTracks.length > 1 && activeTrackIdx >= 0 ? (
-                            <span className="ml-1 rounded bg-primary/15 px-1 py-0.5 text-[10px] font-semibold text-primary">
-                              {activeTrackIdx + 1}/{allTracks.length}
+                          <div className="flex flex-wrap items-center gap-1">
+                            <span className="text-[11px] text-muted-foreground">账号：</span>
+                            {renderTrackBadgePills(activeTrack)}
+                            <span className="font-medium text-foreground break-words">
+                              {activeTrack?.label ||
+                                (summary?.binding?.state === 'PENDING_CHOICE' ? '待选择同步账号' : '默认主账号')}
                             </span>
-                          ) : activeTrack ? (
-                            <span className="ml-1 text-[10px] text-muted-foreground">
-                              ({activeTrack.memberDeviceIds.length} 设备)
-                            </span>
-                          ) : null}
+                            {allTracks.length > 1 && activeTrackIdx >= 0 ? (
+                              <span className="rounded bg-primary/15 px-1 py-0.5 text-[10px] font-semibold text-primary">
+                                {activeTrackIdx + 1}/{allTracks.length}
+                              </span>
+                            ) : null}
+                            {activeTrack?.ephemeral ? (
+                              <span className="text-[10px] text-purple-600 dark:text-purple-300">
+                                · {formatRemainingDuration(activeTrack.ephemeral.expiresAt - Date.now())}
+                              </span>
+                            ) : null}
+                          </div>
                         </div>
                         <div className="flex items-center gap-1 shrink-0">
                           {allTracks.length > 1 ? (
@@ -1009,9 +1191,9 @@ const Popup = () => {
                                 disabled={trackBusy}
                                 onClick={() => void handleRotateAccount(effectiveSiteKey)}
                                 className="h-6 px-2 text-[11px]"
-                                title="按顺序一键轮换到下一个账号并刷新页面">
+                                title="按顺序一键切换到下一个账号（快捷键 Alt+Shift+.）">
                                 <Repeat className="mr-1 h-3 w-3" />
-                                轮换
+                                切号
                               </Button>
                               <DropdownMenu modal={false}>
                                 <DropdownMenuTrigger asChild>
@@ -1021,8 +1203,8 @@ const Popup = () => {
                                     size="sm"
                                     disabled={trackBusy}
                                     className="h-6 px-2 text-[11px]">
-                                    账号列表
-                                    <ChevronDown className="ml-1 h-3 w-3" />
+                                    列表
+                                    <ChevronDown className="ml-0.5 h-3 w-3" />
                                   </Button>
                                 </DropdownMenuTrigger>
                                 <DropdownMenuContent align="end" className="w-56">
@@ -1036,12 +1218,15 @@ const Popup = () => {
                                         }
                                       }}>
                                       <div className="min-w-0 flex-1 flex flex-col">
-                                        <span className="truncate text-xs font-medium">
-                                          #{idx + 1} {track.label}{' '}
-                                          {track.trackId === activeTrack?.trackId ? '(当前)' : ''}
-                                        </span>
+                                        <div className="flex items-center gap-1 min-w-0">
+                                          {renderTrackBadgePills(track)}
+                                          <span className="truncate text-xs font-medium">
+                                            #{idx + 1} {track.label}{' '}
+                                            {track.trackId === activeTrack?.trackId ? '(当前)' : ''}
+                                          </span>
+                                        </div>
                                         <span className="text-[10px] text-muted-foreground">
-                                          {track.cookieCount} Cookie · {track.originDeviceName}
+                                          {track.cookieCount} Cookie · 来自 {track.originDeviceName}
                                         </span>
                                       </div>
                                       {allTracks.length > 1 ? (
@@ -1072,7 +1257,7 @@ const Popup = () => {
                                 disabled={trackBusy}
                                 className="h-6 px-2 text-[11px]">
                                 <UserPlus className="mr-1 h-3 w-3" />
-                                新账号
+                                存新号
                               </Button>
                             </DropdownMenuTrigger>
                             <DropdownMenuContent align="end">
@@ -1082,9 +1267,9 @@ const Popup = () => {
                                   setNewAcctLabel('');
                                 }}>
                                 <div className="flex flex-col">
-                                  <span className="text-xs font-medium">新建空白账号（清空页面登录新号）</span>
+                                  <span className="text-xs font-medium">新建空白小号（清空当前页去登新号）</span>
                                   <span className="text-[10px] text-muted-foreground">
-                                    自动保留当前账号会话，不触发服务端注销
+                                    自动保存原账号不掉线，随时一键切回
                                   </span>
                                 </div>
                               </DropdownMenuItem>
@@ -1094,9 +1279,9 @@ const Popup = () => {
                                   setNewAcctLabel('');
                                 }}>
                                 <div className="flex flex-col">
-                                  <span className="text-xs font-medium">将当前登录态另存为新账号</span>
+                                  <span className="text-xs font-medium">把当前登录状态另存为备份号</span>
                                   <span className="text-[10px] text-muted-foreground">
-                                    复制当前浏览器 Cookie 创建新账号轨道
+                                    复制当前 Cookie 保存为新账号槽位
                                   </span>
                                 </div>
                               </DropdownMenuItem>
@@ -1105,14 +1290,14 @@ const Popup = () => {
                                   <DropdownMenuSeparator />
                                   <DropdownMenuItem onClick={() => void handleSplitIndependent(effectiveSiteKey)}>
                                     <GitBranch className="mr-1.5 h-3.5 w-3.5" />
-                                    <span className="text-xs">拆分为本机独立轨道</span>
+                                    <span className="text-xs">设为仅本机独立账号（不跟随其他电脑）</span>
                                   </DropdownMenuItem>
                                 </>
                               ) : null}
                               <DropdownMenuSeparator />
                               <DropdownMenuItem onClick={() => openOptions('accounts')}>
                                 <Layers className="mr-1.5 h-3.5 w-3.5" />
-                                <span className="text-xs">打开多账号管理中心...</span>
+                                <span className="text-xs">打开多账号色标与备注管理...</span>
                               </DropdownMenuItem>
                             </DropdownMenuContent>
                           </DropdownMenu>
@@ -1126,8 +1311,8 @@ const Popup = () => {
                             onChange={e => setNewAcctLabel(e.target.value)}
                             placeholder={
                               newAcctMode === 'clean_new'
-                                ? '新空白账号名称（如 测试小号B，回车创建）'
-                                : '保存账号名称（如 管理员主号）'
+                                ? '给新小号起名（如 工作小号，回车创建）'
+                                : '保存名称（如 主力大号）'
                             }
                             onKeyDown={e => {
                               if (e.key === 'Enter') void handleCreateAccount(effectiveSiteKey, newAcctMode);
@@ -1141,7 +1326,7 @@ const Popup = () => {
                             disabled={trackBusy}
                             onClick={() => void handleCreateAccount(effectiveSiteKey, newAcctMode)}
                             className="h-7 px-2.5 text-[11px] shrink-0">
-                            {newAcctMode === 'clean_new' ? '清空并切换' : '保存'}
+                            {newAcctMode === 'clean_new' ? '清空并登新号' : '保存'}
                           </Button>
                           <Button
                             type="button"
@@ -1156,86 +1341,118 @@ const Popup = () => {
                     </div>
                   ) : null}
 
-                  {/* Metrics Grid */}
-                  <div className="grid grid-cols-4 gap-1.5 text-center">
-                    <div className="rounded-lg border border-border/70 bg-background px-1.5 py-1.5">
-                      <div className="flex items-center justify-center gap-1 text-[10px] text-muted-foreground">
-                        <Cookie className="h-3 w-3" />
-                        Cookie
+                  {/* Progressive Disclosure Toggle for Site Telemetry / Manual Push-Pull / Dev Tools */}
+                  {!devToolsVisible ? (
+                    <div className="flex items-center justify-between pt-0.5 text-[11px] text-muted-foreground">
+                      <span>
+                        已存 {summary?.cookieCount ?? 0} 条 Cookie
+                        {(summary?.localStorageCount ?? 0) > 0 ? ` · ${summary?.localStorageCount} 项 LS` : ''}
+                      </span>
+                      <button
+                        type="button"
+                        onClick={() => setSiteAdvExpanded(true)}
+                        className="inline-flex items-center gap-0.5 text-[11px] font-medium text-muted-foreground hover:text-primary">
+                        单站手动推拉与调试工具
+                        <ChevronDown className="h-3 w-3" />
+                      </button>
+                    </div>
+                  ) : (
+                    <div className="space-y-2 pt-1">
+                      <div className="grid grid-cols-4 gap-1.5 text-center">
+                        <div className="rounded-lg border border-border/70 bg-background px-1.5 py-1.5">
+                          <div className="flex items-center justify-center gap-1 text-[10px] text-muted-foreground">
+                            <Cookie className="h-3 w-3" />
+                            Cookie
+                          </div>
+                          <div className="mt-0.5 text-sm font-bold">{summary?.cookieCount ?? 0}</div>
+                        </div>
+                        <div className="rounded-lg border border-border/70 bg-background px-1.5 py-1.5">
+                          <div className="flex items-center justify-center gap-1 text-[10px] text-muted-foreground">
+                            <Database className="h-3 w-3" />
+                            LS
+                          </div>
+                          <div className="mt-0.5 text-sm font-bold">{summary?.localStorageCount ?? 0}</div>
+                        </div>
+                        <div className="rounded-lg border border-border/70 bg-background px-1.5 py-1.5">
+                          <div className="text-[10px] text-muted-foreground">待上传</div>
+                          <div className="mt-0.5 text-sm font-bold text-primary">{status.pendingUploads}</div>
+                        </div>
+                        <div className="rounded-lg border border-border/70 bg-background px-1.5 py-1.5">
+                          <div className="text-[10px] text-muted-foreground">待应用</div>
+                          <div className="mt-0.5 text-sm font-bold text-sky-600 dark:text-sky-400">
+                            {status.pendingApplies}
+                          </div>
+                        </div>
                       </div>
-                      <div className="mt-0.5 text-sm font-bold">{summary?.cookieCount ?? 0}</div>
-                    </div>
-                    <div className="rounded-lg border border-border/70 bg-background px-1.5 py-1.5">
-                      <div className="flex items-center justify-center gap-1 text-[10px] text-muted-foreground">
-                        <Database className="h-3 w-3" />
-                        LS
-                      </div>
-                      <div className="mt-0.5 text-sm font-bold">{summary?.localStorageCount ?? 0}</div>
-                    </div>
-                    <div className="rounded-lg border border-border/70 bg-background px-1.5 py-1.5">
-                      <div className="text-[10px] text-muted-foreground">待上传</div>
-                      <div className="mt-0.5 text-sm font-bold text-primary">{status.pendingUploads}</div>
-                    </div>
-                    <div className="rounded-lg border border-border/70 bg-background px-1.5 py-1.5">
-                      <div className="text-[10px] text-muted-foreground">待应用</div>
-                      <div className="mt-0.5 text-sm font-bold text-sky-600 dark:text-sky-400">
-                        {status.pendingApplies}
-                      </div>
-                    </div>
-                  </div>
 
-                  {/* Current Site Push / Pull */}
-                  <div className="grid grid-cols-2 gap-2">
-                    <Button
-                      type="button"
-                      size="sm"
-                      variant="outline"
-                      disabled={!!syncingSiteDir || syncingAll || isBlacklisted}
-                      onClick={() => handleSiteSync(effectiveSiteKey, 'push')}
-                      className="h-8 text-xs">
-                      {syncingSiteDir === 'push' ? (
-                        <Loader2 className="mr-1.5 h-3.5 w-3.5 animate-spin" />
-                      ) : (
-                        <CloudUpload className="mr-1.5 h-3.5 w-3.5" />
-                      )}
-                      当前网站上传
-                    </Button>
-                    <Button
-                      type="button"
-                      size="sm"
-                      variant="outline"
-                      disabled={!!syncingSiteDir || syncingAll || isBlacklisted}
-                      onClick={() => handleSiteSync(effectiveSiteKey, 'pull')}
-                      className="h-8 text-xs">
-                      {syncingSiteDir === 'pull' ? (
-                        <Loader2 className="mr-1.5 h-3.5 w-3.5 animate-spin" />
-                      ) : (
-                        <CloudDownload className="mr-1.5 h-3.5 w-3.5" />
-                      )}
-                      当前网站拉取
-                    </Button>
-                  </div>
+                      <div className="grid grid-cols-2 gap-2">
+                        <Button
+                          type="button"
+                          size="sm"
+                          variant="outline"
+                          disabled={!!syncingSiteDir || syncingAll || isBlacklisted}
+                          onClick={() => handleSiteSync(effectiveSiteKey, 'push')}
+                          className="h-8 text-xs">
+                          {syncingSiteDir === 'push' ? (
+                            <Loader2 className="mr-1.5 h-3.5 w-3.5 animate-spin" />
+                          ) : (
+                            <CloudUpload className="mr-1.5 h-3.5 w-3.5" />
+                          )}
+                          当前网站立即上传
+                        </Button>
+                        <Button
+                          type="button"
+                          size="sm"
+                          variant="outline"
+                          disabled={!!syncingSiteDir || syncingAll || isBlacklisted}
+                          onClick={() => handleSiteSync(effectiveSiteKey, 'pull')}
+                          className="h-8 text-xs">
+                          {syncingSiteDir === 'pull' ? (
+                            <Loader2 className="mr-1.5 h-3.5 w-3.5 animate-spin" />
+                          ) : (
+                            <CloudDownload className="mr-1.5 h-3.5 w-3.5" />
+                          )}
+                          当前网站立即拉取
+                        </Button>
+                      </div>
+
+                      {!uxPrefs.popupDeveloperMode ? (
+                        <div className="flex items-center justify-between text-[10px] text-muted-foreground">
+                          <button
+                            type="button"
+                            onClick={() => void updatePopupUxPrefs({ popupDeveloperMode: true })}
+                            className="hover:text-primary hover:underline">
+                            默认常驻展开开发者工具
+                          </button>
+                          <button
+                            type="button"
+                            onClick={() => setSiteAdvExpanded(false)}
+                            className="inline-flex items-center gap-0.5 hover:text-foreground">
+                            收起
+                            <ChevronUp className="h-3 w-3" />
+                          </button>
+                        </div>
+                      ) : null}
+                    </div>
+                  )}
                 </>
               )
             ) : (
               <div className="flex items-center justify-between py-1 text-xs text-muted-foreground">
                 <div className="flex items-center gap-2">
                   <Globe className="h-4 w-4" />
-                  <span>当前标签页非网页站点（无法执行单站操作）</span>
+                  <span>打开任意网页即可在此管理该站点的自动同步</span>
                 </div>
-                <span className="shrink-0 text-[11px]">
-                  待上传 {status.pendingUploads} · 待应用 {status.pendingApplies}
-                </span>
               </div>
             )}
 
-            {/* Dev <-> Prod Environment Cookie Sync Quick Bar (works on localhost/dev & matched prod sites!) */}
+            {/* Dev <-> Prod Environment Cookie Sync Quick Bar (Auto-visible on localhost/dev or matched rules, or inside devToolsVisible) */}
             {isHttpTab && (matchingEnvRules.length > 0 || isDevTab || showEnvQuickPanel) ? (
               <div className="rounded-lg border border-primary/25 bg-primary/[0.04] p-2.5 text-xs space-y-2">
                 <div className="flex items-center justify-between gap-2">
                   <span className="inline-flex items-center gap-1 font-semibold text-foreground">
                     <ArrowLeftRight className="h-3.5 w-3.5 text-primary" />
-                    开发 / 生产环境 Cookie 同步
+                    开发联调：注入线上登录态到本地页
                   </span>
                   <div className="flex items-center gap-1">
                     {!isDevTab && matchingEnvRules.length > 0 ? (
@@ -1268,8 +1485,8 @@ const Popup = () => {
                               {rule.sourceHostFilter || rule.sourceSiteKey} → {rule.targetUrl}
                             </div>
                             <div className="text-[10px] text-muted-foreground">
-                              {role === 'target' ? '当前为目标环境' : '当前为源环境'} ·{' '}
-                              {!rule.enabled ? '规则已禁用' : rule.autoSync ? '自动跟随开启' : '手动同步'}
+                              {role === 'target' ? '当前为目标页' : '当前为源环境'} ·{' '}
+                              {!rule.enabled ? '已禁用' : rule.autoSync ? '自动跟随' : '手动'}
                             </div>
                           </div>
                           <div className="flex items-center gap-1 shrink-0">
@@ -1288,7 +1505,7 @@ const Popup = () => {
                               variant="outline"
                               disabled={envBusy}
                               onClick={() => void handleExecuteEnvRule(rule, true)}
-                              title="反向同步一次（从目标环境写回源环境）"
+                              title="反向写回源环境"
                               className="h-6 px-1.5 text-[10px]">
                               反向
                             </Button>
@@ -1301,9 +1518,6 @@ const Popup = () => {
 
                 {(isDevTab || showEnvQuickPanel) && (
                   <div className="space-y-1.5 pt-1 border-t border-border/50">
-                    <div className="text-[11px] text-muted-foreground">
-                      将线上/测试环境登录态一键重写注入当前页（自动适配 HTTP / localhost 属性）：
-                    </div>
                     <div className="grid grid-cols-2 gap-1.5">
                       <div>
                         <Input
@@ -1314,7 +1528,7 @@ const Popup = () => {
                             setEnvSourceSiteKey(e.target.value);
                             setEnvSourceTrackId('');
                           }}
-                          placeholder="选择或输入源域名..."
+                          placeholder="选择线上源域名..."
                           className="h-7 px-2 text-[11px] font-mono"
                         />
                         <datalist id="popup-env-source-sites">
@@ -1326,11 +1540,11 @@ const Popup = () => {
                         </datalist>
                       </div>
                       <select
-                        aria-label="选择源站点账号轨道"
+                        aria-label="选择源站点账号"
                         value={envSourceTrackId}
                         onChange={e => setEnvSourceTrackId(e.target.value)}
                         className="h-7 rounded border border-input bg-background px-1.5 text-[11px] text-foreground">
-                        <option value="">跟随当前激活账号</option>
+                        <option value="">跟随当前账号</option>
                         {(selectedEnvSite?.allTracks ?? []).map(tr => (
                           <option key={tr.trackId} value={tr.trackId}>
                             账号：{tr.label} ({tr.cookieCount}条)
@@ -1338,18 +1552,32 @@ const Popup = () => {
                         ))}
                       </select>
                     </div>
-                    <div className="flex items-center justify-between gap-2">
-                      <div className="inline-flex items-center gap-1.5 text-[11px] text-muted-foreground">
-                        <input
-                          id="popup-env-sync-ls"
-                          type="checkbox"
-                          checked={envSyncLs}
-                          onChange={e => setEnvSyncLs(e.target.checked)}
-                          className="h-3.5 w-3.5 rounded accent-primary"
-                        />
-                        <label htmlFor="popup-env-sync-ls" className="cursor-pointer">
-                          含 LocalStorage
-                        </label>
+                    <div className="flex flex-wrap items-center justify-between gap-2">
+                      <div className="flex flex-wrap items-center gap-2.5 text-[11px] text-muted-foreground">
+                        <span className="inline-flex items-center gap-1">
+                          <input
+                            id="popup-env-sync-ls"
+                            type="checkbox"
+                            checked={envSyncLs}
+                            onChange={e => setEnvSyncLs(e.target.checked)}
+                            className="h-3.5 w-3.5 rounded accent-primary"
+                          />
+                          <label htmlFor="popup-env-sync-ls" className="cursor-pointer">
+                            含 LS
+                          </label>
+                        </span>
+                        <span className="inline-flex items-center gap-1">
+                          <input
+                            id="popup-env-sync-ss"
+                            type="checkbox"
+                            checked={envSyncSs}
+                            onChange={e => setEnvSyncSs(e.target.checked)}
+                            className="h-3.5 w-3.5 rounded accent-primary"
+                          />
+                          <label htmlFor="popup-env-sync-ss" className="cursor-pointer">
+                            含 SS
+                          </label>
+                        </span>
                       </div>
                       <div className="flex items-center gap-1">
                         <Button
@@ -1375,7 +1603,7 @@ const Popup = () => {
                   </div>
                 )}
               </div>
-            ) : isHttpTab && effectiveSiteKey ? (
+            ) : isHttpTab && effectiveSiteKey && devToolsVisible ? (
               <div className="flex justify-end">
                 <button
                   type="button"
@@ -1392,7 +1620,7 @@ const Popup = () => {
           {status.undoPointsCount > 0 && latestUndo ? (
             <div className="flex items-center justify-between gap-2 rounded-lg border border-sky-500/35 bg-sky-500/10 px-3 py-2 text-xs">
               <div className="min-w-0">
-                <span className="font-medium text-foreground">本地后悔药可用：</span>
+                <span className="font-medium text-foreground">刚覆盖了登录态？可一键撤回：</span>
                 <span className="truncate text-muted-foreground">{latestUndo.siteKey}</span>
               </div>
               <Button
@@ -1407,7 +1635,7 @@ const Popup = () => {
                 ) : (
                   <RotateCcw className="mr-1 h-3 w-3" />
                 )}
-                撤销上次覆盖
+                恢复原状态
               </Button>
             </div>
           ) : null}
@@ -1419,14 +1647,14 @@ const Popup = () => {
                 <div className="text-xs font-semibold">全局自动同步</div>
                 <div className="text-[10px] text-muted-foreground">
                   {isPaused
-                    ? '当前已暂停自动上传与拉取'
+                    ? '已暂停自动上传与拉取'
                     : settings?.autoSync === false
-                      ? '空间自动同步已关闭（仅手动同步）'
+                      ? '空间自动同步已关闭（仅手动）'
                       : status.pendingUploads > 0
                         ? settings?.syncTimingMode === 'on_page_leave'
-                          ? `离开/关闭页面时自动上传（已暂存 ${status.pendingUploads} 条）`
-                          : `自动运行中 · ${status.pendingUploads} 条变更正在后台自动上传`
-                        : `${settings?.syncTimingMode === 'on_page_leave' ? '离开页面时上传' : '实时自动同步'} · 上次同步 ${formatRelativeTime(status.lastSyncAt)}`}
+                          ? `离开网页时自动上传（待传 ${status.pendingUploads} 条）`
+                          : `后台自动上传中（${status.pendingUploads} 条）`
+                        : `${settings?.syncTimingMode === 'on_page_leave' ? '离开网页时自动同步' : '实时自动同步'} · 上次 ${formatRelativeTime(status.lastSyncAt)}`}
                 </div>
               </div>
               <Switch
@@ -1445,19 +1673,28 @@ const Popup = () => {
               立即全量同步
             </Button>
 
-            <div className="grid grid-cols-2 gap-2">
-              <Button type="button" variant="secondary" size="sm" onClick={openSidePanel} className="h-8 text-xs">
-                <PanelRightOpen className="mr-1.5 h-3.5 w-3.5" />
-                打开侧边栏
+            <div className="grid grid-cols-3 gap-1.5">
+              <Button type="button" variant="secondary" size="sm" onClick={openSidePanel} className="h-8 px-2 text-xs">
+                <PanelRightOpen className="mr-1 h-3.5 w-3.5" />
+                侧边栏
               </Button>
               <Button
                 type="button"
                 variant="outline"
                 size="sm"
-                onClick={() => openOptions('sites')}
-                className="h-8 text-xs">
-                <Settings className="mr-1.5 h-3.5 w-3.5" />
-                综合管理后台
+                onClick={() => openOptions('devices_spaces', 'spaces')}
+                className="h-8 px-2 text-xs">
+                <Laptop className="mr-1 h-3.5 w-3.5" />
+                连新电脑
+              </Button>
+              <Button
+                type="button"
+                variant="outline"
+                size="sm"
+                onClick={() => openOptions('tutorials')}
+                className="h-8 px-2 text-xs">
+                <BookOpen className="mr-1 h-3.5 w-3.5" />
+                新手教程
               </Button>
             </div>
           </div>

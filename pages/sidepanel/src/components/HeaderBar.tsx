@@ -1,12 +1,13 @@
 import { extractErrorMessage, sidePanelApi } from '@console/lib/api';
 import { useBannerPrefs } from '@console/lib/bannerPrefs';
 import { formatRelativeTime, getDeviceStatusMeta } from '@console/lib/format';
-import { useTheme } from '@sessionmesh/shared';
+import { useLocale, useTheme } from '@sessionmesh/shared';
 import type { SyncStatusSummary, SyncTimingMode } from '@sessionmesh/shared';
-import { Button, Input, Label, Switch, ThemeDropdown } from '@sessionmesh/ui';
+import { Button, Input, Label, LanguageDropdown, Switch, ThemeDropdown } from '@sessionmesh/ui';
 import {
   Bell,
   BellOff,
+  BookOpen,
   Laptop,
   Layers,
   Lock,
@@ -32,6 +33,7 @@ export interface HeaderBarProps {
   syncing: boolean;
   onSyncNow: () => Promise<void>;
   onOpenOptions?: () => void;
+  onOpenTutorials?: () => void;
 }
 
 export const HeaderBar: React.FC<HeaderBarProps> = ({
@@ -43,8 +45,10 @@ export const HeaderBar: React.FC<HeaderBarProps> = ({
   syncing,
   onSyncNow,
   onOpenOptions,
+  onOpenTutorials,
 }) => {
   const { setTheme } = useTheme();
+  const { localePreference, locale, setLocalePreference } = useLocale();
   const {
     prefs: bannerPrefs,
     dismissedCount,
@@ -232,6 +236,23 @@ export const HeaderBar: React.FC<HeaderBarProps> = ({
               <span className="absolute -right-0.5 -top-0.5 h-2 w-2 rounded-full bg-amber-500" />
             ) : null}
           </Button>
+          {onOpenTutorials ? (
+            <Button
+              variant="outline"
+              size="icon"
+              className="h-7 w-7"
+              onClick={onOpenTutorials}
+              title="打开新手图文教程与常见问题">
+              <BookOpen className="h-3.5 w-3.5" />
+            </Button>
+          ) : null}
+          <div className="[&_button]:h-7 [&_button]:w-7">
+            <LanguageDropdown
+              localePreference={localePreference}
+              resolvedLocale={locale}
+              setLocalePreference={setLocalePreference}
+            />
+          </div>
           <div className="[&_button]:h-7 [&_button]:w-7">
             <ThemeDropdown setTheme={setTheme} />
           </div>

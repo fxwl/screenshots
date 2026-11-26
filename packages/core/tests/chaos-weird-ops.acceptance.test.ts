@@ -1,5 +1,6 @@
 import { describe, it, expect, afterEach } from 'vitest';
 import { MockWebDAVServer } from '@sessionmesh/webdav-mock';
+import { toStructuredError } from '../src/diagnostics';
 import { parseEnvTarget } from '../src/sync/EnvCookieMapper';
 import { MultiDeviceHarness } from '../src/sim';
 import type { WebDAVConfig } from '../src/types';
@@ -96,6 +97,23 @@ describe('Chaos, Weird Operations, Fault-Injection & Real-HTTP E2E Suite', () =>
         adHoc: { sourceSiteKey: 'locked.io', targetUrl: 'http://localhost:3000' },
       }),
     ).rejects.toThrow(/locked/i);
+    await expect(
+      devA.engine.upsertLocalStorageItem('https://locked.io', 'k_locked', 'v_locked'),
+    ).rejects.toThrow(/locked/i);
+    await expect(
+      devA.engine.upsertCookie('locked.io', {
+        domain: '.locked.io',
+        name: 'ck_locked',
+        value: 'v',
+        path: '/',
+        hostOnly: false,
+        secure: false,
+        httpOnly: false,
+        sameSite: 'lax',
+        session: true,
+      }),
+    ).rejects.toThrow(/locked/i);
+    await expect(devA.engine.updateSpaceSettings({ pollingIntervalSec: 120 })).rejects.toThrow(/locked/i);
 
     // Browser jar and tracks were 100% untouched!
     expect(devA.browser.findJarCookie('sid', 'locked.io')?.value).toBe('acct_2_safe');
@@ -1329,5 +1347,211 @@ describe('Chaos, Weird Operations, Fault-Injection & Real-HTTP E2E Suite', () =>
     expect((await devB.browser.getLocalStorage('https://app.rebuild.io')).items.paused_edit_ls).toBe(
       'paused_ls_val',
     );
+  });
+
+  it('CHAOS-017: Emoji UTF-16 code-point badge/label truncation & degraded WebDAV quirks (d_lower, weakEtags, forbidDotFiles, 423 locked, corrupt read integrity)', async () => {
+    const dav = new MockWebDAVServer({
+      requireAuth: { username: 'chaosuser', password: 'chaos-password-123' },
+      xmlNamespaceStyle: 'd_lower',
+      weakEtags: true,
+      ignoreConditionalHeaders: true,
+      forbidDotFiles: true,
+    });
+    const webdav = createBaseConfig();
+    harness = new MultiDeviceHarness({
+      webdav,
+      fetchImpl: dav.fetchImpl,
+      debounceMs: 0,
+      refreshCoalesceMs: 0,
+      pbkdf2Iterations: 1000,
+    });
+    const devA = await harness.createDevice('Device-A');
+    const devB = await harness.createDevice('Device-B');
+
+    devA.browser.seedCookie({ domain: '.emoji.io', name: 'sid', value: 'e1' });
+    const joinReport = await devA.engine.saveAndJoinSpace({
+      webdav,
+      spaceId: SPACE_ID,
+      spaceName: SPACE_NAME,
+      encryptionPassword: ENC_PASS,
+      deviceName: '🔥Device-A🚀',
+    });
+    expect(joinReport.isNewSpace).toBe(true);
+    expect((await devA.engine.testWebDAVConnection(webdav)).overallOk).toBe(true);
+
+    // 1. Emoji badgeText > 4 code points and long emoji labels truncate by Unicode code point without lone surrogates
+    const created = await devA.engine.createSiteAccountTrack('emoji.io', {
+      mode: 'save_current',
+      label: `${'🔥🚀'.repeat(45)}Tail`,
+      badgeText: '🔥🚀⚡🎯X',
+    });
+    expect(created.badgeText).toBe('🔥🚀⚡🎯');
+    expect(Array.from(created.label).length).toBe(80);
+    expect(() => encodeURIComponent(created.badgeText!)).not.toThrow();
+    expect(() => encodeURIComponent(created.label)).not.toThrow();
+
+    // Unpaired high/low surrogate characters are stripped cleanly
+    const tUpdated = await devA.engine.updateSiteTrack('emoji.io', created.trackId, {
+      badgeText: 'A\uD83DB\uD83D\uDE80C',
+    });
+    expect(tUpdated.badgeText).toBe('AB🚀C');
+    expect(() => encodeURIComponent(tUpdated.badgeText!)).not.toThrow();
+
+    // 2. Push emoji tracks & peer joins cleanly on degraded WebDAV (d_lower + weakEtags + ignoreConditionalHeaders + forbidDotFiles)
+    await devA.engine.flushPendingLocalChanges();
+    await devA.engine.syncNow({ userInitiated: true });
+
+    const joinB = await devB.engine.saveAndJoinSpace({
+      webdav,
+      spaceId: SPACE_ID,
+      spaceName: SPACE_NAME,
+      encryptionPassword: ENC_PASS,
+      deviceName: 'Device-B',
+    });
+    const peerSiteBefore = (await devB.engine.getSitesOverview()).find((s) => s.siteKey === 'emoji.io');
+    expect(peerSiteBefore?.allTracks.some((t) => t.badgeText === 'AB🚀C')).toBe(true);
+    if (joinB.pendingDecisions.some((d) => d.siteKey === 'emoji.io')) {
+      await devB.engine.resolveSiteDecision('emoji.io', {
+        type: 'use_remote_track',
+        trackId: created.trackId,
+      });
+    }
+    await devB.engine.syncNow({ userInitiated: true });
+    expect(devB.browser.findJarCookie('sid', 'emoji.io')?.value).toBe('e1');
+
+    // 3. Inject 423 Locked on space root -> sync fails gracefully, then recovers after lock cleared
+    dav.quirks.lockedPaths = new Set(['/webdav/mesh']);
+    await devA.browser.simulateUserCookieSet({ domain: '.emoji.io', name: 'sid', value: 'e2_after_423' });
+    await devA.engine.flushPendingLocalChanges();
+    const lockedRes = await devA.engine.syncNow({ userInitiated: true });
+    expect(lockedRes.errorMessage).toBeTruthy();
+
+    dav.quirks.lockedPaths = undefined;
+    const recoveredRes = await devA.engine.syncNow({ userInitiated: true });
+    expect(recoveredRes.errorMessage).toBeFalsy();
+    await devB.engine.syncNow({ direction: 'pull', triggerRefresh: false });
+    expect(devB.browser.findJarCookie('sid', 'emoji.io')?.value).toBe('e2_after_423');
+
+    // 4. Bit-flip corruption on one remote batch -> checkIntegrity detects corruptedPaths without throwing
+    const batchPath = [...(dav as unknown as { nodes: Map<string, { kind: string }> }).nodes.keys()].find((p) =>
+      p.includes('/events/') && p.endsWith('.enc'),
+    );
+    expect(batchPath).toBeTruthy();
+    dav.quirks.corruptReadsForPaths = new Set([batchPath!]);
+    const integrity = await devA.engine.checkIntegrity();
+    expect(integrity.ok).toBe(false);
+    expect(integrity.corruptedPaths.some((cp) => batchPath!.endsWith(cp))).toBe(true);
+    dav.quirks.corruptReadsForPaths = undefined;
+  });
+
+  it('CHAOS-018: Backend migration after SW restart (no RAM password) bootstraps dirs, migrates space.enc, and auto-heals 409 missing parent collections on putBytes', async () => {
+    const dav1 = new MockWebDAVServer({
+      requireAuth: { username: 'chaosuser', password: 'chaos-password-123' },
+    });
+    const dav2 = new MockWebDAVServer({
+      requireAuth: { username: 'chaosuser', password: 'chaos-password-123' },
+    });
+    const routeFetch: typeof fetch = (input, init) => {
+      const urlStr = typeof input === 'string' ? input : input instanceof URL ? input.toString() : input.url;
+      if (urlStr.startsWith('https://dav2.')) return dav2.fetchImpl(input, init);
+      return dav1.fetchImpl(input, init);
+    };
+    const webdav1: WebDAVConfig = {
+      url: 'https://dav1.chaos.test/webdav',
+      authType: 'basic',
+      username: 'chaosuser',
+      password: 'chaos-password-123',
+      rootPath: '/mesh1',
+    };
+    const webdav2: WebDAVConfig = {
+      url: 'https://dav2.chaos.test/webdav',
+      authType: 'basic',
+      username: 'chaosuser',
+      password: 'chaos-password-123',
+      rootPath: '/custom-mesh2',
+    };
+
+    harness = new MultiDeviceHarness({
+      webdav: webdav1,
+      fetchImpl: routeFetch,
+      debounceMs: 0,
+      refreshCoalesceMs: 0,
+      pbkdf2Iterations: 1000,
+    });
+    const devA = await harness.createDevice('Device-A');
+    const devB = await harness.createDevice('Device-B');
+
+    devA.browser.seedCookie({ domain: '.migrate.io', name: 'sid', value: 'm1' });
+    await devA.engine.saveAndJoinSpace({
+      webdav: webdav1,
+      spaceId: SPACE_ID,
+      spaceName: SPACE_NAME,
+      encryptionPassword: ENC_PASS,
+      deviceName: 'Device-A',
+    });
+
+    // Simulate MV3 Service Worker idle restart: DEK comes from keyVault, encryptionPassword is NOT in RAM
+    await devA.restartEngine();
+    expect((await devA.engine.getStatusSummary()).locked).toBe(false);
+
+    // Migrate to completely empty WebDAV 2 with custom rootPath -> dirs & space.enc MUST bootstrap!
+    await devA.engine.updateSpaceStorageConfig({ provider: 'webdav', ...webdav2 });
+    await devA.browser.simulateUserCookieSet({ domain: '.migrate.io', name: 'sid', value: 'm2_migrated' });
+    await devA.engine.flushPendingLocalChanges();
+    const pushRes = await devA.engine.syncNow({ userInitiated: true });
+    expect(pushRes.errorMessage).toBeFalsy();
+    expect((await devA.engine.getStatusSummary()).pendingUploads).toBe(0);
+
+    const dav2Nodes = (dav2 as unknown as { nodes: Map<string, unknown> }).nodes;
+    expect(Array.from(dav2Nodes.keys()).some((k) => k.includes('/events/') && k.endsWith('.enc'))).toBe(true);
+
+    const integrity = await devA.engine.checkIntegrity();
+    expect(integrity.ok).toBe(true);
+    expect(integrity.spaceMetadataOk).toBe(true);
+
+    // Simulate external deletion of events/<devId> directory on WebDAV 2 -> putBytes auto-recovers from 409
+    for (const k of Array.from(dav2Nodes.keys())) {
+      if (k.includes('/events/')) {
+        dav2Nodes.delete(k);
+      }
+    }
+    await devA.browser.simulateUserCookieSet({ domain: '.migrate.io', name: 'sid', value: 'm3_healed_409' });
+    await devA.engine.flushPendingLocalChanges();
+    const healedPush = await devA.engine.syncNow({ userInitiated: true });
+    expect(healedPush.errorMessage).toBeFalsy();
+    expect((await devA.engine.getStatusSummary()).pendingUploads).toBe(0);
+    expect(Array.from(dav2Nodes.keys()).some((k) => k.includes('/events/') && k.endsWith('.enc'))).toBe(true);
+
+    // Peer Device B can verify & join migrated WebDAV 2 using the original encryption password!
+    const verified = await devB.engine.verifyRemoteSpacePassword({
+      webdav: webdav2,
+      spaceId: SPACE_ID,
+      encryptionPassword: ENC_PASS,
+    });
+    expect(verified).toMatchObject({ exists: true, verified: true, spaceName: SPACE_NAME });
+
+    // URL / HTTPS diagnostic suggestions must reflect the storage provider (not always say WebDAV)
+    const gistHttpErr = toStructuredError({
+      code: 'GIST_INSECURE_HTTP',
+      phase: 'validate_url',
+      message: 'Insecure http:// GitHub Gist API URLs are forbidden; HTTPS is required.',
+    });
+    expect(gistHttpErr.suggestion).toContain('GitHub API');
+    expect(gistHttpErr.suggestion).not.toContain('WebDAV');
+
+    const s3HttpErr = toStructuredError({
+      code: 'S3_INSECURE_HTTP',
+      phase: 'validate_url',
+      message: 'Insecure http:// S3 endpoint URLs are forbidden; HTTPS is required.',
+    });
+    expect(s3HttpErr.suggestion).toContain('S3');
+    expect(s3HttpErr.suggestion).not.toContain('WebDAV');
+
+    const webdavHttpErr = toStructuredError({
+      code: 'WEBDAV_INSECURE_HTTP',
+      phase: 'validate_url',
+      message: 'Insecure http:// WebDAV URLs are forbidden; HTTPS is required.',
+    });
+    expect(webdavHttpErr.suggestion).toContain('WebDAV');
   });
 });

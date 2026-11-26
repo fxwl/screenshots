@@ -45,7 +45,7 @@ export type CookieSyncStatus =
 
 export type EventOperation = 'CREATE' | 'UPDATE' | 'DELETE' | 'RESTORE' | 'SNAPSHOT' | 'CHECKPOINT';
 
-export type ObjectType = 'cookie' | 'localStorage';
+export type ObjectType = 'cookie' | 'localStorage' | 'sessionStorage' | 'indexedDb';
 
 export type SiteBindingState =
   | 'AUTO_BOUND'
@@ -185,6 +185,54 @@ export interface LocalStorageRecord {
   syncStatus?: CookieSyncStatus;
 }
 
+export interface SessionStorageRecord {
+  logicalId: string;
+  siteKey: string;
+  trackId: string;
+  origin: string;
+  key: string;
+  value: string;
+  version: CausalVersion;
+  sourceDevice: string;
+  sourceDeviceName?: string;
+  deleted: boolean;
+  updatedAt: number;
+  contextAvailable?: boolean;
+  syncStatus?: CookieSyncStatus;
+}
+
+export interface IndexedDbRecord {
+  logicalId: string;
+  siteKey: string;
+  trackId: string;
+  origin: string;
+  dbName: string;
+  dbVersion?: number;
+  storeName: string;
+  keyPath?: string | string[] | null;
+  autoIncrement?: boolean;
+  encodedKey: string;
+  encodedValue: string;
+  byteLength: number;
+  version: CausalVersion;
+  sourceDevice: string;
+  sourceDeviceName?: string;
+  deleted: boolean;
+  updatedAt: number;
+  contextAvailable?: boolean;
+  syncStatus?: CookieSyncStatus;
+}
+
+export type SyncRecord = CookieRecord | LocalStorageRecord | SessionStorageRecord | IndexedDbRecord;
+
+export interface EphemeralTrackMeta {
+  shareId: string;
+  expiresAt: number;
+  localOnly: boolean;
+  sharedBy?: string;
+  note?: string;
+}
+
 export interface SiteTrack {
   trackId: string;
   siteKey: string;
@@ -193,12 +241,17 @@ export interface SiteTrack {
   originDeviceName: string;
   cookieCount: number;
   localStorageCount: number;
+  sessionStorageCount?: number;
+  indexedDbCount?: number;
   updatedAt: number;
   memberDeviceIds: string[];
   revision?: number;
   sortOrder?: number;
   lastUsedAt?: number;
   accountNote?: string;
+  color?: string;
+  badgeText?: string;
+  ephemeral?: EphemeralTrackMeta;
 }
 
 export type AccountCreateMode = 'clean_new' | 'save_current';
@@ -206,6 +259,8 @@ export type AccountCreateMode = 'clean_new' | 'save_current';
 export interface CreateSiteAccountOptions {
   label?: string;
   accountNote?: string;
+  color?: string;
+  badgeText?: string;
   mode: AccountCreateMode;
   triggerRefresh?: boolean;
 }
@@ -214,6 +269,8 @@ export interface UpdateSiteTrackPatch {
   label?: string;
   accountNote?: string;
   sortOrder?: number;
+  color?: string | null;
+  badgeText?: string | null;
 }
 
 export interface AccountRotationResult {
@@ -224,6 +281,7 @@ export interface AccountRotationResult {
   total: number;
   appliedCookies: number;
   failedCookies: number;
+  reloadedTabs?: number;
 }
 
 export interface DeviceSiteBinding {
@@ -266,11 +324,109 @@ export interface WebDAVConfig {
   allowInsecureLocalhostForTesting?: boolean;
 }
 
+export type StorageProviderType = 'webdav' | 's3' | 'github_gist' | 'local_directory';
+
+export type S3VendorPreset = 'r2' | 'aliyun_oss' | 'aws_s3' | 'minio' | 'cos' | 'b2' | 'custom';
+
+export interface S3StorageConfig {
+  provider: 's3';
+  vendorPreset?: S3VendorPreset;
+  endpoint: string;
+  region: string;
+  bucket: string;
+  accessKeyId: string;
+  secretAccessKey: string;
+  sessionToken?: string;
+  rootPrefix: string;
+  addressingStyle?: 'path' | 'virtual_hosted';
+  signatureMode?: 'aws_v4' | 'oss_v4';
+  requestTimeoutMs?: number;
+  allowInsecureLocalhostForTesting?: boolean;
+}
+
+export interface GitHubGistStorageConfig {
+  provider: 'github_gist';
+  personalAccessToken: string;
+  gistId?: string;
+  apiBaseUrl?: string;
+  rootPrefix?: string;
+  requestTimeoutMs?: number;
+  allowInsecureLocalhostForTesting?: boolean;
+}
+
+export interface LocalDirectoryStorageConfig {
+  provider: 'local_directory';
+  directoryLabel: string;
+  handleKey: string;
+  rootPrefix?: string;
+}
+
+export type StorageProviderConfig =
+  | ({ provider: 'webdav' } & WebDAVConfig)
+  | S3StorageConfig
+  | GitHubGistStorageConfig
+  | LocalDirectoryStorageConfig;
+
+export type SanitizedStorageProviderConfig =
+  | ({ provider: 'webdav' } & Omit<WebDAVConfig, 'password' | 'bearerToken'>)
+  | Omit<S3StorageConfig, 'secretAccessKey' | 'sessionToken'>
+  | Omit<GitHubGistStorageConfig, 'personalAccessToken'>
+  | LocalDirectoryStorageConfig;
+
+export interface RemoteObjectStat {
+  path: string;
+  href?: string;
+  name: string;
+  isCollection: boolean;
+  etag?: string;
+  size: number;
+  lastModified?: number;
+  status?: number;
+  quotaUsedBytes?: number;
+  quotaAvailableBytes?: number;
+}
+
+export interface RemoteStorageAdapter {
+  readonly provider: StorageProviderType;
+  readonly displayEndpoint: string;
+  setStorageFormat?(format: 'binary_enc' | 'base64_txt'): void;
+  validateConfig(): void;
+  checkCapabilities(): Promise<CapabilityReport>;
+  ensureDir(subPath: string): Promise<void>;
+  list(subPath: string, depth?: 0 | 1): Promise<RemoteObjectStat[]>;
+  stat(subPath: string): Promise<RemoteObjectStat | null>;
+  getBytes(
+    subPath: string,
+    options?: { ifNoneMatch?: string },
+  ): Promise<{
+    notModified: boolean;
+    bytes: Uint8Array;
+    etag?: string;
+    status: number;
+  }>;
+  putBytes(
+    subPath: string,
+    bytes: Uint8Array,
+    options?: { ifMatch?: string; ifNoneMatchStar?: boolean; contentType?: string },
+  ): Promise<{ etag?: string; status: number }>;
+  delete(subPath: string, options?: { ifMatch?: string; isCollection?: boolean }): Promise<void>;
+}
+
+export type ToolbarBadgeDisplayMode = 'multi_or_tagged' | 'always' | 'status_only';
+
+export interface CookieExpiryWarningSettings {
+  enabled: boolean;
+  warningLeadHours: number;
+  criticalLeadHours: number;
+  includeInactiveTracks: boolean;
+}
+
 export interface SpaceSettings {
   autoSync: boolean;
   direction: SyncDirection;
   syncCookies: boolean;
   syncLocalStorage: boolean;
+  syncSessionStorage?: boolean;
   checkOnNavigate: boolean;
   backgroundCheck: boolean;
   pollingIntervalSec: number;
@@ -287,6 +443,8 @@ export interface SpaceSettings {
   authorityMode?: SpaceAuthorityMode;
   primaryDeviceId?: string;
   devicePolicies?: Record<string, PerDeviceSyncPolicy>;
+  badgeDisplayMode?: ToolbarBadgeDisplayMode;
+  expiryWarning?: CookieExpiryWarningSettings;
 }
 
 export const DEFAULT_SPACE_SETTINGS: SpaceSettings = {
@@ -294,6 +452,7 @@ export const DEFAULT_SPACE_SETTINGS: SpaceSettings = {
   direction: 'bidirectional',
   syncCookies: true,
   syncLocalStorage: true,
+  syncSessionStorage: false,
   checkOnNavigate: true,
   backgroundCheck: true,
   pollingIntervalSec: 60,
@@ -308,13 +467,20 @@ export const DEFAULT_SPACE_SETTINGS: SpaceSettings = {
   syncScopeMode: 'all_sites',
   authorityMode: 'ask',
   devicePolicies: {},
+  badgeDisplayMode: 'multi_or_tagged',
+  expiryWarning: {
+    enabled: true,
+    warningLeadHours: 24,
+    criticalLeadHours: 2,
+    includeInactiveTracks: true,
+  },
 };
 
 export interface SyncSpace {
   spaceId: string;
   opaqueId: string;
   name: string;
-  provider: 'webdav';
+  provider: StorageProviderType;
   rootPath: string;
   schemaVersion: number;
   encryptionVersion: number;
@@ -369,6 +535,8 @@ export interface SyncEvent {
   version: CausalVersion;
   cookieData?: Omit<CookieRecord, 'version' | 'syncStatus' | 'applyResult'>;
   localStorageData?: Omit<LocalStorageRecord, 'version' | 'syncStatus'>;
+  sessionStorageData?: Omit<SessionStorageRecord, 'version' | 'syncStatus'>;
+  indexedDbData?: Omit<IndexedDbRecord, 'version' | 'syncStatus'>;
   deleteReason?: string;
   payloadHash: string;
   createdAt: number;
@@ -414,12 +582,24 @@ export interface BlacklistEntry {
   createdAt: number;
 }
 
+export interface IndexedDbTargetRule {
+  dbName: string;
+  objectStores?: string[];
+  keyPrefixes?: string[];
+}
+
 export interface SiteRuleOverride {
   siteKey: string;
   pattern: string;
   direction: SyncDirection;
   syncCookies: boolean;
   syncLocalStorage: boolean;
+  syncSessionStorage?: boolean;
+  sessionStorageKeyAllowlist?: string[];
+  syncIndexedDb?: boolean;
+  indexedDbTargets?: IndexedDbTargetRule[];
+  indexedDbMaxTotalBytes?: number;
+  watchedCookieNames?: string[];
   autoRefresh: boolean;
   updatedAt: number;
 }
@@ -442,6 +622,7 @@ export interface EnvCookieSyncRule {
   targetUrl: string;
   syncCookies: boolean;
   syncLocalStorage: boolean;
+  syncSessionStorage?: boolean;
   adaptForHttp: boolean;
   cleanTargetBeforeSync: boolean;
   autoSync: boolean;
@@ -464,6 +645,7 @@ export interface ExecuteEnvSyncInput {
     targetUrl: string;
     syncCookies?: boolean;
     syncLocalStorage?: boolean;
+    syncSessionStorage?: boolean;
     adaptForHttp?: boolean;
     cleanTargetBeforeSync?: boolean;
     autoReloadTarget?: boolean;
@@ -481,6 +663,7 @@ export interface EnvCookieSyncResult {
   failedCookies: number;
   removedStaleCookies: number;
   appliedLocalStorage: number;
+  appliedSessionStorage?: number;
   skippedCookies: number;
   reloadedTabs: number;
   errors: string[];
@@ -502,6 +685,8 @@ export interface SnapshotPayload {
   coveredVectorClock: VectorClock;
   cookies: Record<string, CookieRecord>;
   localStorage: Record<string, LocalStorageRecord>;
+  sessionStorage?: Record<string, SessionStorageRecord>;
+  indexedDb?: Record<string, IndexedDbRecord>;
   tombstones: Record<string, Tombstone>;
   tracks: Record<string, SiteTrack>;
   rules: SpaceRuleSet;
@@ -514,10 +699,10 @@ export interface ConflictRecord {
   trackId: string;
   objectType: ObjectType;
   objectId: string;
-  localRecord: CookieRecord | LocalStorageRecord;
-  remoteRecord: CookieRecord | LocalStorageRecord;
+  localRecord: SyncRecord;
+  remoteRecord: SyncRecord;
   winningSide: 'local' | 'remote';
-  resolvedRecord: CookieRecord | LocalStorageRecord;
+  resolvedRecord: SyncRecord;
   detectedAt: number;
   resolved: boolean;
   resolvedBy?: 'auto' | 'user';
@@ -570,6 +755,8 @@ export interface SafetyUndoPoint {
   previousBinding?: DeviceSiteBinding;
   cookies: BrowserCookieInput[];
   localStorageByOrigin: Record<string, Record<string, string>>;
+  sessionStorageByOrigin?: Record<string, Record<string, string>>;
+  indexedDbRecords?: IndexedDbRecord[];
 }
 
 export interface SyncTask {
@@ -632,6 +819,7 @@ export interface CapabilityReport {
   quotaUsedBytes?: number;
   quotaAvailableBytes?: number;
   recommendedStorageFormat?: 'binary_enc' | 'base64_txt';
+  resolvedGistId?: string;
   summaryMessage: string;
 }
 
@@ -673,12 +861,195 @@ export interface IntegrityReport {
 }
 
 export interface PairingPayload {
-  version: 1;
-  webdav: WebDAVConfig;
+  version: 1 | 2;
+  webdav?: WebDAVConfig;
+  storage?: StorageProviderConfig;
   spaceId: string;
   spaceName: string;
   createdAt: number;
   fromDeviceName: string;
+}
+
+export type DebugExportFormat =
+  | 'curl'
+  | 'fetch'
+  | 'cookie_header'
+  | 'headers_json'
+  | 'playwright_storage_state'
+  | 'postman_apifox'
+  | 'netscape_cookies_txt';
+
+export interface DebugExportRequest {
+  siteKey?: string;
+  trackId?: string;
+  targetUrl?: string;
+  format: DebugExportFormat;
+  filterNoise?: boolean;
+  includeLocalStorage?: boolean;
+  includeSessionStorage?: boolean;
+}
+
+export interface DebugExportResult {
+  format: DebugExportFormat;
+  siteKey: string;
+  trackId?: string;
+  trackLabel?: string;
+  targetUrl: string;
+  content: string;
+  suggestedFilename: string;
+  cookieCount: number;
+  originCount: number;
+  liveFallback?: boolean;
+}
+
+export interface InspectedIndexedDbStore {
+  name: string;
+  keyPath?: string | string[] | null;
+  autoIncrement?: boolean;
+  recordCount: number;
+  estimatedBytes: number;
+}
+
+export interface InspectedIndexedDbDatabase {
+  dbName: string;
+  version: number;
+  stores: InspectedIndexedDbStore[];
+  totalEstimatedBytes: number;
+}
+
+export interface IndexedDbMutation {
+  dbName: string;
+  dbVersion?: number;
+  storeName: string;
+  keyPath?: string | string[] | null;
+  autoIncrement?: boolean;
+  encodedKey: string;
+  encodedValue?: string;
+  deleted?: boolean;
+}
+
+export interface SessionSharePayload {
+  version: 1;
+  shareId: string;
+  siteKey: string;
+  accountLabel?: string;
+  note?: string;
+  sharedBy?: string;
+  createdAt: number;
+  expiresAt: number;
+  clampCookieExpiry: boolean;
+  cookies: BrowserCookieInput[];
+  localStorageByOrigin?: Record<string, Record<string, string>>;
+  sessionStorageByOrigin?: Record<string, Record<string, string>>;
+}
+
+export interface CreateSessionShareRequest {
+  siteKey: string;
+  trackId?: string;
+  passphrase: string;
+  ttlMs: number;
+  accountLabel?: string;
+  note?: string;
+  sharedBy?: string;
+  filterNoise?: boolean;
+  excludeHttpOnly?: boolean;
+  includeCookieNames?: string[];
+  excludeCookieNames?: string[];
+  includeLocalStorage?: boolean;
+  includeSessionStorage?: boolean;
+  clampCookieExpiry?: boolean;
+}
+
+export interface CreateSessionShareResult {
+  code: string;
+  shareId: string;
+  siteKey: string;
+  accountLabel: string;
+  expiresAt: number;
+  cookieCount: number;
+  localStorageCount: number;
+  sessionStorageCount: number;
+}
+
+export interface SessionSharePreview {
+  shareId: string;
+  siteKey: string;
+  accountLabel?: string;
+  note?: string;
+  sharedBy?: string;
+  createdAt: number;
+  expiresAt: number;
+  remainingMs: number;
+  clampCookieExpiry: boolean;
+  cookieCount: number;
+  cookieNames: string[];
+  localStorageCount: number;
+  sessionStorageCount: number;
+}
+
+export type SessionShareImportMode = 'ephemeral_track' | 'env_target' | 'override_active';
+
+export interface ImportSessionShareRequest {
+  code: string;
+  passphrase: string;
+  mode: SessionShareImportMode;
+  customLabel?: string;
+  targetUrl?: string;
+  adaptForHttp?: boolean;
+}
+
+export interface ImportSessionShareResult {
+  mode: SessionShareImportMode;
+  siteKey: string;
+  track?: SiteTrack;
+  targetUrl?: string;
+  appliedCookies: number;
+  appliedLocalStorage: number;
+  appliedSessionStorage: number;
+}
+
+export type ExpiryHealthStatus = 'healthy' | 'expiring_soon' | 'critical' | 'expired';
+
+export interface ExpiringCookieSummary {
+  logicalId: string;
+  name: string;
+  domain: string;
+  trackId: string;
+  trackLabel?: string;
+  expirationDate: number;
+  remainingMs: number;
+  status: Exclude<ExpiryHealthStatus, 'healthy'>;
+  watched: boolean;
+  httpOnly: boolean;
+}
+
+export interface SiteExpiryHealth {
+  siteKey: string;
+  status: ExpiryHealthStatus;
+  earliestExpiryAt?: number;
+  remainingMs?: number;
+  expiringCookies: ExpiringCookieSummary[];
+  sessionOnlyAuthCount: number;
+}
+
+export interface ArchiveBackupPayload {
+  format: 'sessionmesh_archive';
+  version: 1;
+  exportedAt: number;
+  spaceName: string;
+  snapshot: SnapshotPayload;
+}
+
+export type ImportArchiveBackupMode = 'merge' | 'replace';
+
+export interface ImportArchiveBackupResult {
+  mode: ImportArchiveBackupMode;
+  spaceName: string;
+  importedCookies: number;
+  importedLocalStorage: number;
+  importedSessionStorage: number;
+  importedIndexedDb: number;
+  importedTracks: number;
 }
 
 export interface SpaceDescriptorPayload {
@@ -716,11 +1087,14 @@ export interface SiteSummaryView {
   allTracks: SiteTrack[];
   cookieCount: number;
   localStorageCount: number;
+  sessionStorageCount?: number;
+  indexedDbCount?: number;
   latestVersionId?: string;
   sourceDeviceName?: string;
   updatedAt?: number;
   syncStatus: CookieSyncStatus;
   rollingTokenDamped?: boolean;
+  expiryHealth?: SiteExpiryHealth;
 }
 
 export type AttentionItemKind =
@@ -735,13 +1109,19 @@ export type AttentionItemKind =
   | 'offline_pending'
   | 'pending_upload'
   | 'retry_task'
-  | 'deferred_reload';
+  | 'deferred_reload'
+  | 'cookie_expiring'
+  | 'indexeddb_quota_exceeded'
+  | 'local_dir_permission_needed'
+  | 'ephemeral_track_expired';
 
 export interface AttentionItem {
   id: string;
   kind: AttentionItemKind;
   severity: 'error' | 'warning' | 'info';
   siteKey?: string;
+  trackId?: string;
+  handleKey?: string;
   tabId?: number;
   conflictId?: string;
   logicalIds?: string[];
@@ -758,9 +1138,11 @@ export interface SyncStatusSummary {
   locked: boolean;
   activeSpaceId?: string;
   activeSpaceName?: string;
-  spaces: Array<{ spaceId: string; name: string; status: DeviceStatus }>;
+  spaces: Array<{ spaceId: string; name: string; status: DeviceStatus; provider?: StorageProviderType }>;
   device?: Device;
   status: DeviceStatus;
+  storageProvider?: StorageProviderType;
+  storageEndpoint?: string;
   webdavConnected: boolean;
   webdavUrl?: string;
   consistencyLevel?: ConsistencyLevel;
@@ -771,6 +1153,7 @@ export interface SyncStatusSummary {
   pendingDecisionsCount: number;
   unresolvedConflictsCount: number;
   undoPointsCount: number;
+  expiringSitesCount?: number;
   latestError?: StructuredError | null;
   attentionItems: AttentionItem[];
 }
@@ -816,6 +1199,45 @@ export interface BrowserApiAdapter {
   applyLocalStorage(
     origin: string,
     mutations: Array<{ key: string; value?: string; deleted?: boolean }>,
+  ): Promise<{ applied: boolean; reason?: string }>;
+
+  getSessionStorage?(origin: string): Promise<{ available: boolean; items: Record<string, string> }>;
+  applySessionStorage?(
+    origin: string,
+    mutations: Array<{ key: string; value?: string; deleted?: boolean }>,
+  ): Promise<{ applied: boolean; reason?: string }>;
+
+  inspectIndexedDb?(
+    origin: string,
+  ): Promise<{ available: boolean; databases: InspectedIndexedDbDatabase[]; reason?: string }>;
+  getIndexedDbRecords?(
+    origin: string,
+    targets: IndexedDbTargetRule[],
+    maxTotalBytes?: number,
+  ): Promise<{
+    available: boolean;
+    quotaExceeded?: boolean;
+    totalBytes: number;
+    records: Array<
+      Omit<
+        IndexedDbRecord,
+        | 'logicalId'
+        | 'siteKey'
+        | 'trackId'
+        | 'version'
+        | 'sourceDevice'
+        | 'sourceDeviceName'
+        | 'deleted'
+        | 'updatedAt'
+        | 'syncStatus'
+      >
+    >;
+    reason?: string;
+  }>;
+  applyIndexedDbMutations?(
+    origin: string,
+    mutations: IndexedDbMutation[],
+    clearStores?: Array<{ dbName: string; storeName: string }>,
   ): Promise<{ applied: boolean; reason?: string }>;
 
   getDevicePlatformInfo(): Promise<{

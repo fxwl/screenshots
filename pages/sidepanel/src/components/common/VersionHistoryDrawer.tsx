@@ -1,5 +1,11 @@
 import { extractErrorMessage, sidePanelApi } from '@console/lib/api';
-import { formatDateTime, formatRelativeTime, getOperationMeta, shortId } from '@console/lib/format';
+import {
+  decodeTypedClonePreview,
+  formatDateTime,
+  formatRelativeTime,
+  getOperationMeta,
+  shortId,
+} from '@console/lib/format';
 import type { SyncEvent } from '@sessionmesh/shared';
 import { Button } from '@sessionmesh/ui';
 import { History, Loader2, RefreshCw, RotateCcw } from 'lucide-react';
@@ -122,7 +128,11 @@ export const VersionHistoryDrawer: React.FC<VersionHistoryDrawerProps> = ({
                   ? ev.cookieData?.value
                   : ev.objectType === 'localStorage'
                     ? ev.localStorageData?.value
-                    : undefined;
+                    : ev.objectType === 'sessionStorage'
+                      ? ev.sessionStorageData?.value
+                      : ev.objectType === 'indexedDb' && ev.indexedDbData?.encodedValue !== undefined
+                        ? decodeTypedClonePreview(ev.indexedDbData.encodedValue)
+                        : undefined;
               const canRestore = ev.operation !== 'CHECKPOINT' && ev.operation !== 'SNAPSHOT';
               return (
                 <div key={ev.eventId} className="rounded-lg border border-border bg-card p-3 text-xs space-y-2">

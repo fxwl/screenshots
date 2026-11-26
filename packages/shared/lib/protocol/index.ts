@@ -4,6 +4,7 @@
 import type {
   AccountCreateMode,
   AccountRotationResult,
+  AccountSwitchToastPayload,
   AttentionItem,
   AttentionItemKind,
   BlacklistEntry,
@@ -11,32 +12,64 @@ import type {
   BrowserCookieInput,
   CapabilityReport,
   ConflictRecord,
+  ContentPageMountConfig,
+  CookieExpiryWarningSettings,
   CookieRecord,
+  CreateSessionShareRequest,
+  CreateSessionShareResult,
   CreateSiteAccountOptions,
+  DebugExportFormat,
+  DebugExportRequest,
+  DebugExportResult,
   DeleteScope,
   Device,
   EnvCookieSyncResult,
   EnvCookieSyncRule,
   ExecuteEnvSyncInput,
+  ExpiryHealthStatus,
+  GitHubGistStorageConfig,
+  ImportArchiveBackupMode,
+  ImportArchiveBackupResult,
+  ImportSessionShareRequest,
+  ImportSessionShareResult,
+  IndexedDbMutation,
+  IndexedDbRecord,
+  IndexedDbTargetRule,
   InitialJoinReport,
+  InspectedIndexedDbDatabase,
+  InspectedIndexedDbStore,
   IntegrityReport,
+  LocalDirectoryStorageConfig,
   LocalStorageRecord,
   LogEntry,
   PageReloadSafetyStatus,
   PendingSiteDecision,
   PerDeviceSyncPolicy,
+  RemoteObjectStat,
   RemoteSpacePasswordVerifyResult,
   RemoteSpaceProbeItem,
+  S3StorageConfig,
+  S3VendorPreset,
   SafetyUndoPoint,
+  SanitizedStorageProviderConfig,
+  SessionShareImportMode,
+  SessionSharePayload,
+  SessionSharePreview,
+  SessionStorageRecord,
   SiteDecisionAction,
+  SiteExpiryHealth,
   SiteRuleOverride,
   SiteSummaryView,
   SpaceAuthorityMode,
   SpaceSettings,
   SsoDomainGroup,
+  StorageProviderConfig,
+  StorageProviderType,
   SyncEvent,
+  SyncRecord,
   SyncRuleUpdatePayload,
   SyncStatusSummary,
+  ToolbarBadgeDisplayMode,
   UpdateSiteTrackPatch,
   WebDAVConfig,
   WebDAVResourceStat,
@@ -47,7 +80,9 @@ export * from './extra';
 export type SessionMeshCommand =
   | { type: 'GET_STATUS_SUMMARY'; activeUrl?: string }
   | { type: 'TEST_WEBDAV_CONNECTION'; config: WebDAVConfig }
+  | { type: 'TEST_STORAGE_CONNECTION'; storage: StorageProviderConfig }
   | { type: 'PROBE_REMOTE_SPACES'; config: WebDAVConfig }
+  | { type: 'PROBE_STORAGE_SPACES'; storage: StorageProviderConfig }
   | {
       type: 'VERIFY_SPACE_PASSWORD';
       webdav: WebDAVConfig;
@@ -55,8 +90,15 @@ export type SessionMeshCommand =
       encryptionPassword: string;
     }
   | {
+      type: 'VERIFY_STORAGE_SPACE_PASSWORD';
+      storage: StorageProviderConfig;
+      spaceId: string;
+      encryptionPassword: string;
+    }
+  | {
       type: 'SAVE_AND_JOIN_SPACE';
-      webdav: WebDAVConfig;
+      webdav?: WebDAVConfig;
+      storage?: StorageProviderConfig;
       spaceId: string;
       spaceName: string;
       encryptionPassword: string;
@@ -65,6 +107,8 @@ export type SessionMeshCommand =
       settingsPatch?: Partial<SpaceSettings>;
       initialManagedSiteKeys?: string[];
     }
+  | { type: 'UPDATE_SPACE_STORAGE_CONFIG'; storage: StorageProviderConfig }
+  | { type: 'NOTIFY_LOCAL_DIR_PERMISSION_GRANTED'; handleKey?: string }
   | { type: 'UNLOCK_SESSION'; encryptionPassword: string; spaceId?: string }
   | { type: 'LOCK_SESSION' }
   | { type: 'GENERATE_PAIRING_CODE'; passphrase?: string }
@@ -105,10 +149,24 @@ export type SessionMeshCommand =
   | { type: 'DELETE_COOKIES'; logicalIds: string[]; siteKey?: string; scope: DeleteScope }
   | { type: 'IMPORT_COOKIES_JSON'; siteKey?: string; trackId?: string; cookies: BrowserCookieInput[] }
   | { type: 'EXPORT_COOKIES_JSON'; siteKey?: string; trackId?: string }
+  | { type: 'EXPORT_DEBUG_STATE'; request: DebugExportRequest }
+  | { type: 'TOGGLE_WATCHED_COOKIE'; siteKey: string; cookieName: string; watched: boolean }
+  | { type: 'CREATE_SESSION_SHARE'; request: CreateSessionShareRequest }
+  | { type: 'PREVIEW_SESSION_SHARE'; code: string; passphrase: string }
+  | { type: 'IMPORT_SESSION_SHARE'; request: ImportSessionShareRequest }
   | { type: 'GET_LOCAL_STORAGE_RECORDS'; siteKey?: string; origin?: string; trackId?: string }
   | { type: 'UPSERT_LOCAL_STORAGE_ITEM'; origin: string; key: string; value: string; trackId?: string }
   | { type: 'APPLY_LOCAL_STORAGE_ITEM'; logicalId: string }
   | { type: 'DELETE_LOCAL_STORAGE_ITEMS'; logicalIds: string[]; scope: DeleteScope }
+  | { type: 'GET_SESSION_STORAGE_RECORDS'; siteKey?: string; origin?: string; trackId?: string }
+  | { type: 'UPSERT_SESSION_STORAGE_ITEM'; origin: string; key: string; value: string; trackId?: string }
+  | { type: 'APPLY_SESSION_STORAGE_ITEM'; logicalId: string }
+  | { type: 'DELETE_SESSION_STORAGE_ITEMS'; logicalIds: string[]; scope: DeleteScope }
+  | { type: 'INSPECT_PAGE_INDEXED_DB'; origin: string }
+  | { type: 'GET_INDEXED_DB_RECORDS'; siteKey?: string; origin?: string; trackId?: string; dbName?: string }
+  | { type: 'APPLY_INDEXED_DB_RECORD'; logicalId: string }
+  | { type: 'DELETE_INDEXED_DB_RECORDS'; logicalIds: string[]; scope: DeleteScope }
+  | { type: 'CAPTURE_PAGE_EXTENDED_STORAGE_NOW'; origin: string }
   | { type: 'GET_RULES_AND_BLACKLIST' }
   | { type: 'ADD_BLACKLIST_ENTRY'; entry: Omit<BlacklistEntry, 'id' | 'createdAt'> }
   | { type: 'REMOVE_BLACKLIST_ENTRY'; id: string; scope: 'space' | 'device' }
@@ -144,16 +202,38 @@ export type SessionMeshCommand =
   | { type: 'WEBDAV_CREATE_BACKUP' }
   | { type: 'WEBDAV_LIST_BACKUPS' }
   | { type: 'WEBDAV_RESTORE_BACKUP'; backupId: string }
+  | { type: 'EXPORT_ARCHIVE_BACKUP'; passphrase?: string }
+  | {
+      type: 'IMPORT_ARCHIVE_BACKUP';
+      base64: string;
+      passphrase?: string;
+      mode: ImportArchiveBackupMode;
+    }
   | {
       type: 'CONTENT_LOCAL_STORAGE_CHANGED';
       origin: string;
       changes: Array<{ key: string; value?: string; deleted?: boolean }>;
     }
-  | { type: 'CONTENT_PAGE_MOUNTED'; origin: string; items: Record<string, string> }
+  | {
+      type: 'CONTENT_SESSION_STORAGE_CHANGED';
+      origin: string;
+      changes: Array<{ key: string; value?: string; deleted?: boolean }>;
+    }
+  | {
+      type: 'CONTENT_INDEXED_DB_CHANGED';
+      origin: string;
+    }
+  | {
+      type: 'CONTENT_PAGE_MOUNTED';
+      origin: string;
+      items: Record<string, string>;
+      sessionItems?: Record<string, string>;
+    }
   | {
       type: 'CONTENT_PAGE_LEAVING';
       origin: string;
       changes: Array<{ key: string; value?: string; deleted?: boolean }>;
+      sessionChanges?: Array<{ key: string; value?: string; deleted?: boolean }>;
     };
 
 export type ContentScriptCommand =
@@ -163,6 +243,36 @@ export type ContentScriptCommand =
       origin: string;
       mutations: Array<{ key: string; value?: string; deleted?: boolean }>;
     }
+  | { type: 'CS_GET_SESSION_STORAGE'; origin: string }
+  | {
+      type: 'CS_APPLY_SESSION_STORAGE';
+      origin: string;
+      mutations: Array<{ key: string; value?: string; deleted?: boolean }>;
+    }
+  | { type: 'CS_INSPECT_INDEXED_DB'; origin: string }
+  | {
+      type: 'CS_GET_INDEXED_DB_RECORDS';
+      origin: string;
+      targets: IndexedDbTargetRule[];
+      maxTotalBytes?: number;
+    }
+  | {
+      type: 'CS_APPLY_INDEXED_DB_MUTATIONS';
+      origin: string;
+      mutations: IndexedDbMutation[];
+      clearStores?: Array<{ dbName: string; storeName: string }>;
+    }
+  | {
+      type: 'CS_CONFIGURE_EXTENDED_MONITORS';
+      origin: string;
+      syncSessionStorage: boolean;
+      sessionStorageKeyAllowlist?: string[];
+      syncIndexedDb: boolean;
+      indexedDbTargets?: IndexedDbTargetRule[];
+      indexedDbMaxTotalBytes?: number;
+    }
+  | { type: 'CS_SHOW_ACCOUNT_TOAST'; payload: AccountSwitchToastPayload }
+  | { type: 'CS_COPY_TEXT_TO_CLIPBOARD'; text: string; toastMessage?: string }
   | { type: 'CS_CHECK_PAGE_SAFE_TO_RELOAD' };
 
 export interface SessionMeshResponse<T = unknown> {
@@ -179,6 +289,7 @@ export interface SessionMeshResponse<T = unknown> {
 export type {
   AccountCreateMode,
   AccountRotationResult,
+  AccountSwitchToastPayload,
   AttentionItem,
   AttentionItemKind,
   BlacklistEntry,
@@ -186,31 +297,63 @@ export type {
   BrowserCookieInput,
   CapabilityReport,
   ConflictRecord,
+  ContentPageMountConfig,
+  CookieExpiryWarningSettings,
   CookieRecord,
+  CreateSessionShareRequest,
+  CreateSessionShareResult,
   CreateSiteAccountOptions,
+  DebugExportFormat,
+  DebugExportRequest,
+  DebugExportResult,
   DeleteScope,
   Device,
   EnvCookieSyncResult,
   EnvCookieSyncRule,
   ExecuteEnvSyncInput,
+  ExpiryHealthStatus,
+  GitHubGistStorageConfig,
+  ImportArchiveBackupMode,
+  ImportArchiveBackupResult,
+  ImportSessionShareRequest,
+  ImportSessionShareResult,
+  IndexedDbMutation,
+  IndexedDbRecord,
+  IndexedDbTargetRule,
   InitialJoinReport,
+  InspectedIndexedDbDatabase,
+  InspectedIndexedDbStore,
   IntegrityReport,
+  LocalDirectoryStorageConfig,
   LocalStorageRecord,
   LogEntry,
   PageReloadSafetyStatus,
   PendingSiteDecision,
   PerDeviceSyncPolicy,
+  RemoteObjectStat,
   RemoteSpacePasswordVerifyResult,
   RemoteSpaceProbeItem,
+  S3StorageConfig,
+  S3VendorPreset,
   SafetyUndoPoint,
+  SanitizedStorageProviderConfig,
+  SessionShareImportMode,
+  SessionSharePayload,
+  SessionSharePreview,
+  SessionStorageRecord,
   SiteDecisionAction,
+  SiteExpiryHealth,
   SiteRuleOverride,
   SiteSummaryView,
   SpaceAuthorityMode,
   SpaceSettings,
   SsoDomainGroup,
+  StorageProviderConfig,
+  StorageProviderType,
   SyncEvent,
+  SyncRecord,
   SyncStatusSummary,
+  ToolbarBadgeDisplayMode,
   UpdateSiteTrackPatch,
   WebDAVConfig,
   WebDAVResourceStat,

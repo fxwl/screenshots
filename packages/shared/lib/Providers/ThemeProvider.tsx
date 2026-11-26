@@ -1,6 +1,7 @@
 import { themeStorage, type Theme } from '@sessionmesh/storage';
 import { createContext, useEffect, useMemo } from 'react';
 import { useStorage } from '../hooks/useStorage';
+import { LocaleProvider } from '../i18n/LocaleProvider';
 
 type ThemeProviderProps = {
   children: React.ReactNode;
@@ -64,7 +65,7 @@ export function ThemeProvider({ children, ...props }: ThemeProviderProps) {
 
   return (
     <ThemeProviderContext.Provider {...props} value={value}>
-      {children}
+      <LocaleProvider>{children}</LocaleProvider>
     </ThemeProviderContext.Provider>
   );
 }

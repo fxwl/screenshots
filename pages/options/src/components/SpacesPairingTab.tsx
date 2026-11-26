@@ -1,4 +1,4 @@
-import type { InitialJoinReport, SyncStatusSummary } from '@sessionmesh/core';
+import type { InitialJoinReport, SanitizedStorageProviderConfig, SyncStatusSummary } from '@sessionmesh/core';
 import { unwrapCommand } from '@sessionmesh/shared';
 import {
   Alert,
@@ -24,8 +24,10 @@ import {
 import {
   CheckCircle2,
   Copy,
+  Dices,
   Edit3,
   FolderPlus,
+  Info,
   KeyRound,
   Laptop,
   Layers,
@@ -42,9 +44,12 @@ import { toast } from 'sonner';
 import {
   copyToClipboard,
   extractErrorMessage,
+  generateShortPairingPin,
   getDeviceStatusMeta,
+  getStorageProviderMeta,
   loadUiNonSensitiveMeta,
   useUiBannerPrefs,
+  useUxOnboardingPrefs,
 } from '../utils/helpers';
 
 interface SpacesPairingTabProps {
@@ -54,6 +59,7 @@ interface SpacesPairingTabProps {
 
 export function SpacesPairingTab({ status, onRefreshStatus }: SpacesPairingTabProps) {
   const { isBannerVisible, dismissBanner } = useUiBannerPrefs();
+  const { markGuideTaskDone } = useUxOnboardingPrefs();
   const [rootPathHint, setRootPathHint] = useState('/SessionMesh');
 
   // Switch space modal (optional password)
@@ -89,16 +95,29 @@ export function SpacesPairingTab({ status, onRefreshStatus }: SpacesPairingTabPr
 
   // Pairing code generator
   const [pairingPassphrase, setPairingPassphrase] = useState('');
+  const [generatedPin, setGeneratedPin] = useState('');
   const [generatedCode, setGeneratedCode] = useState('');
   const [generatingCode, setGeneratingCode] = useState(false);
 
   useEffect(() => {
     void loadUiNonSensitiveMeta().then(meta => {
-      if (meta.rootPath) setRootPathHint(meta.rootPath);
+      const hint = meta.rootPath || meta.s3RootPrefix || meta.gistRootPrefix || meta.localDirRootPrefix;
+      if (hint) setRootPathHint(hint);
     });
-    void unwrapCommand<{ webdav?: { rootPath?: string } | null }>({ type: 'GET_STATUS_SUMMARY' })
+    void unwrapCommand<{
+      storage?: SanitizedStorageProviderConfig | null;
+      webdav?: { rootPath?: string } | null;
+    }>({ type: 'GET_STATUS_SUMMARY' })
       .then(res => {
-        if (res?.webdav?.rootPath) setRootPathHint(res.webdav.rootPath);
+        if (res?.storage) {
+          if (res.storage.provider === 'webdav' && res.storage.rootPath) {
+            setRootPathHint(res.storage.rootPath);
+          } else if (res.storage.provider !== 'webdav' && res.storage.rootPrefix) {
+            setRootPathHint(res.storage.rootPrefix);
+          }
+        } else if (res?.webdav?.rootPath) {
+          setRootPathHint(res.webdav.rootPath);
+        }
       })
       .catch(() => undefined);
   }, []);
@@ -222,23 +241,26 @@ export function SpacesPairingTab({ status, onRefreshStatus }: SpacesPairingTabPr
     }
   };
 
-  const handleGeneratePairingCode = async () => {
-    if (!pairingPassphrase.trim()) {
-      toast.warning('请设置或输入用于保护此配对码的口令（设备 B/C 粘贴时需输入相同口令）');
-      return;
+  const handleGeneratePairingCode = async (forceRandomPin = false) => {
+    const effectivePin =
+      forceRandomPin || !pairingPassphrase.trim() ? generateShortPairingPin(6) : pairingPassphrase.trim();
+    if (forceRandomPin || !pairingPassphrase.trim()) {
+      setPairingPassphrase(effectivePin);
     }
     setGeneratingCode(true);
     try {
       const res = await unwrapCommand<string | { code: string }>({
         type: 'GENERATE_PAIRING_CODE',
-        passphrase: pairingPassphrase.trim(),
+        passphrase: effectivePin,
       });
       const codeStr = typeof res === 'string' ? res : res?.code || '';
       if (!codeStr) {
         throw new Error('后端未返回有效配对码');
       }
+      setGeneratedPin(effectivePin);
       setGeneratedCode(codeStr);
-      toast.success('已生成 AES-256-GCM 加密配对码');
+      void markGuideTaskDone('second_device');
+      toast.success('已生成加密配对码，复制发给第 2 台电脑粘贴即可！');
     } catch (err) {
       toast.error(`生成配对码失败：${extractErrorMessage(err)}`);
     } finally {
@@ -246,13 +268,15 @@ export function SpacesPairingTab({ status, onRefreshStatus }: SpacesPairingTabPr
     }
   };
 
+  const activeProviderMeta = getStorageProviderMeta(status.storageProvider);
   const nonSensitiveSummary = [
-    '=== SessionMesh 非敏感连接摘要（不含任何密码）===',
-    `WebDAV 地址: ${status.webdavUrl || '(请填写您的 WebDAV URL)'}`,
-    `远端根目录: ${rootPathHint}`,
+    '=== SessionMesh 非敏感连接摘要（不含任何密码或密钥）===',
+    `存储后端类型: ${activeProviderMeta.label}`,
+    `端点 / 地址: ${status.storageEndpoint || status.webdavUrl || '(请填写您的存储后端地址)'}`,
+    `前缀 / 根目录: ${rootPathHint}`,
     `同步空间 ID: ${status.activeSpaceId || 'default'}`,
     `同步空间名称: ${status.activeSpaceName || '默认同步空间'}`,
-    'WebDAV 密码: ********（请手动输入）',
+    '存储访问密钥 / Token: ********（请手动输入）',
     '端到端加密主密码: ********（请手动输入）',
   ].join('\n');
 
@@ -263,11 +287,11 @@ export function SpacesPairingTab({ status, onRefreshStatus }: SpacesPairingTabPr
         <CardHeader className="pb-3">
           <CardTitle className="flex items-center gap-2 text-base">
             <Laptop className="h-5 w-5 text-primary" />
-            添加其他设备（设备 B / C）— 10 秒快速配对
+            跨设备加密配对码 (v2) — 10 秒快速接入设备 B / C
           </CardTitle>
           <CardDescription>
-            生成加密配对码 <code>smesh://pair/...</code> 发送到你的另一台电脑，在首次向导 Step 1
-            粘贴即可自动填入所有连接与空间参数。
+            使用 SMES v2 加密将当前空间的存储后端配置（WebDAV / S3 / R2 / 阿里云 OSS / GitHub Private
+            Gist）与空间参数打包为 <code>smesh://pair/...</code> 配对码，在另一台设备向导 Step 1 粘贴即可一键填入。
           </CardDescription>
         </CardHeader>
         <CardContent className="space-y-4">
@@ -277,9 +301,8 @@ export function SpacesPairingTab({ status, onRefreshStatus }: SpacesPairingTabPr
               <ShieldAlert className="h-4 w-4 text-amber-600 dark:text-amber-400" />
               <AlertTitle className="text-sm font-semibold">跨设备配对与凭据安全提示</AlertTitle>
               <AlertDescription className="text-xs leading-relaxed">
-                加密配对码包含 WebDAV
-                连接信息，请仅在自己的受信任设备间私密传输，完成后及时删除聊天记录。若某设备不再信任，请同时轮换空间主密码与
-                WebDAV 应用密码。
+                跨设备加密配对码 (v2) 包含当前空间的存储后端连接信息与访问凭据（WebDAV / S3 / R2 / OSS / GitHub
+                Gist），请仅在自己的受信任设备间私密传输，完成后及时删除聊天记录。若某设备不再信任，请同时轮换空间主密码与存储后端凭据。
               </AlertDescription>
               <div className="absolute right-3 top-3 flex items-center gap-1">
                 <button
@@ -299,53 +322,102 @@ export function SpacesPairingTab({ status, onRefreshStatus }: SpacesPairingTabPr
             </Alert>
           ) : null}
 
+          {status.storageProvider === 'local_directory' ? (
+            <Alert className="border-sky-500/35 bg-sky-500/[0.06]">
+              <Info className="h-4 w-4 text-sky-600 dark:text-sky-400" />
+              <AlertTitle className="text-xs font-semibold">本地同步目录配对提示</AlertTitle>
+              <AlertDescription className="text-xs">
+                当前空间使用「本地同步文件夹」。配对码 (v2) 会自动填充空间
+                ID、名称与子目录前缀，新设备解码后只需在本地重新点击选择对应的 OneDrive / iCloud / Dropbox
+                同步文件夹即可。
+              </AlertDescription>
+            </Alert>
+          ) : null}
+
           <div className="rounded-xl border border-border bg-background p-4 space-y-3">
-            <div className="flex items-center gap-2 text-sm font-semibold">
-              <QrCode className="h-4 w-4 text-primary" />
-              方式一：生成 <code>smesh://pair/...</code> 加密配对码（推荐）
+            <div className="flex flex-wrap items-center justify-between gap-2">
+              <div className="flex items-center gap-2 text-sm font-semibold">
+                <QrCode className="h-4 w-4 text-primary" />
+                方式一：一键生成 <code>smesh://pair/...</code> 跨设备加密配对码（推荐）
+              </div>
+              <Button
+                type="button"
+                size="sm"
+                disabled={generatingCode || status.locked}
+                onClick={() => void handleGeneratePairingCode(true)}>
+                {generatingCode ? (
+                  <Loader2 className="mr-1.5 h-3.5 w-3.5 animate-spin" />
+                ) : (
+                  <Dices className="mr-1.5 h-3.5 w-3.5" />
+                )}
+                随机口令一键生成
+              </Button>
             </div>
             <p className="text-xs text-muted-foreground">
-              配对码使用你下方输入的口令进行 AES-256-GCM
-              加密。新设备粘贴后需输入相同口令解密，并仍需验证空间端到端主密码。
+              无需在另一台电脑重填网盘或密钥！点击右上角「随机口令一键生成」（或在下方自定义口令），把生成的配对包发给第
+              2 台电脑整段粘贴，再验证空间加密主密码即可完成接入。
             </p>
             <div className="flex flex-col gap-2 sm:flex-row">
               <Input
-                type="password"
+                type="text"
                 value={pairingPassphrase}
                 onChange={e => setPairingPassphrase(e.target.value)}
-                placeholder="输入配对码加密口令（可设为一次性口令或空间主密码）"
-                className="flex-1"
+                placeholder="可选：自定义配对口令（留空点击生成将自动分配 6 位随机口令）"
+                className="flex-1 font-mono text-xs"
               />
               <Button
                 type="button"
+                variant="outline"
                 disabled={generatingCode || status.locked}
-                onClick={handleGeneratePairingCode}
-                className="sm:w-44">
+                onClick={() => void handleGeneratePairingCode(false)}
+                className="sm:w-40">
                 {generatingCode ? (
                   <Loader2 className="mr-2 h-4 w-4 animate-spin" />
                 ) : (
                   <ShieldCheck className="mr-2 h-4 w-4" />
                 )}
-                生成加密配对码
+                按此口令生成
               </Button>
             </div>
 
             {generatedCode ? (
-              <div className="space-y-2 pt-1">
-                <Textarea value={generatedCode} readOnly rows={3} className="font-mono text-xs bg-muted/40" />
-                <div className="flex flex-wrap items-center justify-between gap-2">
-                  <span className="text-[11px] text-muted-foreground">
-                    提示：请勿公开分享配对码，建议传输完成后删除聊天记录。
+              <div className="space-y-2.5 rounded-xl border border-primary/30 bg-primary/[0.03] p-3 pt-2.5">
+                <div className="flex flex-wrap items-center justify-between gap-2 text-xs">
+                  <span>
+                    本次配对口令：
+                    <code className="ml-1 rounded bg-muted px-2 py-0.5 font-mono font-bold text-foreground">
+                      {generatedPin}
+                    </code>
                   </span>
-                  <Button
-                    type="button"
-                    size="sm"
-                    variant="secondary"
-                    onClick={() => copyToClipboard(generatedCode, '已复制 smesh://pair 配对码')}>
-                    <Copy className="mr-1.5 h-3.5 w-3.5" />
-                    复制配对码
-                  </Button>
+                  <div className="flex flex-wrap items-center gap-1.5">
+                    <Button
+                      type="button"
+                      size="sm"
+                      variant="outline"
+                      className="h-7 text-xs"
+                      onClick={() => void copyToClipboard(generatedCode, '已仅复制 smesh://pair 配对码')}>
+                      <Copy className="mr-1.5 h-3 w-3" />
+                      仅复制配对码
+                    </Button>
+                    <Button
+                      type="button"
+                      size="sm"
+                      className="h-7 text-xs"
+                      onClick={() =>
+                        void copyToClipboard(
+                          `SessionMesh 跨设备配对码：\n${generatedCode}\n口令：${generatedPin}\n（在另一台电脑打开向导选择「我有配对码」，整段粘贴即可自动识别口令）`,
+                          '已复制完整配对包，发到另一台电脑整段粘贴即可！',
+                        )
+                      }>
+                      <Copy className="mr-1.5 h-3 w-3" />
+                      复制完整配对包（含口令）
+                    </Button>
+                  </div>
                 </div>
+                <Textarea value={generatedCode} readOnly rows={3} className="font-mono text-xs bg-background" />
+                <p className="text-[11px] text-muted-foreground">
+                  提示：另一台电脑向导支持整段粘贴自动提取配对码与口令；接入完成后请及时删除聊天工具中的配对消息。
+                </p>
               </div>
             ) : null}
           </div>
@@ -424,6 +496,11 @@ export function SpacesPairingTab({ status, onRefreshStatus }: SpacesPairingTabPr
                           </Badge>
                         ) : null}
                         <Badge variant={st.variant}>{st.label}</Badge>
+                        {sp.provider ? (
+                          <Badge variant="outline" className="text-[10px]">
+                            {getStorageProviderMeta(sp.provider).shortLabel}
+                          </Badge>
+                        ) : null}
                       </div>
                       <div className="font-mono text-xs text-muted-foreground">Space ID: {sp.spaceId}</div>
                     </div>
@@ -509,7 +586,7 @@ export function SpacesPairingTab({ status, onRefreshStatus }: SpacesPairingTabPr
         <DialogContent>
           <DialogHeader>
             <DialogTitle>新建独立同步空间</DialogTitle>
-            <DialogDescription>在当前 WebDAV 目录下创建全新端到端加密空间，数据与现有空间完全隔离。</DialogDescription>
+            <DialogDescription>在当前存储后端下创建全新端到端加密空间，数据与现有空间完全隔离。</DialogDescription>
           </DialogHeader>
           <div className="space-y-3">
             <div className="space-y-1.5">
@@ -627,7 +704,7 @@ export function SpacesPairingTab({ status, onRefreshStatus }: SpacesPairingTabPr
               className="mt-0.5 h-4 w-4 cursor-pointer accent-destructive"
             />
             <label htmlFor="delete-space-remote-checkbox" className="block flex-1 cursor-pointer">
-              <span className="block font-semibold text-destructive">同时永久删除 WebDAV 远端该空间全部加密数据</span>
+              <span className="block font-semibold text-destructive">同时永久删除远端存储该空间全部加密数据</span>
               <span className="mt-0.5 block text-muted-foreground">
                 高危操作！勾选后其他设备也将无法再读取此空间的云端事件和快照。
               </span>

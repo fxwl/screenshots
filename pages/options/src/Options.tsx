@@ -5,7 +5,14 @@ import { HistoryAndUndoTab } from '@console/components/HistoryAndUndoTab';
 import { LocalStorageTab } from '@console/components/LocalStorageTab';
 import { RulesTab } from '@console/components/RulesTab';
 import { SitesAndCookiesTab } from '@console/components/SitesAndCookiesTab';
-import { unwrapCommand, useSessionMeshStatus, useTheme, withErrorBoundary, withSuspense } from '@sessionmesh/shared';
+import {
+  unwrapCommand,
+  useLocale,
+  useSessionMeshStatus,
+  useTheme,
+  withErrorBoundary,
+  withSuspense,
+} from '@sessionmesh/shared';
 import {
   Alert,
   AlertDescription,
@@ -29,12 +36,14 @@ import {
   DropdownMenuTrigger,
   Input,
   Label,
+  LanguageDropdown,
   ThemeDropdown,
   Toaster,
 } from '@sessionmesh/ui';
 import {
   AlertTriangle,
   ArrowRight,
+  BookOpen,
   ChevronDown,
   Cookie,
   Database,
@@ -61,11 +70,20 @@ import { useCallback, useEffect, useState } from 'react';
 import { toast } from 'sonner';
 import { OnboardingWizard } from './components/OnboardingWizard';
 import { PolicyAdvancedTab } from './components/PolicyAdvancedTab';
+import { QuickStartChecklistCard } from './components/QuickStartChecklistCard';
 import { SpacesPairingTab } from './components/SpacesPairingTab';
+import { TutorialsTab } from './components/TutorialsTab';
 import { WebDAVTab } from './components/WebDAVTab';
 import { extractErrorMessage, getDeviceStatusMeta, openSidePanelFromWindow } from './utils/helpers';
 
-type ConsoleSectionId = 'sites' | 'accounts' | 'rules' | 'devices_spaces' | 'history_conflicts' | 'storage_settings';
+type ConsoleSectionId =
+  | 'sites'
+  | 'accounts'
+  | 'rules'
+  | 'devices_spaces'
+  | 'history_conflicts'
+  | 'storage_settings'
+  | 'tutorials';
 
 const VALID_SECTIONS: ReadonlySet<string> = new Set<ConsoleSectionId>([
   'sites',
@@ -74,6 +92,7 @@ const VALID_SECTIONS: ReadonlySet<string> = new Set<ConsoleSectionId>([
   'devices_spaces',
   'history_conflicts',
   'storage_settings',
+  'tutorials',
 ]);
 
 function readInitialConsoleQuery(): {
@@ -121,6 +140,7 @@ function readInitialConsoleQuery(): {
 const Options = () => {
   const initial = readInitialConsoleQuery();
   const { theme, setTheme } = useTheme();
+  const { localePreference, locale, setLocalePreference } = useLocale();
   const { status, settings, refresh, loading, revision } = useSessionMeshStatus();
 
   const [forceWizard, setForceWizard] = useState<boolean>(initial.onboarding);
@@ -246,7 +266,7 @@ const Options = () => {
         errorCode?: string;
       }>({ type: 'SYNC_NOW' });
       if (res?.errorMessage) {
-        toast.warning(`WebDAV 云端暂时繁忙，系统将继续后台自动退避重试：${res.errorMessage}`);
+        toast.warning(`远端存储暂时繁忙，系统将继续后台自动退避重试：${res.errorMessage}`);
       } else {
         const applied = res?.appliedCookies ?? 0;
         const refreshHint = applied > 0 && !settings?.autoRefresh ? '，刷新对应网页即可生效' : '';
@@ -309,7 +329,7 @@ const Options = () => {
     {
       id: 'sites',
       label: '网站与 Cookies',
-      desc: '站点纳管、Cookie 明细与 LS',
+      desc: '开启网站同步、Cookie 明细与 LS',
       icon: <Cookie className="h-4 w-4" />,
       badge: pendingDecisionsCount > 0 ? pendingDecisionsCount : undefined,
       badgeVariant: 'warning',
@@ -317,25 +337,25 @@ const Options = () => {
     {
       id: 'accounts',
       label: '多账号管理',
-      desc: '账号切换、轮换、备注与注入',
+      desc: '大小号秒切、色标备注与分享',
       icon: <Users className="h-4 w-4" />,
     },
     {
-      id: 'rules',
-      label: '规则与环境同步',
-      desc: '双层黑名单、开发映射、SSO',
-      icon: <Shield className="h-4 w-4" />,
-    },
-    {
       id: 'devices_spaces',
-      label: '设备与同步空间',
-      desc: '设备策略、基准裁决、配对码',
+      label: '设备与跨端配对',
+      desc: '配对码连新电脑、设备策略与多空间',
       icon: <Laptop className="h-4 w-4" />,
     },
     {
+      id: 'rules',
+      label: '排除规则与开发联调',
+      desc: '敏感黑名单、localhost 注入、SSO',
+      icon: <Shield className="h-4 w-4" />,
+    },
+    {
       id: 'history_conflicts',
-      label: '冲突与历史审计',
-      desc: '双栏冲突、后悔药、事件日志',
+      label: '冲突与历史撤回',
+      desc: '冲突处理、后悔药恢复、操作记录',
       icon: <GitMerge className="h-4 w-4" />,
       badge:
         unresolvedConflictsCount > 0 ? unresolvedConflictsCount : undoPointsCount > 0 ? undoPointsCount : undefined,
@@ -344,8 +364,14 @@ const Options = () => {
     {
       id: 'storage_settings',
       label: '存储与系统设置',
-      desc: 'WebDAV 运维、同步策略、安全锁',
+      desc: '存储位置、加密备份、快捷键与锁',
       icon: <Settings2 className="h-4 w-4" />,
+    },
+    {
+      id: 'tutorials',
+      label: '新手教程与指南',
+      desc: '3 分钟图解、配对与多号实战、FAQ',
+      icon: <BookOpen className="h-4 w-4" />,
     },
   ];
 
@@ -460,6 +486,14 @@ const Options = () => {
                       <PanelRightOpen className="mr-1.5 h-3.5 w-3.5" />
                       侧边栏
                     </Button>
+                    <Button
+                      type="button"
+                      size="sm"
+                      variant={activeSection === 'tutorials' ? 'secondary' : 'ghost'}
+                      onClick={() => setActiveSection('tutorials')}>
+                      <BookOpen className="mr-1.5 h-3.5 w-3.5" />
+                      新手教程
+                    </Button>
                     <Button type="button" size="sm" variant="ghost" onClick={() => setForceWizard(true)}>
                       <Sparkles className="mr-1.5 h-3.5 w-3.5" />
                       配置向导
@@ -468,6 +502,11 @@ const Options = () => {
                 ) : null}
               </>
             ) : null}
+            <LanguageDropdown
+              localePreference={localePreference}
+              resolvedLocale={locale}
+              setLocalePreference={setLocalePreference}
+            />
             <ThemeDropdown setTheme={setTheme} />
           </div>
         </div>
@@ -482,6 +521,10 @@ const Options = () => {
       ) : inWizardMode ? (
         <OnboardingWizard
           alreadyConfigured={!!status?.configured}
+          onOpenTutorials={() => {
+            setForceWizard(false);
+            setActiveSection('tutorials');
+          }}
           onComplete={async () => {
             setForceWizard(false);
             try {
@@ -582,7 +625,7 @@ const Options = () => {
               <AlertTriangle className="h-4 w-4" />
               <AlertTitle className="text-sm font-semibold">
                 {status.latestError.retryable
-                  ? `WebDAV 云端暂时繁忙 [${status.latestError.code}] — 后台自动退避重试中`
+                  ? `存储服务暂时繁忙 [${status.latestError.code}] — 后台自动退避重试中`
                   : `同步异常 [${status.latestError.code}] — 本地与云端数据均安全保留`}
               </AlertTitle>
               <AlertDescription className="mt-1 space-y-1 text-xs">
@@ -621,6 +664,46 @@ const Options = () => {
                 <ArrowRight className="ml-1 h-3.5 w-3.5" />
               </Button>
             </div>
+          ) : null}
+
+          {/* Local Directory Permission Recovery Redirect Banner */}
+          {(status.attentionItems ?? []).some(item => item.kind === 'local_dir_permission_needed') &&
+          !(activeSection === 'storage_settings' && storageSubTab === 'webdav') ? (
+            <div className="mb-5 flex flex-wrap items-center justify-between gap-2 rounded-xl border border-amber-500/45 bg-amber-500/[0.08] px-4 py-2.5 text-xs text-amber-900 dark:text-amber-200">
+              <div className="flex items-center gap-2 font-medium">
+                <AlertTriangle className="h-4 w-4 shrink-0 text-amber-600 dark:text-amber-400" />
+                <span>本地同步文件夹需要重新授予读写授权后才能继续同步。</span>
+              </div>
+              <Button
+                type="button"
+                size="sm"
+                className="h-7 px-2.5 text-xs"
+                onClick={() => {
+                  setStorageSubTab('webdav');
+                  setActiveSection('storage_settings');
+                }}>
+                前往存储后端恢复授权
+                <ArrowRight className="ml-1 h-3.5 w-3.5" />
+              </Button>
+            </div>
+          ) : null}
+
+          {/* Interactive 3-Minute Quick Start Checklist (auto-tracks progress & dismissible) */}
+          {!status.locked && status.status !== 'DECRYPT_ERROR' && activeSection !== 'tutorials' ? (
+            <QuickStartChecklistCard
+              refreshSignal={combinedRefreshSignal}
+              onJumpToSites={() => {
+                setSitesSubTab('cookies');
+                setActiveSection('sites');
+              }}
+              onJumpToPairing={() => {
+                setDevicesSubTab('spaces');
+                setActiveSection('devices_spaces');
+              }}
+              onJumpToTutorials={() => {
+                setActiveSection('tutorials');
+              }}
+            />
           ) : null}
 
           {/* Two-Column Console Shell: Left Sidebar Nav + Wide Workspace */}
@@ -779,7 +862,7 @@ const Options = () => {
                           : 'text-muted-foreground hover:text-foreground'
                       }`}>
                       <Server className="h-3.5 w-3.5" />
-                      WebDAV 存储与维护
+                      存储后端与备份
                     </button>
                     <button
                       type="button"
@@ -876,6 +959,19 @@ const Options = () => {
                     layout="wide"
                   />
                 )
+              ) : activeSection === 'tutorials' ? (
+                <TutorialsTab
+                  onStartWizard={() => setForceWizard(true)}
+                  onNavigate={(sec, sub) => {
+                    if (sec === 'sites' && sub === 'localstorage') setSitesSubTab('localstorage');
+                    else if (sec === 'sites') setSitesSubTab('cookies');
+                    if (sec === 'devices_spaces' && sub === 'spaces') setDevicesSubTab('spaces');
+                    else if (sec === 'devices_spaces') setDevicesSubTab('devices');
+                    if (sec === 'storage_settings' && sub === 'policy') setStorageSubTab('policy');
+                    else if (sec === 'storage_settings') setStorageSubTab('webdav');
+                    setActiveSection(sec);
+                  }}
+                />
               ) : storageSubTab === 'webdav' ? (
                 <WebDAVTab status={status} onRefreshStatus={handleRefreshAll} />
               ) : (

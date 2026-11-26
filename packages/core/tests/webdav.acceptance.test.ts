@@ -157,7 +157,8 @@ describe('SMES v2 E2E Crypto Engine, Keyring Rotation & Pairing Code', () => {
     expect(code).not.toContain('dav.sessionmesh.test');
 
     const decoded = await decodePairingCode(code, 'pair-secret-123');
-    expect(decoded).toEqual(payload);
+    expect(decoded).toMatchObject(payload);
+    expect(decoded.storage).toEqual({ provider: 'webdav', ...payload.webdav });
 
     await expect(decodePairingCode(code, 'wrong-passphrase')).rejects.toThrow(/DECRYPT/i);
     await expect(decodePairingCode('https://not-a-pairing-code', 'pair-secret-123')).rejects.toThrow(/DECRYPT/i);

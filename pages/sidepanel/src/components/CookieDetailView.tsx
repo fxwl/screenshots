@@ -7,8 +7,10 @@ import {
   formatCookieExpiry,
   formatDateTime,
   formatRelativeTime,
+  formatRemainingDuration,
   getBindingMeta,
   getCookieSyncStatusMeta,
+  getExpiryBadgeMeta,
   getSameSiteLabel,
   parseImportedCookiesJson,
   shortId,
@@ -57,7 +59,9 @@ import {
   RefreshCw,
   Repeat,
   Search,
+  Share2,
   ShieldAlert,
+  Star,
   Tag,
   Trash2,
   Unlink,
@@ -69,12 +73,15 @@ import type React from 'react';
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { toast } from 'sonner';
 import { StatusBadge } from './common/Badge';
+import { DebugExportDropdown } from './common/DebugExportDropdown';
 import { EmptyState } from './common/EmptyState';
 import { JsonImportModal } from './common/JsonImportModal';
 import { Modal } from './common/Modal';
 import { ThreeScopeDeleteModal } from './common/ThreeScopeDeleteModal';
+import { AccountAppearanceFields, sliceBadgeCodePoints, TrackBadges } from './common/TrackAppearance';
 import { VersionHistoryDrawer } from './common/VersionHistoryDrawer';
 import { CookieEditorModal } from './CookieEditorModal';
+import { SessionShareModal } from './SessionShareModal';
 import { UnmanageSiteModal } from './UnmanageSiteModal';
 import type { UnmanageSiteScope } from './UnmanageSiteModal';
 
@@ -88,7 +95,7 @@ export interface CookieDetailViewProps {
   onOpenLocalStorage?: (siteKey: string, trackId?: string, trackLabel?: string) => void;
 }
 
-type CookieQuickFilter = 'all' | 'active' | 'failed' | 'deleted' | 'httpOnly' | 'secure' | 'session';
+type CookieQuickFilter = 'all' | 'active' | 'expiring' | 'failed' | 'deleted' | 'httpOnly' | 'secure' | 'session';
 
 export const CookieDetailView: React.FC<CookieDetailViewProps> = ({
   site,
@@ -119,13 +126,19 @@ export const CookieDetailView: React.FC<CookieDetailViewProps> = ({
   const [renameTrackOpen, setRenameTrackOpen] = useState(false);
   const [renameTrackValue, setRenameTrackValue] = useState('');
   const [renameTrackNote, setRenameTrackNote] = useState('');
+  const [renameTrackColor, setRenameTrackColor] = useState('');
+  const [renameTrackBadge, setRenameTrackBadge] = useState('');
   const [splitTrackOpen, setSplitTrackOpen] = useState(false);
   const [splitTrackLabel, setSplitTrackLabel] = useState('');
   const [createAcctOpen, setCreateAcctOpen] = useState(false);
   const [createAcctMode, setCreateAcctMode] = useState<AccountCreateMode>('clean_new');
   const [createAcctLabel, setCreateAcctLabel] = useState('');
   const [createAcctNote, setCreateAcctNote] = useState('');
+  const [createAcctColor, setCreateAcctColor] = useState('');
+  const [createAcctBadge, setCreateAcctBadge] = useState('');
   const [unmanageOpen, setUnmanageOpen] = useState(false);
+  const [shareModalOpen, setShareModalOpen] = useState(false);
+  const [watchedNames, setWatchedNames] = useState<string[]>([]);
 
   const { isBannerVisible, dismissBanner } = useBannerPrefs();
   const loadSeqRef = useRef(0);
@@ -178,12 +191,69 @@ export const CookieDetailView: React.FC<CookieDetailViewProps> = ({
     loadCookies();
   }, [loadCookies]);
 
+  useEffect(() => {
+    let active = true;
+    void sidePanelApi
+      .getRulesAndBlacklist()
+      .then(rules => {
+        if (!active) return;
+        const names = rules?.siteOverrides?.[site.siteKey]?.watchedCookieNames ?? [];
+        setWatchedNames(names);
+      })
+      .catch(() => {
+        if (active) setWatchedNames([]);
+      });
+    return () => {
+      active = false;
+    };
+  }, [site.siteKey]);
+
+  const watchedSet = useMemo(
+    () => new Set(watchedNames.map(n => n.trim().toLowerCase()).filter(Boolean)),
+    [watchedNames],
+  );
+  const expiringMap = useMemo(() => {
+    const map = new Map<string, NonNullable<SiteSummaryView['expiryHealth']>['expiringCookies'][number]>();
+    for (const item of site.expiryHealth?.expiringCookies ?? []) {
+      map.set(item.logicalId, item);
+    }
+    return map;
+  }, [site.expiryHealth]);
+
+  const handleToggleWatchCookie = async (cookieName: string, currentlyWatched: boolean) => {
+    setBusyAction(`watch:${cookieName}`);
+    try {
+      const res = await sidePanelApi.toggleWatchedCookie(site.siteKey, cookieName, !currentlyWatched);
+      setWatchedNames(res?.watchedCookieNames ?? []);
+      toast.success(!currentlyWatched ? `已星标盯盘 Cookie「${cookieName}」` : `已取消盯盘 Cookie「${cookieName}」`);
+      await onSiteMutated();
+    } catch (err) {
+      toast.error(`切换盯盘失败：${extractErrorMessage(err)}`);
+    } finally {
+      setBusyAction(null);
+    }
+  };
+
   const effectiveSearch = (localSearch || globalSearch).trim().toLowerCase();
 
   const filteredCookies = useMemo(() => {
+    const nowMs = Date.now();
     return cookies
       .filter(ck => {
         if (quickFilter === 'active' && ck.deleted) return false;
+        if (quickFilter === 'expiring') {
+          if (ck.deleted) return false;
+          const isWatched = watchedSet.has(ck.name.trim().toLowerCase());
+          const inExpiringList = expiringMap.has(ck.logicalId);
+          const expMs =
+            !ck.session && ck.expirationDate !== undefined
+              ? ck.expirationDate > 1e12
+                ? ck.expirationDate
+                : ck.expirationDate * 1000
+              : null;
+          const isExpiringSoon = expMs !== null && expMs - nowMs <= 24 * 3600_000;
+          if (!isWatched && !inExpiringList && !isExpiringSoon) return false;
+        }
         if (quickFilter === 'failed' && ck.applyResult?.accepted !== false && ck.syncStatus !== 'APPLY_FAILED') {
           return false;
         }
@@ -203,7 +273,7 @@ export const CookieDetailView: React.FC<CookieDetailViewProps> = ({
         );
       })
       .sort((a, b) => Number(a.deleted) - Number(b.deleted) || a.name.localeCompare(b.name));
-  }, [cookies, quickFilter, effectiveSearch]);
+  }, [cookies, quickFilter, effectiveSearch, watchedSet, expiringMap]);
 
   const allFilteredSelected = filteredCookies.length > 0 && filteredCookies.every(ck => selectedIds.has(ck.logicalId));
 
@@ -408,6 +478,8 @@ export const CookieDetailView: React.FC<CookieDetailViewProps> = ({
       await sidePanelApi.updateSiteTrack(site.siteKey, viewingTrack.trackId, {
         label: renameTrackValue.trim(),
         accountNote: renameTrackNote.trim(),
+        color: renameTrackColor || null,
+        badgeText: sliceBadgeCodePoints(renameTrackBadge.trim(), 4) || null,
       });
       toast.success('账号信息已更新');
       setRenameTrackOpen(false);
@@ -455,6 +527,8 @@ export const CookieDetailView: React.FC<CookieDetailViewProps> = ({
         mode: createAcctMode,
         label: createAcctLabel.trim() || undefined,
         accountNote: createAcctNote.trim() || undefined,
+        color: createAcctColor || undefined,
+        badgeText: sliceBadgeCodePoints(createAcctBadge.trim(), 4) || undefined,
         triggerRefresh: createAcctMode === 'clean_new',
       });
       setViewingTrackId(created.trackId);
@@ -466,6 +540,8 @@ export const CookieDetailView: React.FC<CookieDetailViewProps> = ({
       setCreateAcctOpen(false);
       setCreateAcctLabel('');
       setCreateAcctNote('');
+      setCreateAcctColor('');
+      setCreateAcctBadge('');
       await onSiteMutated();
     } catch (err) {
       toast.error(`新增账号失败：${extractErrorMessage(err)}`);
@@ -507,6 +583,8 @@ export const CookieDetailView: React.FC<CookieDetailViewProps> = ({
 
   const bindingMeta = getBindingMeta(site.binding.state);
   const selectedCookies = cookies.filter(c => selectedIds.has(c.logicalId));
+  const siteExpiryMeta =
+    site.expiryHealth && site.expiryHealth.status !== 'healthy' ? getExpiryBadgeMeta(site.expiryHealth.status) : null;
 
   return (
     <div className={layout === 'wide' ? 'space-y-4' : 'flex h-full flex-col'}>
@@ -536,14 +614,29 @@ export const CookieDetailView: React.FC<CookieDetailViewProps> = ({
               <div className="flex flex-wrap items-center gap-1.5 min-w-0">
                 <h2 className="truncate text-sm font-semibold">{site.siteKey}</h2>
                 <StatusBadge tone={bindingMeta.tone}>{bindingMeta.label}</StatusBadge>
+                {siteExpiryMeta && site.expiryHealth ? (
+                  <StatusBadge tone={siteExpiryMeta.tone}>
+                    {site.expiryHealth.status === 'expired'
+                      ? 'Cookie 已过期'
+                      : `${siteExpiryMeta.label}${
+                          site.expiryHealth.remainingMs !== undefined
+                            ? ` · ${formatRemainingDuration(site.expiryHealth.remainingMs)}`
+                            : ''
+                        }`}
+                  </StatusBadge>
+                ) : null}
                 {viewingTrack?.accountNote ? (
                   <span className="truncate text-[11px] text-muted-foreground">· {viewingTrack.accountNote}</span>
                 ) : null}
               </div>
-              <p className="truncate text-[11px] text-muted-foreground">
-                查看账号：{viewingTrack?.label || '未绑定'}
-                {isViewingInactiveTrack ? '（非激活）' : ''} · {viewingTrack?.memberDeviceIds?.length || 0} 台设备 ·{' '}
-                {cookies.filter(c => !c.deleted).length} 条生效 Cookie
+              <p className="mt-0.5 flex flex-wrap items-center gap-1 text-[11px] text-muted-foreground">
+                <span>查看账号：</span>
+                <TrackBadges track={viewingTrack} />
+                <span>
+                  {viewingTrack?.label || '未绑定'}
+                  {isViewingInactiveTrack ? '（非激活）' : ''} · {viewingTrack?.memberDeviceIds?.length || 0} 台设备 ·{' '}
+                  {cookies.filter(c => !c.deleted).length} 条生效 Cookie
+                </span>
               </p>
             </div>
           </div>
@@ -627,6 +720,8 @@ export const CookieDetailView: React.FC<CookieDetailViewProps> = ({
                   setCreateAcctMode('clean_new');
                   setCreateAcctLabel('');
                   setCreateAcctNote('');
+                  setCreateAcctColor('');
+                  setCreateAcctBadge('');
                   setCreateAcctOpen(true);
                 }}
                 title="新增多账号轨道">
@@ -657,6 +752,24 @@ export const CookieDetailView: React.FC<CookieDetailViewProps> = ({
           )}
 
           <div className="flex flex-wrap items-center gap-1">
+            <DebugExportDropdown
+              siteKey={site.siteKey}
+              trackId={viewingTrack?.trackId}
+              trackLabel={viewingTrack?.label}
+              includeRawCookiesJson
+            />
+
+            <Button
+              variant="outline"
+              size="sm"
+              className="h-7 px-2 text-[11px]"
+              disabled={site.binding.state === 'BLACKLISTED'}
+              onClick={() => setShareModalOpen(true)}
+              title="打包为一次性端到端加密分享片段">
+              <Share2 className="mr-1 h-3 w-3 text-primary" />
+              临时加密分享
+            </Button>
+
             <Button variant="outline" size="sm" className="h-7 px-2 text-[11px]" onClick={() => handleCopyHeader()}>
               <Copy className="mr-1 h-3 w-3" />
               Header
@@ -687,7 +800,7 @@ export const CookieDetailView: React.FC<CookieDetailViewProps> = ({
                   <DropdownMenuItem
                     onClick={() => onOpenLocalStorage(site.siteKey, viewingTrack?.trackId, viewingTrack?.label)}>
                     <Database className="mr-2 h-3.5 w-3.5" />
-                    查看此账号 LocalStorage
+                    查看此账号网页存储
                   </DropdownMenuItem>
                 ) : null}
                 {site.binding.state !== 'BLACKLISTED' ? (
@@ -698,10 +811,12 @@ export const CookieDetailView: React.FC<CookieDetailViewProps> = ({
                         onClick={() => {
                           setRenameTrackValue(viewingTrack.label || '');
                           setRenameTrackNote(viewingTrack.accountNote || '');
+                          setRenameTrackColor(viewingTrack.color || '');
+                          setRenameTrackBadge(viewingTrack.badgeText || '');
                           setRenameTrackOpen(true);
                         }}>
                         <Tag className="mr-2 h-3.5 w-3.5" />
-                        编辑账号名称与备注
+                        编辑账号名称与标识
                       </DropdownMenuItem>
                     ) : null}
                     <DropdownMenuItem onClick={() => setSplitTrackOpen(true)}>
@@ -785,6 +900,7 @@ export const CookieDetailView: React.FC<CookieDetailViewProps> = ({
             [
               ['all', '全部'],
               ['active', '生效中'],
+              ['expiring', '即将过期/已盯盘'],
               ['failed', '写入失败'],
               ['httpOnly', 'HttpOnly'],
               ['secure', 'Secure'],
@@ -871,6 +987,9 @@ export const CookieDetailView: React.FC<CookieDetailViewProps> = ({
             const syncMeta = getCookieSyncStatusMeta(ck.syncStatus);
             const applyFailed = ck.applyResult?.accepted === false;
             const applyOk = ck.applyResult?.accepted === true;
+            const isWatched = watchedSet.has(ck.name.trim().toLowerCase());
+            const expiringEntry = expiringMap.get(ck.logicalId);
+            const expBadgeMeta = expiringEntry ? getExpiryBadgeMeta(expiringEntry.status) : null;
 
             return (
               <div
@@ -894,8 +1013,27 @@ export const CookieDetailView: React.FC<CookieDetailViewProps> = ({
                     <div className="flex items-start justify-between gap-2">
                       <div className="min-w-0">
                         <div className="flex flex-wrap items-center gap-1.5">
+                          <button
+                            type="button"
+                            disabled={busyAction === `watch:${ck.name}`}
+                            onClick={() => void handleToggleWatchCookie(ck.name, isWatched)}
+                            title={isWatched ? '取消盯盘（Cookie 过期监控）' : '盯盘星标（重点监控过期提醒）'}
+                            className={`rounded p-0.5 transition-colors ${
+                              isWatched
+                                ? 'text-amber-500 hover:bg-amber-500/15'
+                                : 'text-muted-foreground hover:bg-muted hover:text-amber-500'
+                            }`}>
+                            <Star className={`h-3.5 w-3.5 ${isWatched ? 'fill-amber-400 text-amber-500' : ''}`} />
+                          </button>
                           <span className="font-mono font-semibold text-foreground break-all">{ck.name}</span>
                           <StatusBadge tone={syncMeta.tone}>{syncMeta.label}</StatusBadge>
+                          {expBadgeMeta && expiringEntry ? (
+                            <StatusBadge tone={expBadgeMeta.tone}>
+                              {expiringEntry.status === 'expired'
+                                ? '已过期'
+                                : formatRemainingDuration(expiringEntry.remainingMs)}
+                            </StatusBadge>
+                          ) : null}
                           {ck.deleted ? <StatusBadge tone="danger">Tombstone</StatusBadge> : null}
                           {applyOk ? (
                             <StatusBadge tone="success">
@@ -1197,6 +1335,13 @@ export const CookieDetailView: React.FC<CookieDetailViewProps> = ({
               }}
             />
           </div>
+          <AccountAppearanceFields
+            idPrefix="detail-edit-track"
+            color={renameTrackColor}
+            onColorChange={setRenameTrackColor}
+            badgeText={renameTrackBadge}
+            onBadgeTextChange={setRenameTrackBadge}
+          />
         </div>
       </Modal>
 
@@ -1290,6 +1435,13 @@ export const CookieDetailView: React.FC<CookieDetailViewProps> = ({
               if (e.key === 'Enter') void handleConfirmCreateAccount();
             }}
           />
+          <AccountAppearanceFields
+            idPrefix="detail-create-acct"
+            color={createAcctColor}
+            onColorChange={setCreateAcctColor}
+            badgeText={createAcctBadge}
+            onBadgeTextChange={setCreateAcctBadge}
+          />
         </div>
       </Modal>
 
@@ -1297,6 +1449,14 @@ export const CookieDetailView: React.FC<CookieDetailViewProps> = ({
         siteKey={unmanageOpen ? site.siteKey : null}
         onClose={() => setUnmanageOpen(false)}
         onConfirm={handleConfirmUnmanage}
+      />
+
+      <SessionShareModal
+        open={shareModalOpen}
+        onClose={() => setShareModalOpen(false)}
+        siteKey={site.siteKey}
+        trackId={viewingTrack?.trackId}
+        trackLabel={viewingTrack?.label}
       />
     </div>
   );

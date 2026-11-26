@@ -4,8 +4,11 @@ import type {
   ConflictRecord,
   CookieRecord,
   DeviceCheckpoint,
+  IndexedDbRecord,
   LocalStorageRecord,
   ObjectType,
+  SessionStorageRecord,
+  SyncRecord,
   Tombstone,
 } from '../types';
 import {
@@ -16,7 +19,7 @@ import {
 
 export const DEFAULT_TOMBSTONE_MIN_RETENTION_MS = 7 * 24 * 60 * 60 * 1000;
 
-export interface MergeOutcome<T extends CookieRecord | LocalStorageRecord> {
+export interface MergeOutcome<T extends SyncRecord> {
   comparison: CausalComparison;
   winner: 'local' | 'remote' | 'tombstone';
   record?: T;
@@ -25,21 +28,30 @@ export interface MergeOutcome<T extends CookieRecord | LocalStorageRecord> {
   changedLocal: boolean;
 }
 
-type EffectiveSide<T extends CookieRecord | LocalStorageRecord> =
+type EffectiveSide<T extends SyncRecord> =
   | { kind: 'record'; record: T; version: CausalVersion }
   | { kind: 'tombstone'; tombstone: Tombstone; version: CausalVersion };
 
-function isCookieRecord(
-  record: CookieRecord | LocalStorageRecord,
-): record is CookieRecord {
+function isCookieRecord(record: SyncRecord): record is CookieRecord {
   return 'domain' in record;
 }
 
-function getObjectType(record: CookieRecord | LocalStorageRecord): ObjectType {
-  return isCookieRecord(record) ? 'cookie' : 'localStorage';
+function isIndexedDbRecord(record: SyncRecord): record is IndexedDbRecord {
+  return 'dbName' in record && 'storeName' in record;
 }
 
-function resolveEffectiveSide<T extends CookieRecord | LocalStorageRecord>(
+function isSessionStorageRecord(record: SyncRecord): record is SessionStorageRecord {
+  return !isCookieRecord(record) && !isIndexedDbRecord(record) && record.logicalId.startsWith('ss::');
+}
+
+function getObjectType(record: SyncRecord): ObjectType {
+  if (isCookieRecord(record)) return 'cookie';
+  if (isIndexedDbRecord(record)) return 'indexedDb';
+  if (isSessionStorageRecord(record)) return 'sessionStorage';
+  return 'localStorage';
+}
+
+function resolveEffectiveSide<T extends SyncRecord>(
   record?: T,
   tombstone?: Tombstone,
 ): EffectiveSide<T> | null {
@@ -72,7 +84,7 @@ function resolveEffectiveSide<T extends CookieRecord | LocalStorageRecord>(
   return { kind: 'tombstone', tombstone: tomb, version: tomb.deleteVersion };
 }
 
-function buildDeletedPlaceholder<T extends CookieRecord | LocalStorageRecord>(
+function buildDeletedPlaceholder<T extends SyncRecord>(
   template: T,
   tombstone: Tombstone,
 ): T {
@@ -90,8 +102,36 @@ function buildDeletedPlaceholder<T extends CookieRecord | LocalStorageRecord>(
     return placeholder as T;
   }
 
+  if (isIndexedDbRecord(template)) {
+    const placeholder: IndexedDbRecord = {
+      ...template,
+      encodedValue: '',
+      byteLength: 0,
+      deleted: true,
+      version: tombstone.deleteVersion,
+      sourceDevice: tombstone.sourceDevice,
+      updatedAt: tombstone.createdAt,
+      syncStatus: 'DELETED',
+    };
+    return placeholder as T;
+  }
+
+  if (isSessionStorageRecord(template)) {
+    const placeholder: SessionStorageRecord = {
+      ...template,
+      value: '',
+      deleted: true,
+      version: tombstone.deleteVersion,
+      sourceDevice: tombstone.sourceDevice,
+      updatedAt: tombstone.createdAt,
+      syncStatus: 'DELETED',
+    };
+    return placeholder as T;
+  }
+
+  const lsTemplate = template as LocalStorageRecord;
   const placeholder: LocalStorageRecord = {
-    ...template,
+    ...lsTemplate,
     value: '',
     deleted: true,
     version: tombstone.deleteVersion,
@@ -107,7 +147,7 @@ function buildConflictId(objectId: string, versionA: CausalVersion, versionB: Ca
   return `conflict::${objectId}::${pair[0]}::${pair[1]}`;
 }
 
-function buildConflictRecord<T extends CookieRecord | LocalStorageRecord>(params: {
+function buildConflictRecord<T extends SyncRecord>(params: {
   spaceId: string;
   localRecord: T;
   remoteRecord: T;
@@ -157,7 +197,7 @@ function mergeAckDevices(a: string[], b: string[]): { merged: string[]; changedF
  *   via `compareHlcDeterministic` so any set of devices (A/B/C) converges to the exact same state,
  *   while emitting a `ConflictRecord` for user inspection in the Conflict Center.
  */
-export function resolveItemMerge<T extends CookieRecord | LocalStorageRecord>(params: {
+export function resolveItemMerge<T extends SyncRecord>(params: {
   spaceId: string;
   localRecord?: T;
   localTombstone?: Tombstone;

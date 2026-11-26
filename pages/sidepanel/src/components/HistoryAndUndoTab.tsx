@@ -6,6 +6,7 @@ import {
   formatDateTime,
   formatRelativeTime,
   getBindingMeta,
+  getObjectTypeLabel,
   getOperationMeta,
   shortId,
 } from '@console/lib/format';
@@ -159,7 +160,12 @@ export const HistoryAndUndoTab: React.FC<HistoryAndUndoTabProps> = ({
       if (siteFilter !== 'ALL' && ev.siteKey !== siteFilter) return false;
       if (opFilter !== 'ALL' && ev.operation !== opFilter) return false;
       if (!query) return true;
-      const objName = ev.cookieData?.name || ev.localStorageData?.key || ev.objectId;
+      const objName =
+        ev.cookieData?.name ||
+        ev.localStorageData?.key ||
+        ev.sessionStorageData?.key ||
+        (ev.indexedDbData ? `${ev.indexedDbData.dbName}.${ev.indexedDbData.storeName}` : '') ||
+        ev.objectId;
       return (
         ev.siteKey.toLowerCase().includes(query) ||
         objName.toLowerCase().includes(query) ||
@@ -382,7 +388,13 @@ export const HistoryAndUndoTab: React.FC<HistoryAndUndoTabProps> = ({
                   const objName =
                     ev.objectType === 'cookie'
                       ? ev.cookieData?.name || ev.objectId
-                      : ev.localStorageData?.key || ev.objectId;
+                      : ev.objectType === 'localStorage'
+                        ? ev.localStorageData?.key || ev.objectId
+                        : ev.objectType === 'sessionStorage'
+                          ? ev.sessionStorageData?.key || ev.objectId
+                          : ev.indexedDbData
+                            ? `${ev.indexedDbData.dbName}.${ev.indexedDbData.storeName}`
+                            : ev.objectId;
                   const canRestore = ev.operation !== 'SNAPSHOT' && ev.operation !== 'CHECKPOINT';
 
                   return (
@@ -390,7 +402,7 @@ export const HistoryAndUndoTab: React.FC<HistoryAndUndoTabProps> = ({
                       <div className="flex items-start justify-between gap-2">
                         <div className="flex flex-wrap items-center gap-1.5 min-w-0">
                           <StatusBadge tone={opMeta.tone}>{opMeta.label}</StatusBadge>
-                          <StatusBadge tone="neutral">{ev.objectType === 'cookie' ? 'Cookie' : 'LS'}</StatusBadge>
+                          <StatusBadge tone="neutral">{getObjectTypeLabel(ev.objectType)}</StatusBadge>
                           <span className="font-semibold text-foreground">{ev.siteKey}</span>
                           <code className="max-w-[160px] truncate rounded bg-muted px-1 py-0.5 font-mono text-[11px]">
                             {objName}

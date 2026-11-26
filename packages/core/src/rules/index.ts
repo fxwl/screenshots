@@ -1,6 +1,7 @@
 import type {
   BlacklistEntry,
   EnvCookieSyncRule,
+  IndexedDbTargetRule,
   SiteRuleOverride,
   SpaceRuleSet,
   SpaceSettings,
@@ -12,12 +13,21 @@ import { parseEnvTarget } from '../sync/EnvCookieMapper';
 
 export { buildPresetBlacklistEntries } from './presets';
 
+export const DEFAULT_INDEXEDDB_MAX_TOTAL_BYTES = 1024 * 1024; // 1MB
+export const HARD_LIMIT_INDEXEDDB_MAX_TOTAL_BYTES = 2 * 1024 * 1024; // 2MB
+
 export interface EffectiveSitePolicy {
   excluded: boolean;
   excludedBy?: BlacklistEntry;
   direction: Exclude<SyncDirection, 'inherit'>;
   syncCookies: boolean;
   syncLocalStorage: boolean;
+  syncSessionStorage: boolean;
+  sessionStorageKeyAllowlist?: string[];
+  syncIndexedDb: boolean;
+  indexedDbTargets?: IndexedDbTargetRule[];
+  indexedDbMaxTotalBytes: number;
+  watchedCookieNames?: string[];
   autoRefresh: boolean;
 }
 
@@ -272,12 +282,60 @@ function sanitizeSiteOverrides(raw: unknown): Record<string, SiteRuleOverride> {
         ? (obj.direction as SyncDirection)
         : 'inherit';
 
+    const sessionStorageKeyAllowlist = Array.isArray(obj.sessionStorageKeyAllowlist)
+      ? obj.sessionStorageKeyAllowlist
+          .filter((k): k is string => typeof k === 'string' && k.trim().length > 0)
+          .map((k) => k.trim())
+      : undefined;
+
+    const watchedCookieNames = Array.isArray(obj.watchedCookieNames)
+      ? obj.watchedCookieNames
+          .filter((k): k is string => typeof k === 'string' && k.trim().length > 0)
+          .map((k) => k.trim())
+      : undefined;
+
+    const indexedDbTargets: IndexedDbTargetRule[] | undefined = Array.isArray(obj.indexedDbTargets)
+      ? obj.indexedDbTargets
+          .filter((t): t is Record<string, unknown> => Boolean(t && typeof t === 'object'))
+          .map((t) => {
+            const dbName = typeof t.dbName === 'string' ? t.dbName.trim() : '';
+            if (!dbName) return null;
+            const objectStores = Array.isArray(t.objectStores)
+              ? t.objectStores
+                  .filter((s): s is string => typeof s === 'string' && s.trim().length > 0)
+                  .map((s) => s.trim())
+              : undefined;
+            const keyPrefixes = Array.isArray(t.keyPrefixes)
+              ? t.keyPrefixes
+                  .filter((p): p is string => typeof p === 'string' && p.trim().length > 0)
+                  .map((p) => p.trim())
+              : undefined;
+            const rule: IndexedDbTargetRule = { dbName };
+            if (objectStores && objectStores.length > 0) rule.objectStores = objectStores;
+            if (keyPrefixes && keyPrefixes.length > 0) rule.keyPrefixes = keyPrefixes;
+            return rule;
+          })
+          .filter((r): r is IndexedDbTargetRule => r !== null)
+      : undefined;
+
+    const rawMaxBytes =
+      typeof obj.indexedDbMaxTotalBytes === 'number' && Number.isFinite(obj.indexedDbMaxTotalBytes)
+        ? Math.max(64 * 1024, Math.min(HARD_LIMIT_INDEXEDDB_MAX_TOTAL_BYTES, Math.floor(obj.indexedDbMaxTotalBytes)))
+        : undefined;
+
     result[siteKey] = {
       siteKey,
       pattern,
       direction,
       syncCookies: typeof obj.syncCookies === 'boolean' ? obj.syncCookies : true,
       syncLocalStorage: typeof obj.syncLocalStorage === 'boolean' ? obj.syncLocalStorage : true,
+      syncSessionStorage: typeof obj.syncSessionStorage === 'boolean' ? obj.syncSessionStorage : undefined,
+      sessionStorageKeyAllowlist:
+        sessionStorageKeyAllowlist && sessionStorageKeyAllowlist.length > 0 ? sessionStorageKeyAllowlist : undefined,
+      syncIndexedDb: typeof obj.syncIndexedDb === 'boolean' ? obj.syncIndexedDb : undefined,
+      indexedDbTargets: indexedDbTargets && indexedDbTargets.length > 0 ? indexedDbTargets : undefined,
+      indexedDbMaxTotalBytes: rawMaxBytes,
+      watchedCookieNames: watchedCookieNames && watchedCookieNames.length > 0 ? watchedCookieNames : undefined,
       autoRefresh: typeof obj.autoRefresh === 'boolean' ? obj.autoRefresh : true,
       updatedAt:
         typeof obj.updatedAt === 'number' && Number.isFinite(obj.updatedAt)
@@ -381,6 +439,7 @@ function sanitizeEnvSyncRule(
     targetUrl,
     syncCookies: typeof obj.syncCookies === 'boolean' ? obj.syncCookies : true,
     syncLocalStorage: typeof obj.syncLocalStorage === 'boolean' ? obj.syncLocalStorage : false,
+    syncSessionStorage: typeof obj.syncSessionStorage === 'boolean' ? obj.syncSessionStorage : undefined,
     adaptForHttp: typeof obj.adaptForHttp === 'boolean' ? obj.adaptForHttp : true,
     cleanTargetBeforeSync:
       typeof obj.cleanTargetBeforeSync === 'boolean' ? obj.cleanTargetBeforeSync : false,
@@ -474,6 +533,9 @@ export class RulesEngine {
         direction: 'disabled',
         syncCookies: false,
         syncLocalStorage: false,
+        syncSessionStorage: false,
+        syncIndexedDb: false,
+        indexedDbMaxTotalBytes: DEFAULT_INDEXEDDB_MAX_TOTAL_BYTES,
         autoRefresh: false,
       };
     }
@@ -510,12 +572,33 @@ export class RulesEngine {
       const effectiveDirection: Exclude<SyncDirection, 'inherit'> =
         bestOverride.direction === 'inherit' ? globalDirection : bestOverride.direction;
       const disabled = effectiveDirection === 'disabled';
+      const maxIdbBytes = Math.max(
+        64 * 1024,
+        Math.min(
+          HARD_LIMIT_INDEXEDDB_MAX_TOTAL_BYTES,
+          bestOverride.indexedDbMaxTotalBytes ?? DEFAULT_INDEXEDDB_MAX_TOTAL_BYTES,
+        ),
+      );
+      const idbEnabled = Boolean(
+        !disabled &&
+          bestOverride.syncIndexedDb &&
+          bestOverride.indexedDbTargets &&
+          bestOverride.indexedDbTargets.length > 0,
+      );
 
       return {
         excluded: disabled,
         direction: effectiveDirection,
         syncCookies: disabled ? false : bestOverride.syncCookies,
         syncLocalStorage: disabled ? false : bestOverride.syncLocalStorage,
+        syncSessionStorage: disabled
+          ? false
+          : (bestOverride.syncSessionStorage ?? Boolean(this.spaceSettings.syncSessionStorage)),
+        sessionStorageKeyAllowlist: bestOverride.sessionStorageKeyAllowlist,
+        syncIndexedDb: idbEnabled,
+        indexedDbTargets: idbEnabled ? bestOverride.indexedDbTargets : undefined,
+        indexedDbMaxTotalBytes: maxIdbBytes,
+        watchedCookieNames: bestOverride.watchedCookieNames,
         autoRefresh: disabled ? false : bestOverride.autoRefresh,
       };
     }
@@ -527,6 +610,9 @@ export class RulesEngine {
       direction: globalDirection,
       syncCookies: globalDisabled ? false : this.spaceSettings.syncCookies,
       syncLocalStorage: globalDisabled ? false : this.spaceSettings.syncLocalStorage,
+      syncSessionStorage: globalDisabled ? false : Boolean(this.spaceSettings.syncSessionStorage),
+      syncIndexedDb: false,
+      indexedDbMaxTotalBytes: DEFAULT_INDEXEDDB_MAX_TOTAL_BYTES,
       autoRefresh: globalDisabled ? false : this.spaceSettings.autoRefresh,
     };
   }

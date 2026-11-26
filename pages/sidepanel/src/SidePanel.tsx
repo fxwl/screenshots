@@ -186,8 +186,8 @@ const SidePanel: React.FC = () => {
     },
     {
       id: 'localstorage',
-      label: 'LocalStorage',
-      shortLabel: 'LS',
+      label: '网页存储',
+      shortLabel: '存储',
       icon: <Database className="h-3.5 w-3.5" />,
     },
     {
@@ -231,6 +231,7 @@ const SidePanel: React.FC = () => {
         onRefreshAll={handleRefreshAll}
         syncing={syncing}
         onSyncNow={handleSyncNow}
+        onOpenTutorials={() => handleOpenOptions('tutorials')}
         onOpenOptions={() =>
           handleOpenOptions(
             activeTab === 'sites'
@@ -316,14 +317,14 @@ const SidePanel: React.FC = () => {
             <CardHeader className="p-4 pb-2">
               <CardTitle className="text-base">尚未配置 SessionMesh</CardTitle>
               <CardDescription className="text-xs">
-                请先在设置向导中连接您的 WebDAV
-                服务器并设置端到端加密密码，完成后即可在侧边栏全量管理站点轨道、Cookies、LocalStorage、规则与冲突。
+                只需 3 步连接你的本地同步盘（OneDrive / iCloud）、GitHub 私密 Gist、Cloudflare R2 或坚果云
+                WebDAV，或者粘贴另一台电脑的配对码即可开启多端登录态同步。
               </CardDescription>
             </CardHeader>
-            <CardContent className="p-4 pt-2">
+            <CardContent className="p-4 pt-2 space-y-2">
               <Button className="w-full" size="sm" onClick={() => handleOpenOptions()}>
                 <Settings className="mr-1.5 h-4 w-4" />
-                打开首次配置向导
+                开始 3 步快速配置
               </Button>
             </CardContent>
           </Card>

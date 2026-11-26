@@ -1,8 +1,8 @@
 import type {
   CapabilityReport,
   IntegrityReport,
+  SanitizedStorageProviderConfig,
   SyncStatusSummary,
-  WebDAVAuthType,
   WebDAVConfig,
   WebDAVResourceStat,
 } from '@sessionmesh/core';
@@ -24,13 +24,6 @@ import {
   DialogFooter,
   DialogHeader,
   DialogTitle,
-  Input,
-  Label,
-  Select,
-  SelectContent,
-  SelectItem,
-  SelectTrigger,
-  SelectValue,
 } from '@sessionmesh/ui';
 import {
   AlertTriangle,
@@ -41,8 +34,6 @@ import {
   ChevronRight,
   Clock,
   Database,
-  Eye,
-  EyeOff,
   File,
   Folder,
   FolderOpen,
@@ -50,7 +41,9 @@ import {
   Loader2,
   RefreshCw,
   RotateCcw,
+  Save,
   Server,
+  ShieldAlert,
   ShieldCheck,
   Trash2,
   Wrench,
@@ -64,30 +57,91 @@ import {
   formatDateTime,
   formatRelativeTime,
   getConsistencyMeta,
+  getStorageProviderMeta,
   loadUiNonSensitiveMeta,
   saveUiNonSensitiveMeta,
   useUiBannerPrefs,
 } from '../utils/helpers';
+import {
+  isDirectoryPickerSupported,
+  pickAndStoreLocalDirectory,
+  queryLocalDirectoryPermission,
+  requestLocalDirectoryPermission,
+  type DirectoryPermissionState,
+} from '../utils/localDirHandles';
 import { CapabilityReportView } from './CapabilityReportView';
+import { LocalBackupCard } from './LocalBackupCard';
+import {
+  buildStorageConfigFromDraft,
+  createDefaultStorageDraft,
+  draftFromStorageConfig,
+  StorageProviderForm,
+  toNonSensitiveMetaPatch,
+  validateStorageDraft,
+  type StorageFormDraft,
+} from './StorageProviderForm';
 
 interface WebDAVTabProps {
   status: SyncStatusSummary;
   onRefreshStatus: () => Promise<void>;
 }
 
+function normalizeUrlCompare(raw?: string): string {
+  return (raw || '').trim().replace(/\/+$/, '').toLowerCase();
+}
+
+function doesCapabilityReportMatchBackend(
+  report: CapabilityReport | null | undefined,
+  cfg:
+    | { provider: string; url?: string; endpoint?: string; bucket?: string; apiBaseUrl?: string; gistId?: string }
+    | null
+    | undefined,
+  fallbackProvider?: string,
+  fallbackEndpoint?: string,
+): boolean {
+  if (!report) return false;
+  const rUrl = normalizeUrlCompare(report.url);
+  if (!rUrl) return false;
+  if (cfg) {
+    if (cfg.provider === 'webdav') {
+      const target = normalizeUrlCompare(cfg.url);
+      return Boolean(target && rUrl.startsWith(target));
+    }
+    if (cfg.provider === 's3') {
+      const epHost = normalizeUrlCompare(cfg.endpoint).replace(/^https?:\/\//, '');
+      const bucket = (cfg.bucket || '').trim().toLowerCase();
+      return Boolean(epHost && rUrl.includes(epHost) && (!bucket || rUrl.includes(bucket)));
+    }
+    if (cfg.provider === 'github_gist') {
+      const api = normalizeUrlCompare(cfg.apiBaseUrl || 'https://api.github.com');
+      const gid = (cfg.gistId || '').trim().toLowerCase();
+      return Boolean(rUrl.startsWith(api) && rUrl.includes('/gists') && (!gid || rUrl.includes(gid)));
+    }
+    if (cfg.provider === 'local_directory') {
+      return rUrl.startsWith('local://');
+    }
+  }
+  const ep = normalizeUrlCompare(fallbackEndpoint);
+  if (!ep) return false;
+  if (fallbackProvider === 's3') {
+    const hostPart = ep.split(' ')[0].replace(/^https?:\/\//, '');
+    return Boolean(hostPart && rUrl.includes(hostPart));
+  }
+  return rUrl.startsWith(ep) || ep.startsWith(rUrl);
+}
+
 export function WebDAVTab({ status, onRefreshStatus }: WebDAVTabProps) {
   const { isBannerVisible, dismissBanner } = useUiBannerPrefs();
-  // Cached non-sensitive meta & re-test drawer
+  // Cached non-sensitive meta & storage config drawer
   const [lastReport, setLastReport] = useState<CapabilityReport | null>(null);
   const [testPanelOpen, setTestPanelOpen] = useState(false);
-  const [testUrl, setTestUrl] = useState(status.webdavUrl || '');
-  const [testAuthType, setTestAuthType] = useState<WebDAVAuthType>('basic');
-  const [testUsername, setTestUsername] = useState('');
-  const [testPassword, setTestPassword] = useState('');
-  const [testBearer, setTestBearer] = useState('');
-  const [testRootPath, setTestRootPath] = useState('/SessionMesh');
-  const [showSecret, setShowSecret] = useState(false);
+  const [storageDraft, setStorageDraft] = useState<StorageFormDraft>(() =>
+    createDefaultStorageDraft(status.storageProvider ?? 'webdav'),
+  );
   const [testingConn, setTestingConn] = useState(false);
+  const [savingStorage, setSavingStorage] = useState(false);
+  const [localDirPermState, setLocalDirPermState] = useState<DirectoryPermissionState | 'missing' | null>(null);
+  const [restoringDirPerm, setRestoringDirPerm] = useState(false);
 
   // Remote Directory Browser
   const [currentSubPath, setCurrentSubPath] = useState('');
@@ -105,7 +159,7 @@ export function WebDAVTab({ status, onRefreshStatus }: WebDAVTabProps) {
     null,
   );
 
-  // Backups
+  // Cloud Backups
   const [backups, setBackups] = useState<WebDAVResourceStat[]>([]);
   const [loadingBackups, setLoadingBackups] = useState(false);
   const [creatingBackup, setCreatingBackup] = useState(false);
@@ -113,32 +167,56 @@ export function WebDAVTab({ status, onRefreshStatus }: WebDAVTabProps) {
   const [restoringBackup, setRestoringBackup] = useState(false);
 
   useEffect(() => {
-    void loadUiNonSensitiveMeta().then(meta => {
-      if (meta.lastCapabilityReport) setLastReport(meta.lastCapabilityReport);
-      if (meta.webdavUrl) setTestUrl(prev => prev || meta.webdavUrl || '');
-      if (meta.authType) setTestAuthType(meta.authType);
-      if (meta.username) setTestUsername(prev => prev || meta.username || '');
-      if (meta.rootPath) setTestRootPath(meta.rootPath);
+    let active = true;
+    void Promise.all([
+      loadUiNonSensitiveMeta(),
+      unwrapCommand<{
+        storage?: SanitizedStorageProviderConfig | null;
+        webdav?: Omit<WebDAVConfig, 'password' | 'bearerToken'> | null;
+      }>({ type: 'GET_STATUS_SUMMARY' }).catch(() => null),
+    ]).then(([meta, summary]) => {
+      if (!active) return;
+      const cfgFromSummary: SanitizedStorageProviderConfig | null =
+        summary?.storage ?? (summary?.webdav ? { provider: 'webdav', ...summary.webdav } : null);
+      if (
+        meta.lastCapabilityReport &&
+        doesCapabilityReportMatchBackend(
+          meta.lastCapabilityReport,
+          cfgFromSummary,
+          status.storageProvider,
+          status.storageEndpoint,
+        )
+      ) {
+        setLastReport(meta.lastCapabilityReport);
+      } else {
+        setLastReport(null);
+      }
+      setStorageDraft(draftFromStorageConfig(cfgFromSummary, meta));
     });
-    void unwrapCommand<{ webdav?: Omit<WebDAVConfig, 'password' | 'bearerToken'> | null }>({
-      type: 'GET_STATUS_SUMMARY',
-    })
-      .then(res => {
-        const w = res?.webdav;
-        if (!w) return;
-        if (w.url) setTestUrl(w.url);
-        if (w.authType) setTestAuthType(w.authType);
-        if (w.username) setTestUsername(w.username);
-        if (w.rootPath) setTestRootPath(w.rootPath);
-      })
-      .catch(() => undefined);
-  }, []);
+    return () => {
+      active = false;
+    };
+  }, [status.activeSpaceId, status.storageProvider, status.storageEndpoint]);
+
+  const localDirAttention = (status.attentionItems ?? []).find(item => item.kind === 'local_dir_permission_needed');
+  const activeHandleKey =
+    localDirAttention?.handleKey ||
+    (storageDraft.provider === 'local_directory' ? storageDraft.localDirHandleKey : '') ||
+    '';
 
   useEffect(() => {
-    if (status.webdavUrl) {
-      setTestUrl(prev => prev || status.webdavUrl || '');
+    if (status.storageProvider !== 'local_directory' || !activeHandleKey || !isDirectoryPickerSupported()) {
+      setLocalDirPermState(null);
+      return;
     }
-  }, [status.webdavUrl]);
+    let active = true;
+    void queryLocalDirectoryPermission(activeHandleKey, 'readwrite').then(state => {
+      if (active) setLocalDirPermState(state);
+    });
+    return () => {
+      active = false;
+    };
+  }, [status.storageProvider, activeHandleKey]);
 
   const loadDirectory = useCallback(async (subPath: string) => {
     setLoadingDir(true);
@@ -163,7 +241,7 @@ export function WebDAVTab({ status, onRefreshStatus }: WebDAVTabProps) {
       const list = await unwrapCommand<WebDAVResourceStat[]>({ type: 'WEBDAV_LIST_BACKUPS' });
       setBackups(Array.isArray(list) ? list : []);
     } catch (err) {
-      toast.error(`加载备份列表失败：${extractErrorMessage(err)}`);
+      toast.error(`加载远端备份列表失败：${extractErrorMessage(err)}`);
     } finally {
       setLoadingBackups(false);
     }
@@ -176,40 +254,136 @@ export function WebDAVTab({ status, onRefreshStatus }: WebDAVTabProps) {
     }
   }, [status.locked, status.configured, status.activeSpaceId, loadDirectory, loadBackups]);
 
+  const handleRestoreLocalDirPermission = async () => {
+    if (!isDirectoryPickerSupported()) {
+      toast.error('当前浏览器不支持 File System Access API (showDirectoryPicker)');
+      return;
+    }
+    setRestoringDirPerm(true);
+    try {
+      let targetHandleKey = activeHandleKey;
+      let granted = false;
+
+      if (targetHandleKey) {
+        const perm = await requestLocalDirectoryPermission(targetHandleKey, 'readwrite');
+        setLocalDirPermState(perm);
+        if (perm === 'granted') {
+          granted = true;
+        }
+      }
+
+      if (!granted) {
+        const picked = await pickAndStoreLocalDirectory(targetHandleKey || undefined);
+        targetHandleKey = picked.handleKey;
+        setLocalDirPermState(picked.permissionState);
+        if (picked.permissionState === 'granted') {
+          granted = true;
+          if (!activeHandleKey || picked.directoryLabel !== storageDraft.localDirLabel) {
+            const nextDraft: StorageFormDraft = {
+              ...storageDraft,
+              provider: 'local_directory',
+              localDirHandleKey: picked.handleKey,
+              localDirLabel: picked.directoryLabel,
+            };
+            setStorageDraft(nextDraft);
+            await unwrapCommand({
+              type: 'UPDATE_SPACE_STORAGE_CONFIG',
+              storage: buildStorageConfigFromDraft(nextDraft),
+            }).catch(() => undefined);
+          }
+        }
+      }
+
+      if (granted) {
+        await unwrapCommand({
+          type: 'NOTIFY_LOCAL_DIR_PERMISSION_GRANTED',
+          handleKey: targetHandleKey || undefined,
+        });
+        toast.success('已恢复本地同步文件夹读写授权，同步引擎已恢复');
+        await onRefreshStatus();
+        void loadDirectory('');
+        void loadBackups();
+      } else {
+        toast.warning('未能获取目录读写权限，请在浏览器授权弹窗中点击允许');
+      }
+    } catch (err) {
+      const isAbort = err instanceof Error && err.name === 'AbortError';
+      if (!isAbort) {
+        toast.error(`恢复本地文件夹授权失败：${extractErrorMessage(err)}`);
+      }
+    } finally {
+      setRestoringDirPerm(false);
+    }
+  };
+
   const handleRunRetest = async () => {
-    if (!testUrl.trim()) {
-      toast.warning('请填写 WebDAV 地址');
+    const errMsg = validateStorageDraft(storageDraft);
+    if (errMsg) {
+      toast.warning(errMsg);
       return;
     }
     setTestingConn(true);
     try {
-      const isLocal = /^http:\/\/(localhost|127\.0\.0\.1)(:\d+)?(\/|$)/i.test(testUrl.trim());
-      const cfg: WebDAVConfig = {
-        url: testUrl.trim(),
-        authType: testAuthType,
-        username: testAuthType === 'bearer' ? undefined : testUsername.trim(),
-        password: testAuthType === 'bearer' ? undefined : testPassword,
-        bearerToken: testAuthType === 'bearer' ? testBearer.trim() : undefined,
-        rootPath: testRootPath.trim() || '/SessionMesh',
-        allowInsecureLocalhostForTesting: isLocal ? true : undefined,
-      };
+      const cfg = buildStorageConfigFromDraft(storageDraft);
       const report = await unwrapCommand<CapabilityReport>({
-        type: 'TEST_WEBDAV_CONNECTION',
-        config: cfg,
+        type: 'TEST_STORAGE_CONNECTION',
+        storage: cfg,
       });
       setLastReport(report);
+      let nextDraft = storageDraft;
+      if (
+        report.overallOk &&
+        report.resolvedGistId &&
+        storageDraft.provider === 'github_gist' &&
+        !storageDraft.gistId.trim()
+      ) {
+        nextDraft = { ...storageDraft, gistId: report.resolvedGistId };
+        setStorageDraft(nextDraft);
+      }
       await saveUiNonSensitiveMeta({
-        webdavUrl: cfg.url,
-        authType: cfg.authType,
-        rootPath: cfg.rootPath,
-        username: cfg.username,
+        ...toNonSensitiveMetaPatch(nextDraft),
         lastCapabilityReport: report,
       });
-      toast.success(report.overallOk ? '19 项 WebDAV 能力检测通过' : '部分检测项未通过，请展开查看');
+      toast.success(
+        report.overallOk ? `${report.checks.length} 项存储能力检测通过` : '部分检测项未通过，请展开清单查看详情',
+      );
     } catch (err) {
       toast.error(`检测失败：${extractErrorMessage(err)}`);
     } finally {
       setTestingConn(false);
+    }
+  };
+
+  const handleSaveStorageConfig = async () => {
+    const errMsg = validateStorageDraft(storageDraft);
+    if (errMsg) {
+      toast.warning(errMsg);
+      return;
+    }
+    setSavingStorage(true);
+    try {
+      const cfg = buildStorageConfigFromDraft(storageDraft);
+      await unwrapCommand({
+        type: 'UPDATE_SPACE_STORAGE_CONFIG',
+        storage: cfg,
+      });
+      const reportStillMatches = doesCapabilityReportMatchBackend(lastReport, cfg);
+      if (!reportStillMatches) {
+        setLastReport(null);
+      }
+      await saveUiNonSensitiveMeta({
+        ...toNonSensitiveMetaPatch(storageDraft),
+        lastCapabilityReport: reportStillMatches ? lastReport ?? undefined : undefined,
+      });
+      toast.success(`已更新空间存储后端为 ${getStorageProviderMeta(cfg.provider).shortLabel}`);
+      setTestPanelOpen(false);
+      await onRefreshStatus();
+      void loadDirectory('');
+      void loadBackups();
+    } catch (err) {
+      toast.error(`更新存储后端失败：${extractErrorMessage(err)}`);
+    } finally {
+      setSavingStorage(false);
     }
   };
 
@@ -314,27 +488,71 @@ export function WebDAVTab({ status, onRefreshStatus }: WebDAVTabProps) {
   };
 
   const consistency = getConsistencyMeta(status.consistencyLevel ?? lastReport?.consistencyLevel);
+  const providerMeta = getStorageProviderMeta(status.storageProvider);
   const breadcrumbs = currentSubPath.split('/').filter(Boolean);
+  const showLocalDirRecoveryBanner =
+    Boolean(localDirAttention) ||
+    (status.storageProvider === 'local_directory' && localDirPermState !== null && localDirPermState !== 'granted');
+
+  const displayEndpoint =
+    status.storageEndpoint ||
+    status.webdavUrl ||
+    (storageDraft.provider === 'webdav' ? storageDraft.webdavUrl : '') ||
+    '未记录';
 
   return (
     <div className="space-y-5">
+      {/* 1-Click Local Directory Permission Recovery Banner */}
+      {showLocalDirRecoveryBanner ? (
+        <Alert className="border-amber-500/60 bg-amber-500/12">
+          <ShieldAlert className="h-4 w-4 text-amber-600 dark:text-amber-400" />
+          <div className="flex flex-wrap items-center justify-between gap-3">
+            <div className="space-y-1">
+              <AlertTitle className="text-sm font-semibold">
+                {localDirAttention?.title || '本地同步文件夹需要重新授予读写权限'}
+              </AlertTitle>
+              <AlertDescription className="text-xs leading-relaxed">
+                {localDirAttention?.detail ||
+                  '浏览器重启后出于安全策略需要重新确认一次本地目录的读写授权（OneDrive / iCloud / 本地同步目录）。'}
+              </AlertDescription>
+            </div>
+            <Button
+              type="button"
+              size="sm"
+              disabled={restoringDirPerm}
+              onClick={() => void handleRestoreLocalDirPermission()}
+              className="shrink-0">
+              {restoringDirPerm ? (
+                <Loader2 className="mr-1.5 h-3.5 w-3.5 animate-spin" />
+              ) : (
+                <ShieldCheck className="mr-1.5 h-3.5 w-3.5" />
+              )}
+              恢复本地文件夹读写授权
+            </Button>
+          </div>
+        </Alert>
+      ) : null}
+
       {/* Connection Overview */}
       <Card>
         <CardHeader className="pb-3">
           <div className="flex flex-wrap items-start justify-between gap-3">
             <div>
-              <CardTitle className="flex items-center gap-2 text-base">
+              <CardTitle className="flex flex-wrap items-center gap-2 text-base">
                 <Server className="h-5 w-5 text-primary" />
-                WebDAV 连接总览与能力状态
+                存储后端总览与能力状态
+                <Badge variant="info" className="text-[11px]">
+                  {providerMeta.shortLabel}
+                </Badge>
               </CardTitle>
               <CardDescription>
-                所有远端路径均采用不透明空间哈希与设备 UUID，绝不暴露域名或 Cookie 名称。
+                所有写入远端或本地同步目录的对象均采用不透明空间哈希与设备 UUID，绝不暴露域名或 Cookie 名称。
               </CardDescription>
             </div>
             <div className="flex flex-wrap items-center gap-2">
               <Button type="button" variant="outline" size="sm" onClick={() => setTestPanelOpen(prev => !prev)}>
                 <ShieldCheck className="mr-1.5 h-4 w-4" />
-                {testPanelOpen ? '收起检测表单' : '重新测试 19 项能力'}
+                {testPanelOpen ? '收起配置与检测' : '切换后端 / 重新测试'}
               </Button>
             </div>
           </div>
@@ -374,10 +592,10 @@ export function WebDAVTab({ status, onRefreshStatus }: WebDAVTabProps) {
 
           <div className="rounded-lg border border-border bg-background px-3.5 py-2.5 text-xs flex flex-wrap items-center justify-between gap-2">
             <span className="text-muted-foreground">
-              当前地址：<code className="text-foreground break-all">{status.webdavUrl || testUrl || '未记录'}</code>
+              当前存储后端：<strong className="text-foreground">{providerMeta.label}</strong>
             </span>
             <span className="text-muted-foreground">
-              根目录：<code>{testRootPath}</code>
+              端点路径：<code className="text-foreground break-all">{displayEndpoint}</code>
             </span>
           </div>
 
@@ -385,7 +603,7 @@ export function WebDAVTab({ status, onRefreshStatus }: WebDAVTabProps) {
           isBannerVisible('webdav_tab_degraded_warn', 'degraded') ? (
             <Alert className="border-amber-500/40 bg-amber-500/10 pr-24">
               <AlertTriangle className="h-4 w-4 text-amber-600 dark:text-amber-400" />
-              <AlertTitle className="text-sm font-semibold">WebDAV 单写者追加兼容模式提示</AlertTitle>
+              <AlertTitle className="text-sm font-semibold">单写者追加兼容模式提示</AlertTitle>
               <AlertDescription className="text-xs leading-relaxed">{consistency.description}</AlertDescription>
               <div className="absolute right-3 top-3 flex items-center gap-1">
                 <button
@@ -406,80 +624,45 @@ export function WebDAVTab({ status, onRefreshStatus }: WebDAVTabProps) {
           ) : null}
 
           {testPanelOpen ? (
-            <div className="rounded-xl border border-primary/25 bg-primary/[0.02] p-4 space-y-3">
-              <div className="text-xs font-medium text-foreground">
-                输入凭据实时执行 19 项 RFC 4918 WebDAV 能力探测（凭据仅用于本次检测，不落盘明文）：
+            <div className="rounded-xl border border-primary/25 bg-primary/[0.02] p-4 space-y-4">
+              <StorageProviderForm
+                draft={storageDraft}
+                onChange={setStorageDraft}
+                notifyPermissionOnGrant={true}
+                onLocalDirPermissionGranted={onRefreshStatus}
+                secretHint="出于安全原因，已有密钥/Token 不会明文回显；重新测试或保存更新前请重新填入对应密钥（本地文件夹无需密钥）。"
+              />
+              <div className="flex flex-wrap items-center gap-2 pt-1">
+                <Button type="button" variant="outline" size="sm" disabled={testingConn} onClick={handleRunRetest}>
+                  {testingConn ? (
+                    <Loader2 className="mr-1.5 h-4 w-4 animate-spin" />
+                  ) : (
+                    <ShieldCheck className="mr-1.5 h-4 w-4" />
+                  )}
+                  测试当前后端连接
+                </Button>
+                <Button
+                  type="button"
+                  size="sm"
+                  disabled={savingStorage || status.locked}
+                  onClick={handleSaveStorageConfig}>
+                  {savingStorage ? (
+                    <Loader2 className="mr-1.5 h-4 w-4 animate-spin" />
+                  ) : (
+                    <Save className="mr-1.5 h-4 w-4" />
+                  )}
+                  保存并更新当前空间后端
+                </Button>
               </div>
-              <div className="grid gap-3 sm:grid-cols-2">
-                <div className="space-y-1 sm:col-span-2">
-                  <Label className="text-xs">WebDAV URL</Label>
-                  <Input value={testUrl} onChange={e => setTestUrl(e.target.value)} placeholder="https://..." />
-                </div>
-                <div className="space-y-1">
-                  <Label className="text-xs">认证方式</Label>
-                  <Select value={testAuthType} onValueChange={v => setTestAuthType(v as WebDAVAuthType)}>
-                    <SelectTrigger>
-                      <SelectValue />
-                    </SelectTrigger>
-                    <SelectContent>
-                      <SelectItem value="basic">Basic</SelectItem>
-                      <SelectItem value="app_password">应用专用密码</SelectItem>
-                      <SelectItem value="bearer">Bearer Token</SelectItem>
-                    </SelectContent>
-                  </Select>
-                </div>
-                <div className="space-y-1">
-                  <Label className="text-xs">根目录</Label>
-                  <Input value={testRootPath} onChange={e => setTestRootPath(e.target.value)} />
-                </div>
-                {testAuthType === 'bearer' ? (
-                  <div className="space-y-1 sm:col-span-2">
-                    <Label className="text-xs">Bearer Token</Label>
-                    <Input
-                      type={showSecret ? 'text' : 'password'}
-                      value={testBearer}
-                      onChange={e => setTestBearer(e.target.value)}
-                    />
-                  </div>
-                ) : (
-                  <>
-                    <div className="space-y-1">
-                      <Label className="text-xs">用户名</Label>
-                      <Input value={testUsername} onChange={e => setTestUsername(e.target.value)} />
-                    </div>
-                    <div className="space-y-1">
-                      <div className="flex items-center justify-between">
-                        <Label className="text-xs">密码 / 应用专用密码</Label>
-                        <button
-                          type="button"
-                          onClick={() => setShowSecret(p => !p)}
-                          className="text-xs text-muted-foreground hover:text-foreground">
-                          {showSecret ? <EyeOff className="h-3.5 w-3.5" /> : <Eye className="h-3.5 w-3.5" />}
-                        </button>
-                      </div>
-                      <Input
-                        type={showSecret ? 'text' : 'password'}
-                        value={testPassword}
-                        onChange={e => setTestPassword(e.target.value)}
-                      />
-                    </div>
-                  </>
-                )}
-              </div>
-              <Button type="button" size="sm" disabled={testingConn} onClick={handleRunRetest}>
-                {testingConn ? (
-                  <Loader2 className="mr-1.5 h-4 w-4 animate-spin" />
-                ) : (
-                  <ShieldCheck className="mr-1.5 h-4 w-4" />
-                )}
-                开始执行 19 项检测
-              </Button>
             </div>
           ) : null}
 
           {lastReport ? <CapabilityReportView report={lastReport} /> : null}
         </CardContent>
       </Card>
+
+      {/* Universal Local Encrypted Single-File Backup & Restore (.smesh-backup) */}
+      <LocalBackupCard status={status} onRefreshStatus={onRefreshStatus} />
 
       {/* Maintenance Actions */}
       <Card>
@@ -627,9 +810,9 @@ export function WebDAVTab({ status, onRefreshStatus }: WebDAVTabProps) {
             <div>
               <CardTitle className="flex items-center gap-2 text-base">
                 <FolderOpen className="h-5 w-5 text-primary" />
-                远端 WebDAV 目录浏览器
+                远端存储目录浏览器
               </CardTitle>
-              <CardDescription>只读浏览当前加密空间下的目录结构、文件大小与 ETag。</CardDescription>
+              <CardDescription>只读浏览当前加密空间在后端存储下的目录结构、文件大小与 ETag。</CardDescription>
             </div>
             <div className="flex items-center gap-2">
               {currentSubPath ? (
@@ -745,10 +928,10 @@ export function WebDAVTab({ status, onRefreshStatus }: WebDAVTabProps) {
             <div>
               <CardTitle className="flex items-center gap-2 text-base">
                 <Archive className="h-5 w-5 text-primary" />
-                加密备份与一键恢复
+                云端 / 存储后端加密备份与一键恢复
               </CardTitle>
               <CardDescription>
-                备份文件独立保存在远端 <code>backups/</code> 目录，同样使用空间端到端密钥认证加密。
+                备份文件保存在远端或同步目录 <code>backups/</code> 下，同样使用空间端到端密钥认证加密。
               </CardDescription>
             </div>
             <div className="flex items-center gap-2">

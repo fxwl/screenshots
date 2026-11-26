@@ -4,22 +4,38 @@ import type {
   BlacklistEntry,
   BrowserCandidateSite,
   BrowserCookieInput,
+  CapabilityReport,
   ConflictRecord,
   CookieRecord,
+  CreateSessionShareRequest,
+  CreateSessionShareResult,
   CreateSiteAccountOptions,
   CurrentSiteSnapshot,
+  DebugExportRequest,
+  DebugExportResult,
   DeleteScope,
   Device,
   EnvCookieSyncResult,
   EnvCookieSyncRule,
   ExecuteEnvSyncInput,
+  ImportArchiveBackupMode,
+  ImportArchiveBackupResult,
+  ImportSessionShareRequest,
+  ImportSessionShareResult,
+  IndexedDbRecord,
+  InspectedIndexedDbDatabase,
   LocalStorageRecord,
   LogEntry,
   PendingSiteDecision,
   PerDeviceSyncPolicy,
+  RemoteSpacePasswordVerifyResult,
+  RemoteSpaceProbeItem,
   SafetyUndoPoint,
+  SanitizedStorageProviderConfig,
   SessionMeshCommand,
   SessionMeshResponse,
+  SessionSharePreview,
+  SessionStorageRecord,
   SiteDecisionAction,
   SiteRuleOverride,
   SiteSummaryView,
@@ -27,6 +43,7 @@ import type {
   SpaceAuthorityMode,
   SpaceSettings,
   SsoDomainGroup,
+  StorageProviderConfig,
   SyncEvent,
   SyncRuleUpdatePayload,
   SyncStatusSummary,
@@ -39,6 +56,7 @@ export interface StatusSummaryWithSettings {
   currentSite?: CurrentSiteSnapshot | null;
   settings?: SpaceSettings;
   webdav?: Omit<WebDAVConfig, 'password' | 'bearerToken'> | null;
+  storage?: SanitizedStorageProviderConfig | null;
 }
 
 export interface AddManagedSitesResult {
@@ -393,6 +411,159 @@ export const sidePanelApi = {
 
   applyUndoPoint(undoId: string): Promise<void> {
     return runCommand<void>({ type: 'APPLY_UNDO_POINT', undoId });
+  },
+
+  exportDebugState(request: DebugExportRequest): Promise<DebugExportResult> {
+    return runCommand<DebugExportResult>({ type: 'EXPORT_DEBUG_STATE', request });
+  },
+
+  toggleWatchedCookie(
+    siteKey: string,
+    cookieName: string,
+    watched: boolean,
+  ): Promise<{ watchedCookieNames: string[] }> {
+    return runCommand<{ watchedCookieNames: string[] }>({
+      type: 'TOGGLE_WATCHED_COOKIE',
+      siteKey,
+      cookieName,
+      watched,
+    });
+  },
+
+  createSessionShare(request: CreateSessionShareRequest): Promise<CreateSessionShareResult> {
+    return runCommand<CreateSessionShareResult>({ type: 'CREATE_SESSION_SHARE', request });
+  },
+
+  previewSessionShare(code: string, passphrase: string): Promise<SessionSharePreview> {
+    return runCommand<SessionSharePreview>({ type: 'PREVIEW_SESSION_SHARE', code, passphrase });
+  },
+
+  importSessionShare(request: ImportSessionShareRequest): Promise<ImportSessionShareResult> {
+    return runCommand<ImportSessionShareResult>({ type: 'IMPORT_SESSION_SHARE', request });
+  },
+
+  getSessionStorageRecords(filter?: {
+    siteKey?: string;
+    origin?: string;
+    trackId?: string;
+  }): Promise<SessionStorageRecord[]> {
+    return runCommand<SessionStorageRecord[]>({
+      type: 'GET_SESSION_STORAGE_RECORDS',
+      siteKey: filter?.siteKey,
+      origin: filter?.origin,
+      trackId: filter?.trackId,
+    });
+  },
+
+  upsertSessionStorageItem(
+    origin: string,
+    key: string,
+    value: string,
+    trackId?: string,
+  ): Promise<SessionStorageRecord> {
+    return runCommand<SessionStorageRecord>({
+      type: 'UPSERT_SESSION_STORAGE_ITEM',
+      origin,
+      key,
+      value,
+      trackId,
+    });
+  },
+
+  applySessionStorageItem(logicalId: string): Promise<SessionStorageRecord> {
+    return runCommand<SessionStorageRecord>({ type: 'APPLY_SESSION_STORAGE_ITEM', logicalId });
+  },
+
+  deleteSessionStorageItems(logicalIds: string[], scope: DeleteScope): Promise<void> {
+    return runCommand<void>({ type: 'DELETE_SESSION_STORAGE_ITEMS', logicalIds, scope });
+  },
+
+  inspectPageIndexedDb(
+    origin: string,
+  ): Promise<{ available: boolean; databases: InspectedIndexedDbDatabase[]; reason?: string }> {
+    return runCommand<{ available: boolean; databases: InspectedIndexedDbDatabase[]; reason?: string }>({
+      type: 'INSPECT_PAGE_INDEXED_DB',
+      origin,
+    });
+  },
+
+  getIndexedDbRecords(filter?: {
+    siteKey?: string;
+    origin?: string;
+    trackId?: string;
+    dbName?: string;
+  }): Promise<IndexedDbRecord[]> {
+    return runCommand<IndexedDbRecord[]>({
+      type: 'GET_INDEXED_DB_RECORDS',
+      siteKey: filter?.siteKey,
+      origin: filter?.origin,
+      trackId: filter?.trackId,
+      dbName: filter?.dbName,
+    });
+  },
+
+  applyIndexedDbRecord(logicalId: string): Promise<IndexedDbRecord> {
+    return runCommand<IndexedDbRecord>({ type: 'APPLY_INDEXED_DB_RECORD', logicalId });
+  },
+
+  deleteIndexedDbRecords(logicalIds: string[], scope: DeleteScope): Promise<void> {
+    return runCommand<void>({ type: 'DELETE_INDEXED_DB_RECORDS', logicalIds, scope });
+  },
+
+  capturePageExtendedStorageNow(origin: string): Promise<{ capturedSession: number; capturedIndexedDb: number }> {
+    return runCommand<{ capturedSession: number; capturedIndexedDb: number }>({
+      type: 'CAPTURE_PAGE_EXTENDED_STORAGE_NOW',
+      origin,
+    });
+  },
+
+  testStorageConnection(storage: StorageProviderConfig): Promise<CapabilityReport> {
+    return runCommand<CapabilityReport>({ type: 'TEST_STORAGE_CONNECTION', storage });
+  },
+
+  probeStorageSpaces(storage: StorageProviderConfig): Promise<RemoteSpaceProbeItem[]> {
+    return runCommand<RemoteSpaceProbeItem[]>({ type: 'PROBE_STORAGE_SPACES', storage });
+  },
+
+  verifyStorageSpacePassword(
+    storage: StorageProviderConfig,
+    spaceId: string,
+    encryptionPassword: string,
+  ): Promise<RemoteSpacePasswordVerifyResult> {
+    return runCommand<RemoteSpacePasswordVerifyResult>({
+      type: 'VERIFY_STORAGE_SPACE_PASSWORD',
+      storage,
+      spaceId,
+      encryptionPassword,
+    });
+  },
+
+  updateSpaceStorageConfig(storage: StorageProviderConfig): Promise<{ updated: boolean }> {
+    return runCommand<{ updated: boolean }>({ type: 'UPDATE_SPACE_STORAGE_CONFIG', storage });
+  },
+
+  notifyLocalDirPermissionGranted(handleKey?: string): Promise<{ ok: boolean }> {
+    return runCommand<{ ok: boolean }>({ type: 'NOTIFY_LOCAL_DIR_PERMISSION_GRANTED', handleKey });
+  },
+
+  exportArchiveBackup(passphrase?: string): Promise<{ base64: string; suggestedFilename: string; byteLength: number }> {
+    return runCommand<{ base64: string; suggestedFilename: string; byteLength: number }>({
+      type: 'EXPORT_ARCHIVE_BACKUP',
+      passphrase,
+    });
+  },
+
+  importArchiveBackup(
+    base64: string,
+    mode: ImportArchiveBackupMode,
+    passphrase?: string,
+  ): Promise<ImportArchiveBackupResult> {
+    return runCommand<ImportArchiveBackupResult>({
+      type: 'IMPORT_ARCHIVE_BACKUP',
+      base64,
+      mode,
+      passphrase,
+    });
   },
 };
 

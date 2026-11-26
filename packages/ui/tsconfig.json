@@ -12,7 +12,7 @@
       "@/components/*": ["./src/components/*"],
       "@libs/*": ["./src/libs/*"]
     },
-    "types": ["chrome"],
+    "types": ["chrome"]
   },
   "include": ["src/**/*"]
 }

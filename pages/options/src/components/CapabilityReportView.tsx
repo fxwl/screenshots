@@ -74,7 +74,7 @@ export function CapabilityReportView({ report, defaultExpanded = false }: Capabi
               <AlertTriangle className="h-5 w-5 text-destructive" />
             )}
             <span className="font-semibold text-sm">
-              {report.overallOk ? 'WebDAV 连接检测通过' : 'WebDAV 连接检测未通过'}
+              {report.overallOk ? '存储连接能力检测通过' : '存储连接能力检测未通过'}
             </span>
             <Badge variant={consistency.variant}>{consistency.shortLabel}</Badge>
           </div>

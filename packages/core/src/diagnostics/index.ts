@@ -40,8 +40,9 @@ export function scrubSensitiveText(text: string, extraSecrets?: string[]): strin
     }
   }
 
-  // 2. Pairing codes: smesh://pair/v1.<base64url>
+  // 2. Pairing & session-share codes: smesh://pair/v1.<base64url>, smesh://share/v1.<base64url>
   out = out.replace(/smesh:\/\/pair\/[^\s"'<>]+/gi, 'smesh://pair/[REDACTED]');
+  out = out.replace(/smesh:\/\/share\/[^\s"'<>]+/gi, 'smesh://share/[REDACTED]');
 
   // 3. URL embedded credentials: https://user:pass@host
   out = out.replace(/(https?:\/\/)([^/\s:@]+):([^/\s@]+)@/gi, '$1[REDACTED]@');
@@ -65,13 +66,13 @@ export function scrubSensitiveText(text: string, extraSecrets?: string[]): strin
 
   // 7. JSON-like sensitive fields
   out = out.replace(
-    /("(?:password|passwd|encryptionPassword|bearerToken|passphrase|currentDekBase64|dek|dekBase64|secret|cookieValue|authorization)"\s*:\s*)"[^"]*"/gi,
+    /("(?:password|passwd|encryptionPassword|bearerToken|passphrase|currentDekBase64|dek|dekBase64|secret|secretAccessKey|sessionToken|personalAccessToken|cookieValue|authorization)"\s*:\s*)"[^"]*"/gi,
     '$1"[REDACTED]"',
   );
 
   // 8. Key=value or key: value sensitive tokens in free-form text
   out = out.replace(
-    /(\b(?:password|passwd|encryptionPassword|bearerToken|passphrase|secret|cookieValue)\s*[:=]\s*)(?!\[REDACTED\])([^\s,;'"}\]]+)/gi,
+    /(\b(?:password|passwd|encryptionPassword|bearerToken|passphrase|secret|secretAccessKey|sessionToken|personalAccessToken|cookieValue)\s*[:=]\s*)(?!\[REDACTED\])([^\s,;'"}\]]+)/gi,
     '$1[REDACTED]',
   );
 
@@ -303,13 +304,18 @@ export function toStructuredError(
 
   // URL / HTTPS validation errors
   if (/https|invalid url|insecure/i.test(combinedText)) {
+    const providerUrlSuggestion = obj.code?.startsWith('GIST_')
+      ? '请填写合法的 HTTPS GitHub API 地址（默认禁止非加密 HTTP）。'
+      : obj.code?.startsWith('S3_')
+        ? '请填写合法的 HTTPS S3 / 对象存储端点地址（默认禁止非加密 HTTP）。'
+        : '请填写合法的 HTTPS WebDAV 服务地址（默认禁止非加密 HTTP）。';
     return {
       code: obj.code || 'ERR_INVALID_URL',
       phase: obj.phase || 'config',
       message,
       target: safeTarget,
       retryable: false,
-      suggestion: '请填写合法的 HTTPS WebDAV 服务地址（默认禁止非加密 HTTP）。',
+      suggestion: providerUrlSuggestion,
       timestamp: now,
     };
   }
@@ -324,6 +330,14 @@ export function toStructuredError(
     timestamp: now,
   };
 }
+
+export {
+  DEFAULT_COOKIE_EXPIRY_WARNING_SETTINGS,
+  isShortLivedCsrfOrAntiBotCookie,
+  isLikelyAuthCookie,
+  evaluateSiteExpiryHealth,
+  type EvaluateSiteExpiryHealthParams,
+} from './expiryMonitor';
 
 export class DiagnosticLogger {
   private readonly storage: StorageBackend;

@@ -5,6 +5,22 @@
   },
   "extensionDescription": {
     "description": "Extension description",
-    "message": "Multi-device browser login state auto-sync over WebDAV with E2E encryption"
+    "message": "Multi-device browser login state auto-sync across local sync folders, GitHub Gist, S3/R2 & WebDAV with E2E encryption"
+  },
+  "cmdRotateAccountNext": {
+    "description": "Shortcut description for switching to the next account on the current site",
+    "message": "Switch to next account on current site"
+  },
+  "cmdRotateAccountPrev": {
+    "description": "Shortcut description for switching to the previous account on the current site",
+    "message": "Switch to previous account on current site"
+  },
+  "cmdSyncCurrentSite": {
+    "description": "Shortcut description for syncing the current site immediately",
+    "message": "Sync current site immediately"
+  },
+  "cmdCopyCurrentCurl": {
+    "description": "Shortcut description for copying the current site request as cURL",
+    "message": "Copy current site as cURL command"
   }
 }

@@ -1,5 +1,72 @@
-import type { DeviceStatus, SiteBindingState, SyncTimingMode } from '@sessionmesh/core';
+import type { DeviceStatus, ExpiryHealthStatus, SiteBindingState, SyncTimingMode } from '@sessionmesh/core';
 import { useCallback, useEffect, useState } from 'react';
+
+export const SENSITIVE_CLIPBOARD_WARNING = '已复制到剪贴板（含敏感登录态，切勿提交到代码仓库）';
+
+export function formatRemainingDuration(ms: number): string {
+  if (!Number.isFinite(ms) || ms <= 0) return '已过期';
+  const mins = Math.floor(ms / 60_000);
+  if (mins < 1) return '剩余 <1m';
+  if (mins < 60) return `剩余 ${mins}m`;
+  const hours = Math.floor(mins / 60);
+  if (hours < 24) return `剩余 ${hours}h`;
+  const days = Math.floor(hours / 24);
+  return `剩余 ${days}d`;
+}
+
+export function getExpiryBadgeMeta(status: ExpiryHealthStatus): {
+  label: string;
+  variant: 'success' | 'warning' | 'destructive' | 'info' | 'secondary';
+} {
+  switch (status) {
+    case 'healthy':
+      return { label: '状态健康', variant: 'success' };
+    case 'expiring_soon':
+      return { label: '即将过期', variant: 'warning' };
+    case 'critical':
+      return { label: '即将失效', variant: 'destructive' };
+    case 'expired':
+      return { label: '已过期', variant: 'destructive' };
+    default:
+      return { label: '正常', variant: 'secondary' };
+  }
+}
+
+export async function copyTextToClipboard(text: string): Promise<boolean> {
+  try {
+    if (navigator.clipboard && navigator.clipboard.writeText) {
+      await navigator.clipboard.writeText(text);
+      return true;
+    }
+  } catch {
+    // Fallback below
+  }
+  try {
+    const textarea = document.createElement('textarea');
+    textarea.value = text;
+    textarea.style.position = 'fixed';
+    textarea.style.opacity = '0';
+    document.body.appendChild(textarea);
+    textarea.select();
+    const ok = document.execCommand('copy');
+    document.body.removeChild(textarea);
+    return ok;
+  } catch {
+    return false;
+  }
+}
+
+export function downloadTextFile(filename: string, content: string, mimeType = 'text/plain;charset=utf-8'): void {
+  const blob = new Blob([content], { type: mimeType });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url;
+  a.download = filename;
+  document.body.appendChild(a);
+  a.click();
+  document.body.removeChild(a);
+  setTimeout(() => URL.revokeObjectURL(url), 1000);
+}
 
 export function formatRelativeTime(ts?: number): string {
   if (!ts) return '尚未同步';
@@ -73,20 +140,165 @@ export function getBindingBadge(state?: SiteBindingState): {
 } {
   switch (state) {
     case 'AUTO_BOUND':
-      return { label: '自动绑定', variant: 'success' };
+      return { label: '同步中', variant: 'success' };
     case 'USER_BOUND':
-      return { label: '手动跟随', variant: 'info' };
+      return { label: '跟随同步', variant: 'info' };
     case 'INDEPENDENT':
-      return { label: '独立轨道', variant: 'outline' };
+      return { label: '仅本机独立', variant: 'outline' };
     case 'PENDING_CHOICE':
       return { label: '待确认', variant: 'warning' };
     case 'BLACKLISTED':
-      return { label: '黑名单', variant: 'destructive' };
+      return { label: '已排除', variant: 'destructive' };
     case 'UNMANAGED':
-      return { label: '未纳管', variant: 'secondary' };
+      return { label: '未开启同步', variant: 'secondary' };
     default:
-      return { label: '未纳管', variant: 'secondary' };
+      return { label: '未开启同步', variant: 'secondary' };
   }
+}
+
+export interface PopupUxPrefs {
+  checklistDismissed: boolean;
+  checklistCollapsed: boolean;
+  popupTourDone: boolean;
+  popupDeveloperMode: boolean;
+  onboardingExpertMode: boolean;
+  completedGuideTasks: Record<string, boolean>;
+}
+
+export const UX_ONBOARDING_PREFS_KEY = 'sessionmesh_ux_onboarding_prefs_v1';
+const UX_ONBOARDING_PREFS_EVENT = 'sessionmesh:ux-onboarding-prefs-updated';
+
+const DEFAULT_POPUP_UX_PREFS: PopupUxPrefs = {
+  checklistDismissed: false,
+  checklistCollapsed: false,
+  popupTourDone: false,
+  popupDeveloperMode: false,
+  onboardingExpertMode: false,
+  completedGuideTasks: {},
+};
+
+function normalizePopupUxPrefs(raw: unknown): PopupUxPrefs {
+  if (!raw || typeof raw !== 'object') {
+    return { ...DEFAULT_POPUP_UX_PREFS, completedGuideTasks: {} };
+  }
+  const obj = raw as Partial<PopupUxPrefs>;
+  const tasks: Record<string, boolean> = {};
+  if (obj.completedGuideTasks && typeof obj.completedGuideTasks === 'object') {
+    for (const [k, v] of Object.entries(obj.completedGuideTasks)) {
+      if (v) tasks[k] = true;
+    }
+  }
+  return {
+    checklistDismissed: Boolean(obj.checklistDismissed),
+    checklistCollapsed: Boolean(obj.checklistCollapsed),
+    popupTourDone: Boolean(obj.popupTourDone),
+    popupDeveloperMode: Boolean(obj.popupDeveloperMode),
+    onboardingExpertMode: Boolean(obj.onboardingExpertMode),
+    completedGuideTasks: tasks,
+  };
+}
+
+export async function loadPopupUxPrefs(): Promise<PopupUxPrefs> {
+  try {
+    if (typeof chrome !== 'undefined' && chrome.storage?.local) {
+      const res = await chrome.storage.local.get(UX_ONBOARDING_PREFS_KEY);
+      if (res && res[UX_ONBOARDING_PREFS_KEY] !== undefined) {
+        return normalizePopupUxPrefs(res[UX_ONBOARDING_PREFS_KEY]);
+      }
+    }
+    if (typeof window !== 'undefined' && window.localStorage) {
+      const raw = window.localStorage.getItem(UX_ONBOARDING_PREFS_KEY);
+      if (raw) return normalizePopupUxPrefs(JSON.parse(raw));
+    }
+  } catch {
+    // fallback
+  }
+  return { ...DEFAULT_POPUP_UX_PREFS, completedGuideTasks: {} };
+}
+
+export async function patchPopupUxPrefs(patch: Partial<PopupUxPrefs>): Promise<PopupUxPrefs> {
+  const prev = await loadPopupUxPrefs();
+  const next = normalizePopupUxPrefs({
+    ...prev,
+    ...patch,
+    completedGuideTasks: patch.completedGuideTasks
+      ? { ...prev.completedGuideTasks, ...patch.completedGuideTasks }
+      : prev.completedGuideTasks,
+  });
+  try {
+    if (typeof chrome !== 'undefined' && chrome.storage?.local) {
+      await chrome.storage.local.set({ [UX_ONBOARDING_PREFS_KEY]: next });
+    }
+  } catch {
+    // ignore
+  }
+  try {
+    if (typeof window !== 'undefined' && window.localStorage) {
+      window.localStorage.setItem(UX_ONBOARDING_PREFS_KEY, JSON.stringify(next));
+    }
+  } catch {
+    // ignore
+  }
+  if (typeof window !== 'undefined') {
+    window.dispatchEvent(new CustomEvent<PopupUxPrefs>(UX_ONBOARDING_PREFS_EVENT, { detail: next }));
+  }
+  return next;
+}
+
+export function usePopupUxPrefs() {
+  const [prefs, setPrefs] = useState<PopupUxPrefs>(() => ({
+    ...DEFAULT_POPUP_UX_PREFS,
+    completedGuideTasks: {},
+  }));
+  const [ready, setReady] = useState(false);
+
+  useEffect(() => {
+    let active = true;
+    void loadPopupUxPrefs().then(loaded => {
+      if (active) {
+        setPrefs(loaded);
+        setReady(true);
+      }
+    });
+
+    const handleCustom = (event: Event) => {
+      const detail = (event as CustomEvent<PopupUxPrefs>).detail;
+      if (detail) setPrefs(normalizePopupUxPrefs(detail));
+    };
+    const handleStorage = (changes: Record<string, chrome.storage.StorageChange>, areaName: string) => {
+      if (areaName === 'local' && changes[UX_ONBOARDING_PREFS_KEY]) {
+        setPrefs(normalizePopupUxPrefs(changes[UX_ONBOARDING_PREFS_KEY].newValue));
+      }
+    };
+
+    if (typeof window !== 'undefined') {
+      window.addEventListener(UX_ONBOARDING_PREFS_EVENT, handleCustom);
+    }
+    if (typeof chrome !== 'undefined' && chrome.storage?.onChanged) {
+      chrome.storage.onChanged.addListener(handleStorage);
+    }
+    return () => {
+      active = false;
+      if (typeof window !== 'undefined') {
+        window.removeEventListener(UX_ONBOARDING_PREFS_EVENT, handleCustom);
+      }
+      if (typeof chrome !== 'undefined' && chrome.storage?.onChanged) {
+        chrome.storage.onChanged.removeListener(handleStorage);
+      }
+    };
+  }, []);
+
+  const updatePopupUxPrefs = useCallback(async (patch: Partial<PopupUxPrefs>) => {
+    const next = await patchPopupUxPrefs(patch);
+    setPrefs(next);
+    return next;
+  }, []);
+
+  return {
+    prefs,
+    ready,
+    updatePopupUxPrefs,
+  };
 }
 
 export function extractFallbackHost(url?: string): string | null {

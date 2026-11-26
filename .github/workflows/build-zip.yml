@@ -41,30 +41,47 @@ jobs:
       - name: Run tests
         run: pnpm test
 
-      - name: Build and package extension
+      - name: Build and package Chromium & Edge extension
         run: pnpm zip
 
-      - name: Prepare release asset filename
+      - name: Prepare Chromium release asset
         id: asset
         shell: bash
         run: |
-          ZIP_FILE=$(ls dist-zip/*.zip | head -n 1)
+          ZIP_FILE=$(ls dist-zip/extension-1*.zip dist-zip/extension-*.zip 2>/dev/null | grep -v 'firefox' | head -n 1)
           VERSION=$(node -p "require('./package.json').version")
           if [[ "${GITHUB_REF_TYPE}" == "tag" ]]; then
             ASSET_NAME="sessionmesh-${GITHUB_REF_NAME}.zip"
+            FF_ASSET_NAME="sessionmesh-firefox-${GITHUB_REF_NAME}.xpi"
+            SRC_ASSET_NAME="sessionmesh-source-${GITHUB_REF_NAME}.zip"
           else
             ASSET_NAME="sessionmesh-v${VERSION}-latest.zip"
+            FF_ASSET_NAME="sessionmesh-firefox-v${VERSION}-latest.xpi"
+            SRC_ASSET_NAME="sessionmesh-source-v${VERSION}-latest.zip"
           fi
           cp "$ZIP_FILE" "dist-zip/${ASSET_NAME}"
+          git archive --format=zip -o "dist-zip/${SRC_ASSET_NAME}" HEAD
           echo "zip_path=dist-zip/${ASSET_NAME}" >> "$GITHUB_OUTPUT"
-          echo "asset_name=${ASSET_NAME}" >> "$GITHUB_OUTPUT"
+          echo "ff_asset_name=${FF_ASSET_NAME}" >> "$GITHUB_OUTPUT"
+          echo "ff_path=dist-zip/${FF_ASSET_NAME}" >> "$GITHUB_OUTPUT"
+          echo "src_path=dist-zip/${SRC_ASSET_NAME}" >> "$GITHUB_OUTPUT"
           echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
 
-      - name: Upload extension artifact
+      - name: Build and package Firefox MV3 extension
+        shell: bash
+        run: |
+          pnpm zip:firefox
+          XPI_FILE=$(ls dist-zip/extension-firefox-*.xpi | head -n 1)
+          cp "$XPI_FILE" "${{ steps.asset.outputs.ff_path }}"
+
+      - name: Upload extension artifacts
         uses: actions/upload-artifact@v4
         with:
           name: sessionmesh-extension-${{ steps.asset.outputs.version }}
-          path: ${{ steps.asset.outputs.zip_path }}
+          path: |
+            ${{ steps.asset.outputs.zip_path }}
+            ${{ steps.asset.outputs.ff_path }}
+            ${{ steps.asset.outputs.src_path }}
           retention-days: 30
 
       - name: Publish rolling latest build on main push
@@ -78,10 +95,13 @@ jobs:
             Automated build from `main` commit `${{ github.sha }}`.
 
             - Passed `pnpm lint`, `pnpm type-check`, and `pnpm test`
-            - Compatible with Chrome & Microsoft Edge (Manifest V3)
+            - Includes Chromium/Edge `.zip`, Firefox MV3 `.xpi`, and AMO review source archive
           prerelease: true
           make_latest: 'false'
-          files: ${{ steps.asset.outputs.zip_path }}
+          files: |
+            ${{ steps.asset.outputs.zip_path }}
+            ${{ steps.asset.outputs.ff_path }}
+            ${{ steps.asset.outputs.src_path }}
 
       - name: Publish official versioned GitHub Release on tag push
         if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
@@ -91,4 +111,7 @@ jobs:
           generate_release_notes: true
           prerelease: false
           make_latest: 'true'
-          files: ${{ steps.asset.outputs.zip_path }}
+          files: |
+            ${{ steps.asset.outputs.zip_path }}
+            ${{ steps.asset.outputs.ff_path }}
+            ${{ steps.asset.outputs.src_path }}

@@ -569,7 +569,7 @@ describe('Data Management, Security & System Acceptance Suite (D-001 .. D-017)',
     expect(code.startsWith('smesh://pair/v1.')).toBe(true);
     const decoded = await devB.engine.decodePairingCode(code, 'pair-pass-777');
     expect(decoded.spaceId).toBe(SPACE_ID);
-    expect(decoded.webdav.url).toBe(webdav.url);
+    expect(decoded.webdav?.url).toBe(webdav.url);
     expect(decoded.fromDeviceName).toBe('Device-A');
 
     await devB.engine.saveAndJoinSpace({

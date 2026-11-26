@@ -1,3 +1,5 @@
+import { localeStorage, type ResolvedLocale } from '@sessionmesh/storage';
+
 export const MENU_IDS = {
   ROOT: 'sessionmesh-root',
   OPEN_SIDEPANEL: 'sessionmesh-open-sidepanel',
@@ -17,6 +19,16 @@ export interface ContextMenuActionHandlers {
   onBlacklistCurrentSite: (tabUrl?: string) => Promise<void>;
 }
 
+interface FirefoxBrowserNamespace {
+  sidebarAction?: {
+    open?: () => Promise<void>;
+  };
+}
+
+function getFirefoxSidebarAction(): FirefoxBrowserNamespace['sidebarAction'] {
+  return (globalThis as unknown as { browser?: FirefoxBrowserNamespace }).browser?.sidebarAction;
+}
+
 let listenerRegistered = false;
 
 function createMenuSafe(props: chrome.contextMenus.CreateProperties): void {
@@ -30,10 +42,14 @@ function createMenuSafe(props: chrome.contextMenus.CreateProperties): void {
 }
 
 /**
- * Idempotently creates the SessionMesh right-click context menu hierarchy.
+ * Idempotently creates the SessionMesh right-click context menu hierarchy
+ * in the active UI language (`zh-CN` or `en`), supporting both Chromium Side Panel and Firefox Sidebar.
  */
-export function setupContextMenus(): void {
+export function setupContextMenus(locale?: ResolvedLocale): void {
   if (typeof chrome === 'undefined' || !chrome.contextMenus) return;
+  const isEn = (locale ?? localeStorage.resolve()) === 'en';
+  const canOpenSidebar =
+    typeof chrome.sidePanel?.open === 'function' || typeof getFirefoxSidebarAction()?.open === 'function';
 
   try {
     chrome.contextMenus.removeAll(() => {
@@ -41,15 +57,15 @@ export function setupContextMenus(): void {
 
       createMenuSafe({
         id: MENU_IDS.ROOT,
-        title: 'SessionMesh 多设备同步',
+        title: isEn ? 'SessionMesh Multi-Device Sync' : 'SessionMesh 多设备同步',
         contexts: ['all'],
       });
 
-      if (typeof chrome.sidePanel?.open === 'function') {
+      if (canOpenSidebar) {
         createMenuSafe({
           id: MENU_IDS.OPEN_SIDEPANEL,
           parentId: MENU_IDS.ROOT,
-          title: '打开 SessionMesh 侧边栏管理台',
+          title: isEn ? 'Open SessionMesh Side Panel' : '打开 SessionMesh 侧边栏管理台',
           contexts: ['all'],
         });
       }
@@ -57,42 +73,42 @@ export function setupContextMenus(): void {
       createMenuSafe({
         id: MENU_IDS.ADD_MANAGED_SITE,
         parentId: MENU_IDS.ROOT,
-        title: '➕ 将当前网站纳入 SessionMesh 同步管理',
+        title: isEn ? '➕ Enable Auto-Sync for Current Site' : '➕ 开启当前网站的自动同步',
         contexts: ['all'],
       });
 
       createMenuSafe({
         id: MENU_IDS.ROTATE_SITE_ACCOUNT,
         parentId: MENU_IDS.ROOT,
-        title: '🔄 轮换当前网站下一个账号',
+        title: isEn ? '🔄 Switch to Next Account on Site' : '🔄 切换当前网站下一个账号',
         contexts: ['all'],
       });
 
       createMenuSafe({
         id: MENU_IDS.SYNC_CURRENT_SITE,
         parentId: MENU_IDS.ROOT,
-        title: '立即同步当前网站',
+        title: isEn ? 'Sync Current Site Now' : '立即同步当前网站',
         contexts: ['all'],
       });
 
       createMenuSafe({
         id: MENU_IDS.TOGGLE_PAUSE,
         parentId: MENU_IDS.ROOT,
-        title: '暂停 / 恢复全局同步',
+        title: isEn ? 'Pause / Resume Global Sync' : '暂停 / 恢复全局同步',
         contexts: ['all'],
       });
 
       createMenuSafe({
         id: MENU_IDS.BLACKLIST_CURRENT_SITE,
         parentId: MENU_IDS.ROOT,
-        title: '将当前网站加入黑名单',
+        title: isEn ? '🚫 Exclude Current Site (Do Not Sync)' : '🚫 排除当前网站（不同步）',
         contexts: ['all'],
       });
 
       createMenuSafe({
         id: MENU_IDS.OPEN_OPTIONS,
         parentId: MENU_IDS.ROOT,
-        title: '打开 SessionMesh 控制中心',
+        title: isEn ? 'Open SessionMesh Control Center' : '打开 SessionMesh 控制中心',
         contexts: ['all'],
       });
     });
@@ -116,6 +132,15 @@ export function registerContextMenuListener(handlers: ContextMenuActionHandlers)
           chrome.sidePanel.open({ windowId: tab.windowId }).catch(err => {
             console.warn('SessionMesh sidePanel.open failed:', err);
           });
+        } else {
+          const ffSidebar = getFirefoxSidebarAction();
+          if (typeof ffSidebar?.open === 'function') {
+            ffSidebar.open().catch(err => {
+              console.warn('SessionMesh sidebarAction.open failed:', err);
+            });
+          } else if (chrome.tabs?.create && chrome.runtime?.getURL) {
+            chrome.tabs.create({ url: chrome.runtime.getURL('sidepanel/index.html') });
+          }
         }
         break;
       }

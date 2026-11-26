@@ -1,6 +1,7 @@
 {
   "$schema": "https://turbo.build/schema.json",
   "ui": "tui",
+  "globalPassThroughEnv": ["__FIREFOX__", "__DEV__", "BROWSER"],
   "tasks": {
     "dev": {
       "dependsOn": ["^build"],

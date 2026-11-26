@@ -2,8 +2,11 @@ import type {
   BrowserCookieInput,
   CookieRecord,
   CookieSyncStatus,
+  DebugExportFormat,
   DeviceStatus,
   EventOperation,
+  ExpiryHealthStatus,
+  ObjectType,
   PerDeviceSyncPolicy,
   SameSiteValue,
   SiteBindingState,
@@ -13,6 +16,230 @@ import type {
 } from '@sessionmesh/shared';
 
 export type BadgeTone = 'neutral' | 'primary' | 'success' | 'warning' | 'danger' | 'info';
+
+export interface AccountColorPreset {
+  value: string;
+  label: string;
+}
+
+export const ACCOUNT_COLOR_PRESETS: ReadonlyArray<AccountColorPreset> = [
+  { value: '#dc2626', label: '生产红' },
+  { value: '#d97706', label: '测试橙' },
+  { value: '#2563eb', label: '开发蓝' },
+  { value: '#16a34a', label: '个人绿' },
+  { value: '#7c3aed', label: '临时/只读紫' },
+  { value: '#0891b2', label: '灰度青' },
+  { value: '#475569', label: '默认灰' },
+];
+
+export const SENSITIVE_CLIPBOARD_WARNING = '已复制到剪贴板（含敏感登录态，切勿提交到代码仓库）';
+
+export interface DebugExportOptionMeta {
+  format: DebugExportFormat;
+  label: string;
+  shortLabel: string;
+  hint: string;
+}
+
+export const DEBUG_EXPORT_FORMAT_OPTIONS: ReadonlyArray<DebugExportOptionMeta> = [
+  { format: 'curl', label: 'curl 命令', shortLabel: 'curl (.sh)', hint: '命令行复现请求' },
+  { format: 'fetch', label: 'fetch 请求片段', shortLabel: 'fetch (.js)', hint: 'Node.js / 服务端脚本' },
+  { format: 'cookie_header', label: 'Cookie 请求头', shortLabel: 'Cookie Header (.txt)', hint: 'name=value; ...' },
+  { format: 'headers_json', label: 'Headers JSON', shortLabel: 'Headers JSON', hint: '{ "Cookie": "..." }' },
+  {
+    format: 'playwright_storage_state',
+    label: 'Playwright storageState.json',
+    shortLabel: 'storageState.json',
+    hint: '自动化测试复用登录态',
+  },
+  {
+    format: 'postman_apifox',
+    label: 'Postman / Apifox JSON',
+    shortLabel: 'Postman / Apifox (.json)',
+    hint: '接口调试导入',
+  },
+  {
+    format: 'netscape_cookies_txt',
+    label: 'Netscape cookies.txt',
+    shortLabel: 'cookies.txt',
+    hint: 'wget / yt-dlp / curl -b',
+  },
+];
+
+export function formatRemainingDuration(ms: number): string {
+  if (!Number.isFinite(ms) || ms <= 0) return '已过期';
+  const mins = Math.floor(ms / 60_000);
+  if (mins < 1) return '剩余 <1m';
+  if (mins < 60) return `剩余 ${mins}m`;
+  const hours = Math.floor(mins / 60);
+  if (hours < 24) return `剩余 ${hours}h`;
+  const days = Math.floor(hours / 24);
+  return `剩余 ${days}d`;
+}
+
+export function getExpiryBadgeMeta(status: ExpiryHealthStatus): { label: string; tone: BadgeTone } {
+  switch (status) {
+    case 'healthy':
+      return { label: '状态健康', tone: 'success' };
+    case 'expiring_soon':
+      return { label: '即将过期', tone: 'warning' };
+    case 'critical':
+      return { label: '即将失效', tone: 'danger' };
+    case 'expired':
+      return { label: '已过期', tone: 'danger' };
+    default:
+      return { label: '正常', tone: 'neutral' };
+  }
+}
+
+export function formatByteSize(bytes?: number): string {
+  if (bytes === undefined || bytes === null || !Number.isFinite(bytes) || bytes < 0) return '0 B';
+  if (bytes < 1024) return `${Math.round(bytes)} B`;
+  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(bytes >= 10 * 1024 ? 1 : 2)} KB`;
+  return `${(bytes / (1024 * 1024)).toFixed(2)} MB`;
+}
+
+export function getObjectTypeLabel(objectType: ObjectType): string {
+  switch (objectType) {
+    case 'cookie':
+      return 'Cookie';
+    case 'localStorage':
+      return 'LS';
+    case 'sessionStorage':
+      return 'SS';
+    case 'indexedDb':
+      return 'IDB';
+    default:
+      return String(objectType);
+  }
+}
+
+export function generateRandomSharePassphrase(length = 16): string {
+  const alphabet = '23456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnpqrstuvwxyz';
+  const maxUnbiased = 256 - (256 % alphabet.length);
+  let out = '';
+  if (typeof crypto !== 'undefined' && typeof crypto.getRandomValues === 'function') {
+    while (out.length < length) {
+      const buf = new Uint8Array(Math.max(length * 2, 16));
+      crypto.getRandomValues(buf);
+      for (let i = 0; i < buf.length && out.length < length; i += 1) {
+        const b = buf[i];
+        if (b < maxUnbiased) {
+          out += alphabet[b % alphabet.length];
+        }
+      }
+    }
+    return out;
+  }
+  while (out.length < length) {
+    out += alphabet[Math.floor(Math.random() * alphabet.length)];
+  }
+  return out;
+}
+
+const TYPED_TAG_KEY = '$sm_t';
+
+function decodePreviewNode(node: unknown): unknown {
+  if (node === null || typeof node !== 'object') return node;
+  if (Array.isArray(node)) return node.map(decodePreviewNode);
+
+  const rec = node as Record<string, unknown>;
+  if (Object.prototype.hasOwnProperty.call(rec, TYPED_TAG_KEY)) {
+    const tag = rec[TYPED_TAG_KEY];
+    switch (tag) {
+      case 'undef':
+        return '[undefined]';
+      case 'num':
+        return String(rec.v ?? 'NaN');
+      case 'bigint':
+        return `${String(rec.v ?? '0')}n`;
+      case 'date':
+        return `Date(${String(rec.v ?? '')})`;
+      case 'regexp':
+        return `/${String(rec.s ?? '')}/${String(rec.f ?? '')}`;
+      case 'u8':
+        return `[Uint8Array base64(${String(rec.b64 ?? '').length} chars)]`;
+      case 'ab':
+        return `[ArrayBuffer base64(${String(rec.b64 ?? '').length} chars)]`;
+      case 'view':
+        return `[${String(rec.kind ?? 'TypedArray')} base64(${String(rec.b64 ?? '').length} chars)]`;
+      case 'map': {
+        const entries = Array.isArray(rec.e) ? rec.e : [];
+        return {
+          __type: 'Map',
+          entries: entries.map(pair =>
+            Array.isArray(pair) && pair.length >= 2 ? [decodePreviewNode(pair[0]), decodePreviewNode(pair[1])] : pair,
+          ),
+        };
+      }
+      case 'set': {
+        const values = Array.isArray(rec.v) ? rec.v : [];
+        return {
+          __type: 'Set',
+          values: values.map(decodePreviewNode),
+        };
+      }
+      case 'raw_obj': {
+        const inner = (rec.v ?? {}) as Record<string, unknown>;
+        const out: Record<string, unknown> = {};
+        for (const k of Object.keys(inner)) {
+          out[k] = decodePreviewNode(inner[k]);
+        }
+        return out;
+      }
+      default:
+        return rec;
+    }
+  }
+
+  const out: Record<string, unknown> = {};
+  for (const k of Object.keys(rec)) {
+    out[k] = decodePreviewNode(rec[k]);
+  }
+  return out;
+}
+
+export function decodeTypedClonePreview(encoded: string): string {
+  if (!encoded) return '';
+  try {
+    const parsed = JSON.parse(encoded) as unknown;
+    const decoded = decodePreviewNode(parsed);
+    if (typeof decoded === 'string') return decoded;
+    if (typeof decoded === 'number' || typeof decoded === 'boolean' || decoded === null) {
+      return String(decoded);
+    }
+    return JSON.stringify(decoded, null, 2);
+  } catch {
+    return encoded;
+  }
+}
+
+function decodeIdbKeyNodePreview(node: unknown): string {
+  if (typeof node === 'string') return node;
+  if (typeof node === 'number') return String(node);
+  if (Array.isArray(node) && node.length === 2) {
+    const [kind, payload] = node;
+    if (kind === 'n') return String(payload);
+    if (kind === 'd' && typeof payload === 'number') {
+      return new Date(payload).toISOString();
+    }
+    if (kind === 'b') return `[BinaryKey ${String(payload).slice(0, 12)}...]`;
+    if (kind === 'a' && Array.isArray(payload)) {
+      return `[${payload.map(decodeIdbKeyNodePreview).join(', ')}]`;
+    }
+  }
+  return JSON.stringify(node);
+}
+
+export function decodeIdbKeyPreview(encodedKey: string): string {
+  if (!encodedKey) return '';
+  try {
+    const parsed = JSON.parse(encodedKey) as unknown;
+    return decodeIdbKeyNodePreview(parsed);
+  } catch {
+    return encodedKey;
+  }
+}
 
 export function formatRelativeTime(ts?: number): string {
   if (!ts) return '从未';
@@ -77,9 +304,8 @@ export async function copyToClipboard(text: string): Promise<boolean> {
   }
 }
 
-export function downloadJsonFile(filename: string, data: unknown): void {
-  const text = typeof data === 'string' ? data : JSON.stringify(data, null, 2);
-  const blob = new Blob([text], { type: 'application/json;charset=utf-8' });
+export function downloadTextFile(filename: string, content: string, mimeType = 'text/plain;charset=utf-8'): void {
+  const blob = new Blob([content], { type: mimeType });
   const url = URL.createObjectURL(blob);
   const a = document.createElement('a');
   a.href = url;
@@ -88,6 +314,11 @@ export function downloadJsonFile(filename: string, data: unknown): void {
   a.click();
   document.body.removeChild(a);
   setTimeout(() => URL.revokeObjectURL(url), 1000);
+}
+
+export function downloadJsonFile(filename: string, data: unknown): void {
+  const text = typeof data === 'string' ? data : JSON.stringify(data, null, 2);
+  downloadTextFile(filename, text, 'application/json;charset=utf-8');
 }
 
 export function buildCookieHeader(cookies: Array<Pick<BrowserCookieInput, 'name' | 'value'>>): string {
@@ -117,17 +348,17 @@ export function toBrowserCookieInput(record: CookieRecord): BrowserCookieInput {
 export function getBindingMeta(state: SiteBindingState): { label: string; tone: BadgeTone } {
   switch (state) {
     case 'AUTO_BOUND':
-      return { label: '自动绑定', tone: 'success' };
+      return { label: '同步中', tone: 'success' };
     case 'USER_BOUND':
-      return { label: '手动跟随', tone: 'primary' };
+      return { label: '跟随同步', tone: 'primary' };
     case 'INDEPENDENT':
-      return { label: '独立轨道', tone: 'info' };
+      return { label: '仅本机独立', tone: 'info' };
     case 'PENDING_CHOICE':
       return { label: '待确认', tone: 'warning' };
     case 'BLACKLISTED':
-      return { label: '黑名单', tone: 'neutral' };
+      return { label: '已排除', tone: 'neutral' };
     case 'UNMANAGED':
-      return { label: '未纳管', tone: 'neutral' };
+      return { label: '未开启同步', tone: 'neutral' };
     default:
       return { label: state, tone: 'neutral' };
   }

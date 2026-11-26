@@ -56,3 +56,25 @@ export function buildCookieLogicalId(params: {
 export function buildLocalStorageLogicalId(trackId: string, origin: string, key: string): string {
   return `ls::${trackId}::${normalizeOrigin(origin)}::${key}`;
 }
+
+/**
+ * Constructs the canonical globally unique logical identifier for a SessionStorage record.
+ * Strictly isolates by trackId, origin (scheme + host + port), and key.
+ */
+export function buildSessionStorageLogicalId(trackId: string, origin: string, key: string): string {
+  return `ss::${trackId}::${normalizeOrigin(origin)}::${key}`;
+}
+
+/**
+ * Constructs the canonical globally unique logical identifier for an IndexedDB record.
+ * Strictly isolates by trackId, origin, dbName, storeName, and canonical encodedKey.
+ */
+export function buildIndexedDbLogicalId(params: {
+  trackId: string;
+  origin: string;
+  dbName: string;
+  storeName: string;
+  encodedKey: string;
+}): string {
+  return `idb::${params.trackId}::${normalizeOrigin(params.origin)}::${encodeURIComponent(params.dbName)}::${encodeURIComponent(params.storeName)}::${params.encodedKey}`;
+}

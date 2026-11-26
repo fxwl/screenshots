@@ -1,8 +1,8 @@
 {
   "name": "sessionmesh",
-  "version": "1.1.0",
+  "version": "1.3.0",
   "private": true,
-  "description": "SessionMesh — Multi-device browser login state synchronization over WebDAV with E2E encryption",
+  "description": "SessionMesh — Multi-device browser login state sync across WebDAV, S3/R2/OSS, GitHub Gist & local sync folders with E2E encryption",
   "license": "MIT",
   "repository": {
     "type": "git",
@@ -17,6 +17,7 @@
     "dev": "cross-env __DEV__=true turbo run dev --concurrency 25",
     "dev:firefox": "cross-env __DEV__=true __FIREFOX__=true turbo dev --concurrency 20",
     "zip": "rimraf dist && pnpm build && pnpm -F @sessionmesh/zipper zip",
+    "zip:firefox": "rimraf dist && pnpm build:firefox && cross-env BROWSER=firefox pnpm -F @sessionmesh/zipper zip",
     "test": "turbo test",
     "type-check": "turbo type-check",
     "lint": "turbo lint",

@@ -12,5 +12,5 @@
     },
     "types": ["chrome"]
   },
-  "include": ["index.ts", "src"],
+  "include": ["index.ts", "src"]
 }

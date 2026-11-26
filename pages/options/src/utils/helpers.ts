@@ -2,11 +2,148 @@ import type {
   CapabilityReport,
   ConsistencyLevel,
   DeviceStatus,
+  S3VendorPreset,
+  StorageProviderType,
   SyncTimingMode,
   WebDAVAuthType,
 } from '@sessionmesh/core';
 import { useCallback, useEffect, useState } from 'react';
 import { toast } from 'sonner';
+
+export interface S3VendorOption {
+  id: S3VendorPreset;
+  label: string;
+  shortLabel: string;
+  defaultRegion: string;
+  defaultAddressingStyle: 'path' | 'virtual_hosted';
+  defaultSignatureMode: 'aws_v4' | 'oss_v4';
+  endpointPlaceholder: string;
+  regionPlaceholder: string;
+  tip: string;
+}
+
+export const S3_VENDOR_OPTIONS: S3VendorOption[] = [
+  {
+    id: 'r2',
+    label: 'Cloudflare R2 [推荐·免费额度]',
+    shortLabel: 'Cloudflare R2',
+    defaultRegion: 'auto',
+    defaultAddressingStyle: 'path',
+    defaultSignatureMode: 'aws_v4',
+    endpointPlaceholder: 'https://<accountId>.r2.cloudflarestorage.com',
+    regionPlaceholder: 'auto',
+    tip: '推荐个人与跨端同步：Cloudflare R2 提供每月免费 10GB 存储与零出站流量费；Region 请填 auto，寻址风格使用 Path-Style。',
+  },
+  {
+    id: 'aliyun_oss',
+    label: '阿里云 OSS',
+    shortLabel: '阿里云 OSS',
+    defaultRegion: 'cn-hangzhou',
+    defaultAddressingStyle: 'virtual_hosted',
+    defaultSignatureMode: 'oss_v4',
+    endpointPlaceholder: 'https://oss-cn-hangzhou.aliyuncs.com',
+    regionPlaceholder: 'cn-hangzhou',
+    tip: '阿里云 OSS 要求使用 Virtual-Hosted-Style 域名访问（<bucket>.oss-<region>.aliyuncs.com），支持阿里云 V4 (oss_v4) 与 S3 兼容签名 (aws_v4)。',
+  },
+  {
+    id: 'aws_s3',
+    label: 'AWS S3',
+    shortLabel: 'AWS S3',
+    defaultRegion: 'us-east-1',
+    defaultAddressingStyle: 'virtual_hosted',
+    defaultSignatureMode: 'aws_v4',
+    endpointPlaceholder: 'https://s3.us-east-1.amazonaws.com',
+    regionPlaceholder: 'us-east-1',
+    tip: 'Amazon S3 标准对象存储，默认使用 Virtual-Hosted-Style 与 AWS SigV4。',
+  },
+  {
+    id: 'minio',
+    label: 'MinIO',
+    shortLabel: 'MinIO',
+    defaultRegion: 'us-east-1',
+    defaultAddressingStyle: 'path',
+    defaultSignatureMode: 'aws_v4',
+    endpointPlaceholder: 'https://minio.example.com:9000',
+    regionPlaceholder: 'us-east-1',
+    tip: '适用于自建 MinIO、RustFS、Garage、Ceph RGW 等，默认使用 Path-Style。',
+  },
+  {
+    id: 'cos',
+    label: '腾讯云 COS',
+    shortLabel: '腾讯云 COS',
+    defaultRegion: 'ap-guangzhou',
+    defaultAddressingStyle: 'virtual_hosted',
+    defaultSignatureMode: 'aws_v4',
+    endpointPlaceholder: 'https://cos.ap-guangzhou.myqcloud.com',
+    regionPlaceholder: 'ap-guangzhou',
+    tip: '腾讯云 COS S3 兼容接口（Bucket 名称通常包含 appid 后缀，如 bucket-1250000000）。',
+  },
+  {
+    id: 'b2',
+    label: 'Backblaze B2',
+    shortLabel: 'Backblaze B2',
+    defaultRegion: 'us-west-004',
+    defaultAddressingStyle: 'virtual_hosted',
+    defaultSignatureMode: 'aws_v4',
+    endpointPlaceholder: 'https://s3.us-west-004.backblazeb2.com',
+    regionPlaceholder: 'us-west-004',
+    tip: 'Backblaze B2 S3 兼容 API（提供 10GB 免费额度）。',
+  },
+  {
+    id: 'custom',
+    label: '自定义 S3',
+    shortLabel: '自定义 S3',
+    defaultRegion: 'us-east-1',
+    defaultAddressingStyle: 'path',
+    defaultSignatureMode: 'aws_v4',
+    endpointPlaceholder: 'https://s3.example.com',
+    regionPlaceholder: 'us-east-1',
+    tip: '任意兼容 S3 SigV4 协议的对象存储服务。',
+  },
+];
+
+export function getS3VendorOption(preset?: S3VendorPreset): S3VendorOption {
+  return S3_VENDOR_OPTIONS.find(item => item.id === preset) ?? S3_VENDOR_OPTIONS[0];
+}
+
+export function getStorageProviderMeta(provider?: StorageProviderType): {
+  id: StorageProviderType;
+  label: string;
+  shortLabel: string;
+  description: string;
+} {
+  switch (provider) {
+    case 's3':
+      return {
+        id: 's3',
+        label: 'S3 / R2 / 阿里云 OSS',
+        shortLabel: 'S3 · R2 · OSS',
+        description: 'Cloudflare R2、阿里云 OSS、AWS S3、MinIO、腾讯云 COS、Backblaze B2',
+      };
+    case 'github_gist':
+      return {
+        id: 'github_gist',
+        label: 'GitHub Private Gist',
+        shortLabel: 'GitHub Private Gist',
+        description: '使用个人 Secret/Private Gist 免费同步（强制拦截公开 Gist）',
+      };
+    case 'local_directory':
+      return {
+        id: 'local_directory',
+        label: '本地同步文件夹',
+        shortLabel: '本地同步文件夹',
+        description: 'OneDrive / iCloud / Dropbox 本地同步目录直接读写',
+      };
+    case 'webdav':
+    default:
+      return {
+        id: 'webdav',
+        label: 'WebDAV 云盘 / 自建 NAS',
+        shortLabel: 'WebDAV',
+        description: 'Nextcloud、坚果云、群晖 NAS、Alist 等标准 WebDAV 服务',
+      };
+  }
+}
 
 export interface WebDAVProviderPreset {
   id: string;
@@ -67,9 +204,9 @@ export interface PresetBlacklistOption {
 export const PRESET_BLACKLIST_OPTIONS: PresetBlacklistOption[] = [
   {
     category: 'webdav_self',
-    title: '当前 WebDAV 服务器域名（防同步回环）',
-    description: '自动排除你刚刚填写的 WebDAV 域名，避免云盘管理后台会话与同步引擎互相干扰。',
-    examples: '自动从 Step 1 URL 提取域名',
+    title: '当前同步存储服务器域名（防同步回环）',
+    description: '自动排除你刚刚填写的 WebDAV / S3 / 存储服务端域名，避免云端管理后台会话与同步引擎互相干扰。',
+    examples: '自动从 Step 1 存储端点提取域名',
     defaultChecked: true,
   },
   {
@@ -96,10 +233,24 @@ export const PRESET_BLACKLIST_OPTIONS: PresetBlacklistOption[] = [
 ];
 
 export interface UiNonSensitiveMeta {
+  storageProvider?: StorageProviderType;
+  storageEndpoint?: string;
   webdavUrl?: string;
   authType?: WebDAVAuthType;
   rootPath?: string;
   username?: string;
+  s3VendorPreset?: S3VendorPreset;
+  s3Bucket?: string;
+  s3Region?: string;
+  s3RootPrefix?: string;
+  s3AddressingStyle?: 'path' | 'virtual_hosted';
+  s3SignatureMode?: 'aws_v4' | 'oss_v4';
+  gistId?: string;
+  gistApiBaseUrl?: string;
+  gistRootPrefix?: string;
+  localDirLabel?: string;
+  localDirHandleKey?: string;
+  localDirRootPrefix?: string;
   lastCapabilityReport?: CapabilityReport;
 }
 
@@ -121,13 +272,27 @@ export async function loadUiNonSensitiveMeta(): Promise<UiNonSensitiveMeta> {
 export async function saveUiNonSensitiveMeta(patch: Partial<UiNonSensitiveMeta>): Promise<void> {
   try {
     const prev = await loadUiNonSensitiveMeta();
-    // Never persist secrets (password / bearerToken / encryptionPassword)
+    // Never persist secrets (password / bearerToken / secretAccessKey / sessionToken / personalAccessToken / encryptionPassword)
     const next: UiNonSensitiveMeta = {
+      storageProvider: patch.storageProvider ?? prev.storageProvider,
+      storageEndpoint: patch.storageEndpoint ?? prev.storageEndpoint,
       webdavUrl: patch.webdavUrl ?? prev.webdavUrl,
       authType: patch.authType ?? prev.authType,
       rootPath: patch.rootPath ?? prev.rootPath,
       username: patch.username ?? prev.username,
-      lastCapabilityReport: patch.lastCapabilityReport ?? prev.lastCapabilityReport,
+      s3VendorPreset: patch.s3VendorPreset ?? prev.s3VendorPreset,
+      s3Bucket: patch.s3Bucket ?? prev.s3Bucket,
+      s3Region: patch.s3Region ?? prev.s3Region,
+      s3RootPrefix: patch.s3RootPrefix ?? prev.s3RootPrefix,
+      s3AddressingStyle: patch.s3AddressingStyle ?? prev.s3AddressingStyle,
+      s3SignatureMode: patch.s3SignatureMode ?? prev.s3SignatureMode,
+      gistId: patch.gistId ?? prev.gistId,
+      gistApiBaseUrl: patch.gistApiBaseUrl ?? prev.gistApiBaseUrl,
+      gistRootPrefix: patch.gistRootPrefix ?? prev.gistRootPrefix,
+      localDirLabel: patch.localDirLabel ?? prev.localDirLabel,
+      localDirHandleKey: patch.localDirHandleKey ?? prev.localDirHandleKey,
+      localDirRootPrefix: patch.localDirRootPrefix ?? prev.localDirRootPrefix,
+      lastCapabilityReport: 'lastCapabilityReport' in patch ? patch.lastCapabilityReport : prev.lastCapabilityReport,
     };
     if (typeof chrome !== 'undefined' && chrome.storage?.local) {
       await chrome.storage.local.set({ [UI_META_KEY]: next });
@@ -149,6 +314,206 @@ export type BannerCategory = 'security' | 'degraded' | 'general';
 
 export const UI_BANNER_PREFS_KEY = 'sessionmesh_ui_banner_prefs_v1';
 const UI_BANNER_PREFS_EVENT = 'sessionmesh:banner-prefs-updated';
+
+export interface UxOnboardingPrefs {
+  checklistDismissed: boolean;
+  checklistCollapsed: boolean;
+  popupTourDone: boolean;
+  popupDeveloperMode: boolean;
+  onboardingExpertMode: boolean;
+  completedGuideTasks: Record<string, boolean>;
+}
+
+export const UX_ONBOARDING_PREFS_KEY = 'sessionmesh_ux_onboarding_prefs_v1';
+const UX_ONBOARDING_PREFS_EVENT = 'sessionmesh:ux-onboarding-prefs-updated';
+
+export const DEFAULT_UX_ONBOARDING_PREFS: UxOnboardingPrefs = {
+  checklistDismissed: false,
+  checklistCollapsed: false,
+  popupTourDone: false,
+  popupDeveloperMode: false,
+  onboardingExpertMode: false,
+  completedGuideTasks: {},
+};
+
+function normalizeUxOnboardingPrefs(raw: unknown): UxOnboardingPrefs {
+  if (!raw || typeof raw !== 'object') {
+    return { ...DEFAULT_UX_ONBOARDING_PREFS, completedGuideTasks: {} };
+  }
+  const obj = raw as Partial<UxOnboardingPrefs>;
+  const tasks: Record<string, boolean> = {};
+  if (obj.completedGuideTasks && typeof obj.completedGuideTasks === 'object') {
+    for (const [k, v] of Object.entries(obj.completedGuideTasks)) {
+      if (v) tasks[k] = true;
+    }
+  }
+  return {
+    checklistDismissed: Boolean(obj.checklistDismissed),
+    checklistCollapsed: Boolean(obj.checklistCollapsed),
+    popupTourDone: Boolean(obj.popupTourDone),
+    popupDeveloperMode: Boolean(obj.popupDeveloperMode),
+    onboardingExpertMode: Boolean(obj.onboardingExpertMode),
+    completedGuideTasks: tasks,
+  };
+}
+
+export async function loadUxOnboardingPrefs(): Promise<UxOnboardingPrefs> {
+  try {
+    if (typeof chrome !== 'undefined' && chrome.storage?.local) {
+      const res = await chrome.storage.local.get(UX_ONBOARDING_PREFS_KEY);
+      if (res && res[UX_ONBOARDING_PREFS_KEY] !== undefined) {
+        return normalizeUxOnboardingPrefs(res[UX_ONBOARDING_PREFS_KEY]);
+      }
+    }
+    if (typeof window !== 'undefined' && window.localStorage) {
+      const raw = window.localStorage.getItem(UX_ONBOARDING_PREFS_KEY);
+      if (raw) {
+        return normalizeUxOnboardingPrefs(JSON.parse(raw));
+      }
+    }
+  } catch {
+    // fallback to default
+  }
+  return { ...DEFAULT_UX_ONBOARDING_PREFS, completedGuideTasks: {} };
+}
+
+export async function saveUxOnboardingPrefs(nextRaw: UxOnboardingPrefs): Promise<UxOnboardingPrefs> {
+  const next = normalizeUxOnboardingPrefs(nextRaw);
+  try {
+    if (typeof chrome !== 'undefined' && chrome.storage?.local) {
+      await chrome.storage.local.set({ [UX_ONBOARDING_PREFS_KEY]: next });
+    }
+  } catch {
+    // fallback to localStorage
+  }
+  try {
+    if (typeof window !== 'undefined' && window.localStorage) {
+      window.localStorage.setItem(UX_ONBOARDING_PREFS_KEY, JSON.stringify(next));
+    }
+  } catch {
+    // ignore storage errors
+  }
+  if (typeof window !== 'undefined') {
+    window.dispatchEvent(new CustomEvent<UxOnboardingPrefs>(UX_ONBOARDING_PREFS_EVENT, { detail: next }));
+  }
+  return next;
+}
+
+export async function patchUxOnboardingPrefs(patch: Partial<UxOnboardingPrefs>): Promise<UxOnboardingPrefs> {
+  const prev = await loadUxOnboardingPrefs();
+  return saveUxOnboardingPrefs({
+    ...prev,
+    ...patch,
+    completedGuideTasks: patch.completedGuideTasks
+      ? { ...prev.completedGuideTasks, ...patch.completedGuideTasks }
+      : prev.completedGuideTasks,
+  });
+}
+
+export function useUxOnboardingPrefs() {
+  const [prefs, setPrefs] = useState<UxOnboardingPrefs>(() => ({
+    ...DEFAULT_UX_ONBOARDING_PREFS,
+    completedGuideTasks: {},
+  }));
+
+  useEffect(() => {
+    let active = true;
+    void loadUxOnboardingPrefs().then(loaded => {
+      if (active) setPrefs(loaded);
+    });
+
+    const handleCustom = (event: Event) => {
+      const detail = (event as CustomEvent<UxOnboardingPrefs>).detail;
+      if (detail) {
+        setPrefs(normalizeUxOnboardingPrefs(detail));
+      }
+    };
+
+    const handleStorage = (changes: Record<string, chrome.storage.StorageChange>, areaName: string) => {
+      if (areaName === 'local' && changes[UX_ONBOARDING_PREFS_KEY]) {
+        setPrefs(normalizeUxOnboardingPrefs(changes[UX_ONBOARDING_PREFS_KEY].newValue));
+      }
+    };
+
+    if (typeof window !== 'undefined') {
+      window.addEventListener(UX_ONBOARDING_PREFS_EVENT, handleCustom);
+    }
+    if (typeof chrome !== 'undefined' && chrome.storage?.onChanged) {
+      chrome.storage.onChanged.addListener(handleStorage);
+    }
+
+    return () => {
+      active = false;
+      if (typeof window !== 'undefined') {
+        window.removeEventListener(UX_ONBOARDING_PREFS_EVENT, handleCustom);
+      }
+      if (typeof chrome !== 'undefined' && chrome.storage?.onChanged) {
+        chrome.storage.onChanged.removeListener(handleStorage);
+      }
+    };
+  }, []);
+
+  const updatePrefs = useCallback(async (patch: Partial<UxOnboardingPrefs>) => {
+    const next = await patchUxOnboardingPrefs(patch);
+    setPrefs(next);
+    return next;
+  }, []);
+
+  const markGuideTaskDone = useCallback(async (taskId: string) => {
+    const next = await patchUxOnboardingPrefs({
+      completedGuideTasks: { [taskId]: true },
+    });
+    setPrefs(next);
+    return next;
+  }, []);
+
+  const resetGuideProgress = useCallback(async () => {
+    const next = await saveUxOnboardingPrefs({
+      ...DEFAULT_UX_ONBOARDING_PREFS,
+      onboardingExpertMode: prefs.onboardingExpertMode,
+      popupDeveloperMode: prefs.popupDeveloperMode,
+      completedGuideTasks: {},
+    });
+    setPrefs(next);
+    return next;
+  }, [prefs.onboardingExpertMode, prefs.popupDeveloperMode]);
+
+  return {
+    prefs,
+    updatePrefs,
+    markGuideTaskDone,
+    resetGuideProgress,
+  };
+}
+
+export function generateShortPairingPin(length = 6): string {
+  const digits = '23456789ABCDEFGHJKLMNPQRSTUVWXYZ';
+  let pin = '';
+  if (typeof crypto !== 'undefined' && typeof crypto.getRandomValues === 'function') {
+    const buf = new Uint8Array(length * 2);
+    crypto.getRandomValues(buf);
+    for (let i = 0; i < buf.length && pin.length < length; i += 1) {
+      pin += digits[buf[i] % digits.length];
+    }
+    return pin;
+  }
+  while (pin.length < length) {
+    pin += digits[Math.floor(Math.random() * digits.length)];
+  }
+  return pin;
+}
+
+export function openExternalUrl(url: string): void {
+  try {
+    if (typeof chrome !== 'undefined' && chrome.tabs?.create) {
+      chrome.tabs.create({ url });
+      return;
+    }
+  } catch {
+    // fallback below
+  }
+  window.open(url, '_blank', 'noopener,noreferrer');
+}
 
 export const DEFAULT_UI_BANNER_PREFS: UiBannerPrefs = {
   showSecurityWarnings: true,
@@ -521,9 +886,42 @@ export function downloadJsonFile(filename: string, content: string): void {
   URL.revokeObjectURL(url);
 }
 
+export function downloadBase64File(filename: string, base64: string, mimeType = 'application/octet-stream'): void {
+  const clean = base64.replace(/\s+/g, '');
+  const binary = window.atob(clean);
+  const bytes = new Uint8Array(binary.length);
+  for (let i = 0; i < binary.length; i += 1) {
+    bytes[i] = binary.charCodeAt(i);
+  }
+  const blob = new Blob([bytes], { type: mimeType });
+  const url = URL.createObjectURL(blob);
+  const anchor = document.createElement('a');
+  anchor.href = url;
+  anchor.download = filename;
+  document.body.appendChild(anchor);
+  anchor.click();
+  document.body.removeChild(anchor);
+  URL.revokeObjectURL(url);
+}
+
+export async function readFileAsBase64(file: File): Promise<string> {
+  const buffer = await file.arrayBuffer();
+  const bytes = new Uint8Array(buffer);
+  const chunkSize = 0x8000;
+  let binary = '';
+  for (let i = 0; i < bytes.length; i += chunkSize) {
+    const chunk = bytes.subarray(i, i + chunkSize);
+    binary += String.fromCharCode(...chunk);
+  }
+  return window.btoa(binary);
+}
+
 export function openSidePanelFromWindow(): void {
   try {
-    if (typeof chrome !== 'undefined' && chrome.windows && chrome.sidePanel) {
+    const ffSidebar = (globalThis as unknown as { browser?: { sidebarAction?: { open?: () => Promise<void> } } })
+      .browser?.sidebarAction;
+
+    if (typeof chrome !== 'undefined' && chrome.windows && typeof chrome.sidePanel?.open === 'function') {
       chrome.windows.getCurrent(currentWindow => {
         if (currentWindow?.id !== undefined) {
           chrome.sidePanel.open({ windowId: currentWindow.id }).catch(err => {
@@ -531,6 +929,14 @@ export function openSidePanelFromWindow(): void {
           });
         }
       });
+    } else if (typeof ffSidebar?.open === 'function') {
+      ffSidebar.open().catch(() => {
+        if (typeof chrome !== 'undefined' && chrome.tabs?.create && chrome.runtime?.getURL) {
+          chrome.tabs.create({ url: chrome.runtime.getURL('sidepanel/index.html') });
+        }
+      });
+    } else if (typeof chrome !== 'undefined' && chrome.tabs?.create && chrome.runtime?.getURL) {
+      chrome.tabs.create({ url: chrome.runtime.getURL('sidepanel/index.html') });
     } else {
       toast.info('请在浏览器扩展工具栏点击侧边栏图标打开管理台');
     }

@@ -2,6 +2,39 @@
 
 All notable changes to **SessionMesh** will be documented in this file.
 
+## [1.3.0] - 2026-11-26
+
+### Added
+
+- **Multi-Provider Storage Backends & Local Encrypted Archive Backup**:
+  - **S3-Compatible Object Storage (`S3StorageAdapter`)**: Zero-dependency Web Crypto AWS SigV4 and Aliyun `oss_v4` (`OSS4-HMAC-SHA256`) signing with built-in vendor presets for **Cloudflare R2**, **Aliyun OSS** (Virtual-Hosted-Style), **AWS S3**, **MinIO**, **Tencent COS**, **Backblaze B2**, and custom S3 endpoints.
+  - **GitHub Private Gist Storage (`GitHubGistStorageAdapter`)**: Zero-cost private synchronization using Secret GitHub Gists with lossless flat filename escaping, `ETag` `304` caching, and strict `public === false` privacy enforcement (`GIST_PUBLIC_FORBIDDEN` guard).
+  - **Local Sync Directory Storage (`LocalDirectoryStorageAdapter`)**: Direct read/write sync to **OneDrive / iCloud / Dropbox / local folders** via Chromium File System Access API and `DirHandleStore` IndexedDB persistence, complete with a 1-click permission recovery banner (`local_dir_permission_needed`).
+  - **Universal `.smesh-backup` Single-File Encrypted Archive**: Cross-browser (`Chrome`, `Edge`, `Firefox`) password-encrypted archive export/import (`encodeArchiveBackup` / `decodeArchiveBackup`) supporting both **Causal Smart Merge** (`merge`) and **Full Replace Restore** (`replace`).
+  - **Cross-Device Pairing Code v2**: Upgraded `smesh://pair/...` pairing codes to SMES v2 payloads packaging WebDAV, S3/R2/OSS, and GitHub Private Gist configurations.
+- **Extended Storage Sync (`sessionStorage` & Opt-In `IndexedDB`)**:
+  - Origin-scoped `sessionStorage` sync with a global default setting and per-site rule overrides / key allowlists.
+  - Opt-in per-site `IndexedDB` snapshot sync via `typedCloneCodec` with target database/objectStore/key-prefix rules and configurable byte-budget quota protection.
+- **Developer Debug Export**:
+  - Export effective site/track credentials as `cURL`, Node.js `fetch`, raw `Cookie` header, `headers.json`, Playwright `storageState.json`, Postman/Apifox JSON, or Netscape `cookies.txt` with RFC 6265 scheme/domain/path filtering and analytics noise suppression.
+- **Team Temporary Encrypted Session Share (`smesh://share/v1.`)**:
+  - Time-limited encrypted session sharing with high-entropy passphrases, pre-import preview, cookie expiry clamping, `HttpOnly`/cookie-name filters, and three import modes (`ephemeral_track`, `env_target`, `override_active`).
+- **Global Shortcuts, Account Color Badges & Cookie Expiry Warnings**:
+  - Manifest V3 `chrome.commands` global shortcuts (`rotate-account-next`, `rotate-account-prev`, `sync-current-site`, `copy-current-curl`) with post-switch in-page toast notifications and quick browser shortcut settings access.
+  - Per-account custom color palette, `<=4` character toolbar badge labels with automatic WCAG text contrast, and configurable toolbar badge display modes (`multi_or_tagged`, `always`, `status_only`).
+  - Cookie expiry health monitor (`expiryMonitor`: `healthy`, `expiring_soon`, `critical`, `expired`) with watched auth cookie pinning, configurable warning/critical lead hours, and inactive track monitoring.
+- **Full Bilingual UI (`简体中文` / `English` / `Follow Browser`)**:
+  - 1-click live language switching (`LanguageDropdown`) across the Onboarding Wizard, Toolbar Popup, Side Panel, Options Control Center, right-click Context Menus, toolbar badge tooltips, and in-page switch toasts—backed by an AST-verified 2,460+ entry translation dictionary with zero page reload required.
+- **Firefox Manifest V3 Support & Automated Multi-Browser Releases**:
+  - Native Firefox MV3 manifest & runtime support (`sidebar_action`, `browser_specific_settings.gecko`, `options_ui.open_in_tab`, synchronous `browser.sidebarAction.open()` fallback), `pnpm zip:firefox` packaging, and automated `.xpi` + AMO source archive publishing in GitHub Actions.
+- **Refreshed Store & Documentation Screenshots**:
+  - Re-captured all `1280×800` 24-bit RGB product and store screenshots showcasing the Fluent 3D cookie icon, 4-provider storage selector, multi-account color badges, environment sync, debug export, and bilingual UI controls.
+
+### Changed
+
+- **Options Control Center & Onboarding Upgrades**:
+  - Unified Onboarding Wizard Step 1 and the Control Center **Storage & Backup** tab around a reusable 4-provider selector (`WebDAV`, `S3 / R2 / OSS`, `GitHub Private Gist`, `Local Directory`) alongside the embedded `.smesh-backup` card and updated **Sync Policy** controls.
+
 ## [1.1.0] - 2026-11-26
 
 ### Added

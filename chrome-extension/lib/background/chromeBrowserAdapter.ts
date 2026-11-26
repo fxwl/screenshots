@@ -4,11 +4,15 @@ import type {
   BrowserCookieChangeEvent,
   BrowserCookieInput,
   BrowserTabInfo,
+  IndexedDbMutation,
+  IndexedDbRecord,
+  IndexedDbTargetRule,
+  InspectedIndexedDbDatabase,
   PageReloadSafetyStatus,
   PartitionKeyInfo,
   SameSiteValue,
 } from '@sessionmesh/core';
-import type { ContentScriptCommand } from '@sessionmesh/shared';
+import type { AccountSwitchToastPayload, ContentScriptCommand } from '@sessionmesh/shared';
 
 type ChromeCookieWithPartition = chrome.cookies.Cookie & {
   partitionKey?: PartitionKeyInfo;
@@ -523,11 +527,14 @@ export class ChromeBrowserAdapter implements BrowserApiAdapter {
     return matched;
   }
 
-  async getLocalStorage(origin: string): Promise<{ available: boolean; items: Record<string, string> }> {
+  private async getOriginStorage(
+    origin: string,
+    type: 'CS_GET_LOCAL_STORAGE' | 'CS_GET_SESSION_STORAGE',
+  ): Promise<{ available: boolean; items: Record<string, string> }> {
     const tabs = await this.findTabsByExactOrigin(origin);
     for (const tab of tabs) {
       const res = await sendTabMessageWithTimeout<{ available: boolean; items: Record<string, string> }>(tab.id, {
-        type: 'CS_GET_LOCAL_STORAGE',
+        type,
         origin,
       });
       if (res?.available) {
@@ -540,9 +547,9 @@ export class ChromeBrowserAdapter implements BrowserApiAdapter {
     return { available: false, items: {} };
   }
 
-  async applyLocalStorage(
+  private async applyOriginStorageMutations(
     origin: string,
-    mutations: Array<{ key: string; value?: string; deleted?: boolean }>,
+    command: ContentScriptCommand,
   ): Promise<{ applied: boolean; reason?: string }> {
     const tabs = await this.findTabsByExactOrigin(origin);
     if (tabs.length === 0) {
@@ -554,11 +561,7 @@ export class ChromeBrowserAdapter implements BrowserApiAdapter {
     let lastReason: string | undefined;
 
     for (const tab of tabs) {
-      const res = await sendTabMessageWithTimeout<{ applied: boolean; reason?: string }>(tab.id, {
-        type: 'CS_APPLY_LOCAL_STORAGE',
-        origin,
-        mutations,
-      });
+      const res = await sendTabMessageWithTimeout<{ applied: boolean; reason?: string }>(tab.id, command);
       if (res?.applied) {
         anyApplied = true;
       } else if (res?.reason) {
@@ -567,6 +570,237 @@ export class ChromeBrowserAdapter implements BrowserApiAdapter {
     }
 
     return anyApplied ? { applied: true } : { applied: false, reason: lastReason ?? 'content_script_unreachable' };
+  }
+
+  async getLocalStorage(origin: string): Promise<{ available: boolean; items: Record<string, string> }> {
+    return this.getOriginStorage(origin, 'CS_GET_LOCAL_STORAGE');
+  }
+
+  async applyLocalStorage(
+    origin: string,
+    mutations: Array<{ key: string; value?: string; deleted?: boolean }>,
+  ): Promise<{ applied: boolean; reason?: string }> {
+    return this.applyOriginStorageMutations(origin, {
+      type: 'CS_APPLY_LOCAL_STORAGE',
+      origin,
+      mutations,
+    });
+  }
+
+  async getSessionStorage(origin: string): Promise<{ available: boolean; items: Record<string, string> }> {
+    return this.getOriginStorage(origin, 'CS_GET_SESSION_STORAGE');
+  }
+
+  async applySessionStorage(
+    origin: string,
+    mutations: Array<{ key: string; value?: string; deleted?: boolean }>,
+  ): Promise<{ applied: boolean; reason?: string }> {
+    return this.applyOriginStorageMutations(origin, {
+      type: 'CS_APPLY_SESSION_STORAGE',
+      origin,
+      mutations,
+    });
+  }
+
+  async inspectIndexedDb(
+    origin: string,
+  ): Promise<{ available: boolean; databases: InspectedIndexedDbDatabase[]; reason?: string }> {
+    const tabs = await this.findTabsByExactOrigin(origin);
+    if (tabs.length === 0) {
+      return { available: false, databases: [], reason: 'no_open_tab_for_origin' };
+    }
+
+    let lastReason: string | undefined;
+    for (const tab of tabs) {
+      const res = await sendTabMessageWithTimeout<{
+        available: boolean;
+        databases?: InspectedIndexedDbDatabase[];
+        reason?: string;
+      }>(
+        tab.id,
+        {
+          type: 'CS_INSPECT_INDEXED_DB',
+          origin,
+        },
+        4_000,
+      );
+      if (res?.available) {
+        return {
+          available: true,
+          databases: res.databases ?? [],
+        };
+      }
+      if (res?.reason) {
+        lastReason = res.reason;
+      }
+    }
+
+    return {
+      available: false,
+      databases: [],
+      reason: lastReason ?? 'content_script_unreachable',
+    };
+  }
+
+  async getIndexedDbRecords(
+    origin: string,
+    targets: IndexedDbTargetRule[],
+    maxTotalBytes?: number,
+  ): Promise<{
+    available: boolean;
+    quotaExceeded?: boolean;
+    totalBytes: number;
+    records: Array<
+      Omit<
+        IndexedDbRecord,
+        | 'logicalId'
+        | 'siteKey'
+        | 'trackId'
+        | 'version'
+        | 'sourceDevice'
+        | 'sourceDeviceName'
+        | 'deleted'
+        | 'updatedAt'
+        | 'syncStatus'
+      >
+    >;
+    reason?: string;
+  }> {
+    const tabs = await this.findTabsByExactOrigin(origin);
+    if (tabs.length === 0) {
+      return { available: false, totalBytes: 0, records: [], reason: 'no_open_tab_for_origin' };
+    }
+
+    let lastReason: string | undefined;
+    for (const tab of tabs) {
+      const res = await sendTabMessageWithTimeout<{
+        available: boolean;
+        quotaExceeded?: boolean;
+        totalBytes?: number;
+        records?: Array<
+          Omit<
+            IndexedDbRecord,
+            | 'logicalId'
+            | 'siteKey'
+            | 'trackId'
+            | 'version'
+            | 'sourceDevice'
+            | 'sourceDeviceName'
+            | 'deleted'
+            | 'updatedAt'
+            | 'syncStatus'
+          >
+        >;
+        reason?: string;
+      }>(
+        tab.id,
+        {
+          type: 'CS_GET_INDEXED_DB_RECORDS',
+          origin,
+          targets,
+          maxTotalBytes,
+        },
+        5_000,
+      );
+      if (res?.available) {
+        return {
+          available: true,
+          quotaExceeded: res.quotaExceeded,
+          totalBytes: res.totalBytes ?? 0,
+          records: res.records ?? [],
+          reason: res.reason,
+        };
+      }
+      if (res?.reason) {
+        lastReason = res.reason;
+      }
+    }
+
+    return {
+      available: false,
+      totalBytes: 0,
+      records: [],
+      reason: lastReason ?? 'content_script_unreachable',
+    };
+  }
+
+  async applyIndexedDbMutations(
+    origin: string,
+    mutations: IndexedDbMutation[],
+    clearStores?: Array<{ dbName: string; storeName: string }>,
+  ): Promise<{ applied: boolean; reason?: string }> {
+    const tabs = await this.findTabsByExactOrigin(origin);
+    if (tabs.length === 0) {
+      return { applied: false, reason: 'no_open_tab_for_origin' };
+    }
+
+    let lastReason: string | undefined;
+    // IndexedDB is shared across the origin; apply once on the first responsive tab (active tab prioritized).
+    for (const tab of tabs) {
+      const res = await sendTabMessageWithTimeout<{ applied: boolean; reason?: string }>(
+        tab.id,
+        {
+          type: 'CS_APPLY_INDEXED_DB_MUTATIONS',
+          origin,
+          mutations,
+          clearStores,
+        },
+        5_000,
+      );
+      if (res?.applied) {
+        return { applied: true };
+      }
+      if (res?.reason) {
+        lastReason = res.reason;
+      }
+    }
+
+    return { applied: false, reason: lastReason ?? 'content_script_unreachable' };
+  }
+
+  async configureOriginExtendedMonitors(
+    origin: string,
+    config: {
+      syncSessionStorage: boolean;
+      sessionStorageKeyAllowlist?: string[];
+      syncIndexedDb: boolean;
+      indexedDbTargets?: IndexedDbTargetRule[];
+      indexedDbMaxTotalBytes?: number;
+    },
+  ): Promise<void> {
+    const tabs = await this.findTabsByExactOrigin(origin);
+    if (tabs.length === 0) return;
+
+    await Promise.allSettled(
+      tabs.map(tab =>
+        sendTabMessageWithTimeout(tab.id, {
+          type: 'CS_CONFIGURE_EXTENDED_MONITORS',
+          origin,
+          syncSessionStorage: config.syncSessionStorage,
+          sessionStorageKeyAllowlist: config.sessionStorageKeyAllowlist,
+          syncIndexedDb: config.syncIndexedDb,
+          indexedDbTargets: config.indexedDbTargets,
+          indexedDbMaxTotalBytes: config.indexedDbMaxTotalBytes,
+        }),
+      ),
+    );
+  }
+
+  async sendAccountToastToTab(tabId: number, payload: AccountSwitchToastPayload): Promise<boolean> {
+    const res = await sendTabMessageWithTimeout<{ shown?: boolean }>(tabId, {
+      type: 'CS_SHOW_ACCOUNT_TOAST',
+      payload,
+    });
+    return Boolean(res?.shown ?? res);
+  }
+
+  async copyTextInTab(tabId: number, text: string, toastMessage?: string): Promise<boolean> {
+    const res = await sendTabMessageWithTimeout<{ copied?: boolean }>(tabId, {
+      type: 'CS_COPY_TEXT_TO_CLIPBOARD',
+      text,
+      toastMessage,
+    });
+    return Boolean(res?.copied);
   }
 
   async getDevicePlatformInfo(): Promise<{

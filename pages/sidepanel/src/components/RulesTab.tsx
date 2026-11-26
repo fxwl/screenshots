@@ -3,6 +3,7 @@ import type { RulesAndBlacklistData } from '@console/lib/api';
 import {
   copyToClipboard,
   downloadJsonFile,
+  formatByteSize,
   formatRelativeTime,
   getDirectionLabel,
   getMatchTypeLabel,
@@ -11,6 +12,7 @@ import type {
   BlacklistEntry,
   BrowserCandidateSite,
   EnvCookieSyncRule,
+  IndexedDbTargetRule,
   SiteRuleOverride,
   SiteSummaryView,
   SyncDirection,
@@ -21,6 +23,7 @@ import {
   ArrowLeftRight,
   Ban,
   Copy,
+  Database,
   Download,
   Globe,
   Laptop,
@@ -30,10 +33,12 @@ import {
   Play,
   Plus,
   RefreshCw,
+  Search,
   Shield,
   Sliders,
   Trash2,
   Upload,
+  X,
 } from 'lucide-react';
 import type React from 'react';
 import { useCallback, useEffect, useState } from 'react';
@@ -41,6 +46,7 @@ import { toast } from 'sonner';
 import { StatusBadge } from './common/Badge';
 import { EmptyState } from './common/EmptyState';
 import { JsonImportModal } from './common/JsonImportModal';
+import { DEFAULT_INDEXEDDB_QUOTA_BYTES, IndexedDbPickerModal } from './IndexedDbPickerModal';
 
 export interface RulesTabProps {
   globalSearch: string;
@@ -79,12 +85,19 @@ export const RulesTab: React.FC<RulesTabProps> = ({
   const [blPattern, setBlPattern] = useState('');
   const [blReason, setBlReason] = useState('');
 
-  // Add Site Override Form
+  // Add / Edit Site Override Form
   const [ovSiteKey, setOvSiteKey] = useState('');
   const [ovDirection, setOvDirection] = useState<SyncDirection>('bidirectional');
   const [ovSyncCookies, setOvSyncCookies] = useState(true);
   const [ovSyncLs, setOvSyncLs] = useState(true);
-  const [ovAutoRefresh, setOvAutoRefresh] = useState(false);
+  const [ovSyncSs, setOvSyncSs] = useState(false);
+  const [ovSsAllowlist, setOvSsAllowlist] = useState('');
+  const [ovSyncIndexedDb, setOvSyncIndexedDb] = useState(false);
+  const [ovIndexedDbTargets, setOvIndexedDbTargets] = useState<IndexedDbTargetRule[]>([]);
+  const [ovIdbDbName, setOvIdbDbName] = useState('');
+  const [ovIdbStores, setOvIdbStores] = useState('');
+  const [ovAutoRefresh, setOvAutoRefresh] = useState(true);
+  const [idbPickerOpen, setIdbPickerOpen] = useState(false);
 
   // Add SSO Group Form
   const [ssoName, setSsoName] = useState('');
@@ -99,6 +112,7 @@ export const RulesTab: React.FC<RulesTabProps> = ({
   const [envSourceTrackId, setEnvSourceTrackId] = useState('');
   const [envTargetUrl, setEnvTargetUrl] = useState('http://localhost:3000');
   const [envSyncLs, setEnvSyncLs] = useState(true);
+  const [envSyncSs, setEnvSyncSs] = useState(false);
   const [envAdaptHttp, setEnvAdaptHttp] = useState(true);
   const [envCleanTarget, setEnvCleanTarget] = useState(true);
   const [envAutoSync, setEnvAutoSync] = useState(true);
@@ -114,6 +128,7 @@ export const RulesTab: React.FC<RulesTabProps> = ({
     setEnvSourceTrackId('');
     setEnvTargetUrl('http://localhost:3000');
     setEnvSyncLs(true);
+    setEnvSyncSs(false);
     setEnvAdaptHttp(true);
     setEnvCleanTarget(true);
     setEnvAutoSync(true);
@@ -130,6 +145,7 @@ export const RulesTab: React.FC<RulesTabProps> = ({
     setEnvSourceTrackId(rule.sourceTrackId || '');
     setEnvTargetUrl(rule.targetUrl);
     setEnvSyncLs(rule.syncLocalStorage);
+    setEnvSyncSs(Boolean(rule.syncSessionStorage));
     setEnvAdaptHttp(rule.adaptForHttp);
     setEnvCleanTarget(rule.cleanTargetBeforeSync);
     setEnvAutoSync(rule.autoSync);
@@ -210,6 +226,69 @@ export const RulesTab: React.FC<RulesTabProps> = ({
     }
   };
 
+  const resetOverrideForm = () => {
+    setOvSiteKey('');
+    setOvDirection('bidirectional');
+    setOvSyncCookies(true);
+    setOvSyncLs(true);
+    setOvSyncSs(false);
+    setOvSsAllowlist('');
+    setOvSyncIndexedDb(false);
+    setOvIndexedDbTargets([]);
+    setOvIdbDbName('');
+    setOvIdbStores('');
+    setOvAutoRefresh(true);
+  };
+
+  const startEditOverride = (rule: SiteRuleOverride) => {
+    setOvSiteKey(rule.siteKey);
+    setOvDirection(rule.direction);
+    setOvSyncCookies(rule.syncCookies);
+    setOvSyncLs(rule.syncLocalStorage);
+    setOvSyncSs(Boolean(rule.syncSessionStorage));
+    setOvSsAllowlist((rule.sessionStorageKeyAllowlist ?? []).join(', '));
+    setOvSyncIndexedDb(Boolean(rule.syncIndexedDb));
+    setOvIndexedDbTargets(rule.indexedDbTargets ? [...rule.indexedDbTargets] : []);
+    setOvAutoRefresh(rule.autoRefresh);
+  };
+
+  const mergeIdbTargets = (incoming: IndexedDbTargetRule[]) => {
+    setOvIndexedDbTargets(prev => {
+      const next = [...prev];
+      for (const item of incoming) {
+        const idx = next.findIndex(t => t.dbName === item.dbName);
+        if (idx >= 0) {
+          const mergedStores = Array.from(
+            new Set([...(next[idx].objectStores ?? []), ...(item.objectStores ?? [])]),
+          ).filter(Boolean);
+          next[idx] = {
+            ...next[idx],
+            objectStores: mergedStores.length > 0 ? mergedStores : undefined,
+          };
+        } else {
+          next.push(item);
+        }
+      }
+      return next;
+    });
+    setOvSyncIndexedDb(true);
+  };
+
+  const handleAddManualIdbTarget = () => {
+    const dbName = ovIdbDbName.trim();
+    if (!dbName) {
+      toast.warning('请输入 IndexedDB 数据库名称 (dbName)');
+      return;
+    }
+    const stores = ovIdbStores
+      .split(/[,，\s]+/)
+      .map(s => s.trim())
+      .filter(Boolean);
+    mergeIdbTargets([{ dbName, objectStores: stores.length > 0 ? stores : undefined }]);
+    setOvIdbDbName('');
+    setOvIdbStores('');
+  };
+
   const handleUpsertOverride = async (e: React.FormEvent) => {
     e.preventDefault();
     const siteKey = ovSiteKey.trim().toLowerCase();
@@ -217,20 +296,31 @@ export const RulesTab: React.FC<RulesTabProps> = ({
       toast.warning('请输入站点域名 (siteKey)');
       return;
     }
+    const allowlist = ovSsAllowlist
+      .split(/[,，\s]+/)
+      .map(s => s.trim())
+      .filter(Boolean);
+    const existing = data.siteOverrides[siteKey];
     setBusyKey('add-ov');
     try {
       const rule: SiteRuleOverride = {
         siteKey,
-        pattern: siteKey,
+        pattern: existing?.pattern || siteKey,
         direction: ovDirection,
         syncCookies: ovSyncCookies,
         syncLocalStorage: ovSyncLs,
+        syncSessionStorage: ovSyncSs,
+        sessionStorageKeyAllowlist: allowlist.length > 0 ? allowlist : undefined,
+        syncIndexedDb: ovSyncIndexedDb,
+        indexedDbTargets: ovIndexedDbTargets.length > 0 ? ovIndexedDbTargets : undefined,
+        indexedDbMaxTotalBytes: existing?.indexedDbMaxTotalBytes ?? DEFAULT_INDEXEDDB_QUOTA_BYTES,
+        watchedCookieNames: existing?.watchedCookieNames,
         autoRefresh: ovAutoRefresh,
         updatedAt: Date.now(),
       };
       await sidePanelApi.upsertSiteRule(rule);
       toast.success(`已保存站点策略：${siteKey} (${getDirectionLabel(ovDirection)})`);
-      setOvSiteKey('');
+      resetOverrideForm();
       await loadRules();
       await onStatusChanged();
     } catch (err) {
@@ -340,6 +430,7 @@ export const RulesTab: React.FC<RulesTabProps> = ({
         targetUrl: dst,
         syncCookies: true,
         syncLocalStorage: envSyncLs,
+        syncSessionStorage: envSyncSs,
         adaptForHttp: envAdaptHttp,
         cleanTargetBeforeSync: envCleanTarget,
         autoSync: envAutoSync,
@@ -371,8 +462,9 @@ export const RulesTab: React.FC<RulesTabProps> = ({
     try {
       const res = await sidePanelApi.executeEnvSync({ ruleId: rule.id, reverse });
       const lsHint = res.appliedLocalStorage > 0 ? `、${res.appliedLocalStorage} 项 LS` : '';
+      const ssHint = (res.appliedSessionStorage ?? 0) > 0 ? `、${res.appliedSessionStorage} 项 SS` : '';
       toast.success(
-        `${reverse ? '反向' : '环境'}同步完成：写入 ${res.appliedCookies} 条 Cookie${lsHint}${
+        `${reverse ? '反向' : '环境'}同步完成：写入 ${res.appliedCookies} 条 Cookie${lsHint}${ssHint}${
           res.failedCookies > 0 ? `（失败 ${res.failedCookies} 条）` : ''
         }`,
       );
@@ -850,6 +942,12 @@ export const RulesTab: React.FC<RulesTabProps> = ({
                   </Label>
                 </div>
                 <div className="flex items-center gap-1.5">
+                  <Switch id="sp-env-ss" className="scale-75" checked={envSyncSs} onCheckedChange={setEnvSyncSs} />
+                  <Label htmlFor="sp-env-ss" className="text-[11px] cursor-pointer">
+                    同步 sessionStorage
+                  </Label>
+                </div>
+                <div className="flex items-center gap-1.5">
                   <Switch
                     id="sp-env-auto"
                     className="scale-75"
@@ -945,6 +1043,7 @@ export const RulesTab: React.FC<RulesTabProps> = ({
                       <div className="flex flex-wrap gap-1">
                         {rule.adaptForHttp ? <StatusBadge tone="neutral">HTTP适配</StatusBadge> : null}
                         {rule.syncLocalStorage ? <StatusBadge tone="neutral">含LS</StatusBadge> : null}
+                        {rule.syncSessionStorage ? <StatusBadge tone="neutral">含SS</StatusBadge> : null}
                         {rule.cleanTargetBeforeSync ? <StatusBadge tone="neutral">清理旧项</StatusBadge> : null}
                       </div>
                       <div className="flex items-center gap-1">
@@ -1043,6 +1142,23 @@ export const RulesTab: React.FC<RulesTabProps> = ({
                   </Label>
                 </div>
                 <div className="flex items-center gap-1.5">
+                  <Switch id="ov-sync-ss" className="scale-75" checked={ovSyncSs} onCheckedChange={setOvSyncSs} />
+                  <Label htmlFor="ov-sync-ss" className="text-xs cursor-pointer">
+                    同步 sessionStorage
+                  </Label>
+                </div>
+                <div className="flex items-center gap-1.5">
+                  <Switch
+                    id="ov-sync-idb"
+                    className="scale-75"
+                    checked={ovSyncIndexedDb}
+                    onCheckedChange={setOvSyncIndexedDb}
+                  />
+                  <Label htmlFor="ov-sync-idb" className="text-xs cursor-pointer">
+                    同步轻量 IndexedDB
+                  </Label>
+                </div>
+                <div className="flex items-center gap-1.5">
                   <Switch
                     id="ov-auto-refresh"
                     className="scale-75"
@@ -1054,7 +1170,126 @@ export const RulesTab: React.FC<RulesTabProps> = ({
                   </Label>
                 </div>
               </div>
-              <div className="flex justify-end">
+
+              {ovSyncSs ? (
+                <div className="space-y-1">
+                  <Label htmlFor="ov-ss-allowlist" className="text-[11px] text-muted-foreground">
+                    sessionStorage Key 白名单（可选，逗号分隔，留空则同步全部 Key）
+                  </Label>
+                  <Input
+                    id="ov-ss-allowlist"
+                    value={ovSsAllowlist}
+                    onChange={e => setOvSsAllowlist(e.target.value)}
+                    placeholder="例如 auth_token, oidc.user, tab_session"
+                    className="h-7 font-mono text-[11px]"
+                  />
+                </div>
+              ) : null}
+
+              {ovSyncIndexedDb ? (
+                <div className="space-y-2 rounded-lg border border-primary/25 bg-primary/[0.04] p-2.5">
+                  <div className="flex flex-wrap items-center justify-between gap-1.5">
+                    <span className="inline-flex items-center gap-1 font-medium text-foreground">
+                      <Database className="h-3.5 w-3.5 text-primary" />
+                      轻量 IndexedDB 白名单目标
+                    </span>
+                    <span className="text-[10px] text-muted-foreground">
+                      最大配额：默认 {formatByteSize(DEFAULT_INDEXEDDB_QUOTA_BYTES)} 熔断保护
+                    </span>
+                  </div>
+
+                  <div className="flex flex-wrap items-center gap-1.5">
+                    <Button
+                      type="button"
+                      variant="outline"
+                      size="sm"
+                      className="h-6 px-2 text-[11px] bg-background"
+                      onClick={() =>
+                        mergeIdbTargets([{ dbName: 'firebaseLocalStorageDb', objectStores: ['firebaseLocalStorage'] }])
+                      }>
+                      + Firebase Auth
+                    </Button>
+                    <Button
+                      type="button"
+                      variant="outline"
+                      size="sm"
+                      className="h-6 px-2 text-[11px] bg-background"
+                      onClick={() => mergeIdbTargets([{ dbName: 'localforage', objectStores: ['keyvaluepairs'] }])}>
+                      + LocalForage
+                    </Button>
+                    <Button
+                      type="button"
+                      variant="default"
+                      size="sm"
+                      className="h-6 px-2 text-[11px]"
+                      onClick={() => setIdbPickerOpen(true)}>
+                      <Search className="mr-1 h-3 w-3" />
+                      扫描打开标签页的 IndexedDB...
+                    </Button>
+                  </div>
+
+                  {ovIndexedDbTargets.length > 0 ? (
+                    <div className="flex flex-wrap gap-1.5">
+                      {ovIndexedDbTargets.map(target => (
+                        <span
+                          key={target.dbName}
+                          className="inline-flex items-center gap-1 rounded-md border border-border bg-background px-2 py-0.5 text-[11px]">
+                          <code className="font-mono font-semibold">{target.dbName}</code>
+                          <span className="text-muted-foreground">
+                            / {target.objectStores?.length ? target.objectStores.join(', ') : '全部 Store'}
+                          </span>
+                          <button
+                            type="button"
+                            onClick={() => setOvIndexedDbTargets(prev => prev.filter(t => t.dbName !== target.dbName))}
+                            className="ml-0.5 text-muted-foreground hover:text-rose-600"
+                            title="移除目标库">
+                            <X className="h-3 w-3" />
+                          </button>
+                        </span>
+                      ))}
+                    </div>
+                  ) : (
+                    <p className="text-[11px] text-amber-800 dark:text-amber-300">
+                      提示：请添加至少一个预设或通过「扫描打开标签页的 IndexedDB...」勾选需要同步的库表。
+                    </p>
+                  )}
+
+                  <div className="grid grid-cols-5 gap-1.5">
+                    <Input
+                      value={ovIdbDbName}
+                      onChange={e => setOvIdbDbName(e.target.value)}
+                      placeholder="dbName（手动添加）"
+                      className="col-span-2 h-7 bg-background font-mono text-[11px]"
+                    />
+                    <Input
+                      value={ovIdbStores}
+                      onChange={e => setOvIdbStores(e.target.value)}
+                      placeholder="objectStores（逗号分隔，可选）"
+                      className="col-span-2 h-7 bg-background font-mono text-[11px]"
+                    />
+                    <Button
+                      type="button"
+                      variant="outline"
+                      size="sm"
+                      className="h-7 text-[11px] bg-background"
+                      onClick={handleAddManualIdbTarget}>
+                      添加
+                    </Button>
+                  </div>
+                </div>
+              ) : null}
+
+              <div className="flex justify-end gap-1.5">
+                {ovSiteKey && data.siteOverrides[ovSiteKey.trim().toLowerCase()] ? (
+                  <Button
+                    type="button"
+                    variant="outline"
+                    size="sm"
+                    className="h-7 px-2.5 text-xs"
+                    onClick={resetOverrideForm}>
+                    重置表单
+                  </Button>
+                ) : null}
                 <Button type="submit" size="sm" className="h-7 px-3 text-xs" disabled={busyKey === 'add-ov'}>
                   <Plus className="mr-1 h-3.5 w-3.5" />
                   保存站点覆盖策略
@@ -1078,7 +1313,7 @@ export const RulesTab: React.FC<RulesTabProps> = ({
                         <span className="font-mono font-semibold text-foreground">{rule.siteKey}</span>
                         <p className="text-[10px] text-muted-foreground">更新于 {formatRelativeTime(rule.updatedAt)}</p>
                       </div>
-                      <div className="flex items-center gap-1.5">
+                      <div className="flex items-center gap-1">
                         <select
                           aria-label={`${rule.siteKey} 同步方向`}
                           value={rule.direction}
@@ -1091,6 +1326,14 @@ export const RulesTab: React.FC<RulesTabProps> = ({
                           <option value="disabled">禁用</option>
                           <option value="inherit">继承默认</option>
                         </select>
+                        <Button
+                          variant="ghost"
+                          size="icon"
+                          className="h-7 w-7 text-muted-foreground hover:text-foreground"
+                          onClick={() => startEditOverride(rule)}
+                          title="编辑单站扩展存储与策略">
+                          <Pencil className="h-3.5 w-3.5" />
+                        </Button>
                         <Button
                           variant="ghost"
                           size="icon"
@@ -1107,8 +1350,22 @@ export const RulesTab: React.FC<RulesTabProps> = ({
                         Cookie: {rule.syncCookies ? '开' : '关'}
                       </StatusBadge>
                       <StatusBadge tone={rule.syncLocalStorage ? 'success' : 'neutral'}>
-                        LocalStorage: {rule.syncLocalStorage ? '开' : '关'}
+                        LS: {rule.syncLocalStorage ? '开' : '关'}
                       </StatusBadge>
+                      {rule.syncSessionStorage ? (
+                        <StatusBadge tone="success">
+                          SS: 开
+                          {rule.sessionStorageKeyAllowlist?.length
+                            ? ` (${rule.sessionStorageKeyAllowlist.length} Key)`
+                            : ''}
+                        </StatusBadge>
+                      ) : null}
+                      {rule.syncIndexedDb ? (
+                        <StatusBadge tone="primary">
+                          IndexedDB: {rule.indexedDbTargets?.length ?? 0} 库 (上限{' '}
+                          {formatByteSize(rule.indexedDbMaxTotalBytes ?? DEFAULT_INDEXEDDB_QUOTA_BYTES)})
+                        </StatusBadge>
+                      ) : null}
                       <StatusBadge tone={rule.autoRefresh ? 'info' : 'neutral'}>
                         自动刷新: {rule.autoRefresh ? '开' : '关'}
                       </StatusBadge>
@@ -1204,6 +1461,20 @@ export const RulesTab: React.FC<RulesTabProps> = ({
         description="支持由 SessionMesh 导出的规则 JSON，将合并更新空间级黑名单、本机级黑名单及单站方向覆盖。"
         placeholder='{"spaceBlacklist": [], "deviceBlacklist": [], "siteOverrides": {}}'
         onImport={handleImportRules}
+      />
+
+      <IndexedDbPickerModal
+        open={idbPickerOpen}
+        onClose={() => setIdbPickerOpen(false)}
+        initialSiteKey={ovSiteKey.trim() || undefined}
+        existingTargets={ovIndexedDbTargets}
+        onApplyTargets={(resolvedSiteKey, targets) => {
+          if (!ovSiteKey.trim() && resolvedSiteKey) {
+            setOvSiteKey(resolvedSiteKey);
+          }
+          mergeIdbTargets(targets);
+          toast.success(`已勾选 ${targets.length} 个 IndexedDB 目标库，点击「保存站点覆盖策略」即可生效`);
+        }}
       />
     </div>
   );

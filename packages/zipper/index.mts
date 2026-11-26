@@ -7,7 +7,8 @@ const packageJson = JSON.parse(fs.readFileSync('../../package.json', 'utf8'));
 const YYYY_MM_DD = new Date().toISOString().slice(0, 10).replace(/-/g, '');
 const HH_mm_ss = new Date().toISOString().slice(11, 19).replace(/:/g, '');
 
-const fileName = `extension-${packageJson.version}-${YYYY_MM_DD}-${HH_mm_ss}`;
+const prefix = IS_FIREFOX ? 'extension-firefox' : 'extension';
+const fileName = `${prefix}-${packageJson.version}-${YYYY_MM_DD}-${HH_mm_ss}`;
 
 await zipBundle({
   distDirectory: resolve(import.meta.dirname, '..', '..', '..', 'dist'),

@@ -7,10 +7,14 @@ import {
   ArrowRight,
   ChevronDown,
   ChevronUp,
+  Clock,
+  ExternalLink,
+  FolderKey,
   Info,
   Loader2,
   RefreshCw,
   Settings,
+  Sliders,
   Trash2,
   Wrench,
   X,
@@ -22,7 +26,7 @@ import { toast } from 'sonner';
 export interface AttentionBannerProps {
   items: AttentionItem[];
   onRefreshAll: () => Promise<void>;
-  onNavigateTab: (tab: 'sites' | 'conflicts' | 'history', siteKey?: string) => void;
+  onNavigateTab: (tab: 'sites' | 'conflicts' | 'history' | 'rules', siteKey?: string) => void;
   onOpenOptions: () => void;
 }
 
@@ -290,10 +294,76 @@ export const AttentionBanner: React.FC<AttentionBannerProps> = ({
                         立即刷新该页
                       </Button>
                     ) : null}
+
+                    {item.kind === 'cookie_expiring' ? (
+                      <>
+                        {item.siteKey ? (
+                          <Button
+                            type="button"
+                            size="sm"
+                            onClick={() => {
+                              const url = `https://${item.siteKey}`;
+                              if (typeof chrome !== 'undefined' && chrome.tabs?.create) {
+                                chrome.tabs.create({ url });
+                              } else {
+                                window.open(url, '_blank');
+                              }
+                            }}
+                            className="h-6 px-2 text-[11px]">
+                            <ExternalLink className="mr-1 h-3 w-3" />
+                            打开站点续期
+                          </Button>
+                        ) : null}
+                        {item.siteKey ? (
+                          <Button
+                            type="button"
+                            size="sm"
+                            variant="outline"
+                            onClick={() => onNavigateTab('sites', item.siteKey)}
+                            className="h-6 px-2 text-[11px]">
+                            查看 Cookies
+                          </Button>
+                        ) : null}
+                      </>
+                    ) : null}
+
+                    {item.kind === 'local_dir_permission_needed' ? (
+                      <Button type="button" size="sm" onClick={onOpenOptions} className="h-6 px-2 text-[11px]">
+                        <FolderKey className="mr-1 h-3 w-3" />
+                        前往控制中心恢复目录授权
+                      </Button>
+                    ) : null}
+
+                    {item.kind === 'indexeddb_quota_exceeded' ? (
+                      <Button
+                        type="button"
+                        size="sm"
+                        onClick={() => onNavigateTab('rules', item.siteKey)}
+                        className="h-6 px-2 text-[11px]">
+                        <Sliders className="mr-1 h-3 w-3" />
+                        调整同步规则
+                      </Button>
+                    ) : null}
+
+                    {item.kind === 'ephemeral_track_expired' ? (
+                      <Button
+                        type="button"
+                        size="sm"
+                        variant="outline"
+                        disabled={isBusy}
+                        onClick={() => void handleDismiss(item.id, '已关闭临时账号清理通知')}
+                        className="h-6 px-2 text-[11px]">
+                        <Clock className="mr-1 h-3 w-3" />
+                        知道了
+                      </Button>
+                    ) : null}
                   </div>
                 </div>
 
-                {item.dismissible ? (
+                {item.dismissible ||
+                item.kind === 'cookie_expiring' ||
+                item.kind === 'indexeddb_quota_exceeded' ||
+                item.kind === 'ephemeral_track_expired' ? (
                   <button
                     type="button"
                     disabled={isBusy}

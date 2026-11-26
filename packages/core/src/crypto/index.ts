@@ -1,4 +1,4 @@
-export { bytesToBase64, base64ToBytes, bytesToHex } from './encoding';
+export { bytesToBase64, base64ToBytes, bytesToBase64Url, base64UrlToBytes, bytesToHex } from './encoding';
 export {
   type SmesHeader,
   SmesCryptoError,
@@ -18,3 +18,21 @@ export {
   parseSmesHeader,
 } from './smes';
 export { encodePairingCode, decodePairingCode } from './pairing';
+export {
+  SESSION_SHARE_PREFIX,
+  SESSION_SHARE_AAD,
+  SESSION_SHARE_PBKDF2_ITERATIONS,
+  generateSharePassphrase,
+  encodeSessionShare,
+  decodeSessionShare,
+  toSessionSharePreview,
+  clampSharedCookiesExpiry,
+} from './sessionShare';
+export {
+  type TypedCloneEncodeResult,
+  type IdbKeyEncodeResult,
+  encodeTypedValue,
+  decodeTypedValue,
+  encodeIdbKey,
+  decodeIdbKey,
+} from './typedCloneCodec';

@@ -2,13 +2,23 @@ import { extractErrorMessage, sidePanelApi } from '@console/lib/api';
 import { useBannerPrefs } from '@console/lib/bannerPrefs';
 import {
   copyToClipboard,
+  decodeIdbKeyPreview,
+  decodeTypedClonePreview,
   formatCookieExpiry,
   formatDateTime,
   formatRelativeTime,
+  getObjectTypeLabel,
   getSameSiteLabel,
   shortId,
 } from '@console/lib/format';
-import type { ConflictRecord, CookieRecord, LocalStorageRecord } from '@sessionmesh/shared';
+import type {
+  ConflictRecord,
+  CookieRecord,
+  IndexedDbRecord,
+  LocalStorageRecord,
+  SessionStorageRecord,
+  SyncRecord,
+} from '@sessionmesh/shared';
 import { Button } from '@sessionmesh/ui';
 import {
   CheckCircle2,
@@ -36,17 +46,36 @@ export interface ConflictsTabProps {
   layout?: 'compact' | 'wide';
 }
 
-function isCookieRecord(rec: CookieRecord | LocalStorageRecord): rec is CookieRecord {
+function isCookieRecord(rec: SyncRecord): rec is CookieRecord {
   return 'domain' in rec && 'name' in rec;
+}
+
+function isIndexedDbRecord(rec: SyncRecord): rec is IndexedDbRecord {
+  return 'dbName' in rec && 'encodedKey' in rec;
+}
+
+function getSyncRecordValueText(rec: SyncRecord): string {
+  if (isIndexedDbRecord(rec)) {
+    return decodeTypedClonePreview(rec.encodedValue);
+  }
+  return (rec as CookieRecord | LocalStorageRecord | SessionStorageRecord).value;
+}
+
+function getSyncRecordNameText(rec: SyncRecord): string {
+  if (isCookieRecord(rec)) return rec.name;
+  if (isIndexedDbRecord(rec)) return `${rec.dbName}.${rec.storeName}:${decodeIdbKeyPreview(rec.encodedKey)}`;
+  return rec.key;
 }
 
 const RecordSideCard: React.FC<{
   side: 'local' | 'remote';
-  record: CookieRecord | LocalStorageRecord;
+  record: SyncRecord;
   isWinner: boolean;
   valueDiffers: boolean;
 }> = ({ side, record, isWinner, valueDiffers }) => {
   const isCookie = isCookieRecord(record);
+  const isIdb = isIndexedDbRecord(record);
+  const valueText = getSyncRecordValueText(record);
   const vcEntries = Object.entries(record.version?.vectorClock || {});
 
   return (
@@ -79,7 +108,7 @@ const RecordSideCard: React.FC<{
           <button
             type="button"
             onClick={async () => {
-              const ok = await copyToClipboard(record.value);
+              const ok = await copyToClipboard(valueText);
               if (ok) toast.success('已复制该版本值');
             }}
             className="text-muted-foreground hover:text-foreground"
@@ -93,7 +122,7 @@ const RecordSideCard: React.FC<{
               ? 'border-amber-500/40 bg-amber-500/[0.06] text-foreground'
               : 'border-border/70 bg-background text-foreground/90'
           }`}>
-          {record.deleted ? '<已删除 Tombstone>' : record.value || '<空字符串>'}
+          {record.deleted ? '<已删除 Tombstone>' : valueText || '<空字符串>'}
         </pre>
       </div>
 
@@ -125,6 +154,21 @@ const RecordSideCard: React.FC<{
                 PartitionKey：<span className="font-mono text-foreground">{record.partitionKey.topLevelSite}</span>
               </p>
             ) : null}
+          </>
+        ) : isIdb ? (
+          <>
+            <p className="truncate">
+              Origin：<span className="font-mono text-foreground">{record.origin}</span>
+            </p>
+            <p className="truncate">
+              库表：
+              <span className="font-mono text-foreground">
+                {record.dbName} / {record.storeName}
+              </span>
+            </p>
+            <p className="truncate">
+              Key：<span className="font-mono text-foreground">{decodeIdbKeyPreview(record.encodedKey)}</span>
+            </p>
           </>
         ) : (
           <>
@@ -162,7 +206,7 @@ const RecordSideCard: React.FC<{
               <code
                 key={devId}
                 className="rounded border border-border bg-background px-1 py-0.2 font-mono text-[9px] text-foreground">
-                {shortId(devId, 8)}:{seq}
+                {shortId(devId, 8)}:{String(seq)}
               </code>
             ))
           )}
@@ -227,12 +271,14 @@ export const ConflictsTab: React.FC<ConflictsTabProps> = ({
   const filteredConflicts = conflicts.filter(c => {
     if (filterMode === 'unresolved' && c.resolved) return false;
     if (!query) return true;
-    const itemName = isCookieRecord(c.localRecord) ? c.localRecord.name : c.localRecord.key;
+    const itemName = getSyncRecordNameText(c.localRecord);
+    const localVal = getSyncRecordValueText(c.localRecord);
+    const remoteVal = getSyncRecordValueText(c.remoteRecord);
     return (
       c.siteKey.toLowerCase().includes(query) ||
       itemName.toLowerCase().includes(query) ||
-      c.localRecord.value.toLowerCase().includes(query) ||
-      c.remoteRecord.value.toLowerCase().includes(query)
+      localVal.toLowerCase().includes(query) ||
+      remoteVal.toLowerCase().includes(query)
     );
   });
 
@@ -316,10 +362,9 @@ export const ConflictsTab: React.FC<ConflictsTabProps> = ({
         ) : (
           <div className="space-y-3">
             {filteredConflicts.map(conflict => {
-              const itemName = isCookieRecord(conflict.localRecord)
-                ? conflict.localRecord.name
-                : conflict.localRecord.key;
-              const valueDiffers = conflict.localRecord.value !== conflict.remoteRecord.value;
+              const itemName = getSyncRecordNameText(conflict.localRecord);
+              const valueDiffers =
+                getSyncRecordValueText(conflict.localRecord) !== getSyncRecordValueText(conflict.remoteRecord);
               const resolvingLocal = busyId === `${conflict.conflictId}:local`;
               const resolvingRemote = busyId === `${conflict.conflictId}:remote`;
 
@@ -336,9 +381,7 @@ export const ConflictsTab: React.FC<ConflictsTabProps> = ({
                         <GitMerge className="h-3.5 w-3.5 text-amber-600 dark:text-amber-400 shrink-0" />
                         <span className="font-semibold text-foreground">{conflict.siteKey}</span>
                         <code className="rounded bg-muted px-1.5 py-0.5 font-mono text-[11px]">{itemName}</code>
-                        <StatusBadge tone="neutral">
-                          {conflict.objectType === 'cookie' ? 'Cookie' : 'LocalStorage'}
-                        </StatusBadge>
+                        <StatusBadge tone="neutral">{getObjectTypeLabel(conflict.objectType)}</StatusBadge>
                       </div>
                       <p className="mt-1 flex flex-wrap items-center gap-1.5 text-[11px] text-muted-foreground">
                         <span>检测于 {formatRelativeTime(conflict.detectedAt)}</span>

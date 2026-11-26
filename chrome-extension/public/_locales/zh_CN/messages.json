@@ -5,6 +5,22 @@
   },
   "extensionDescription": {
     "description": "扩展描述",
-    "message": "基于 WebDAV 与端到端加密的多设备浏览器登录态自动同步扩展"
+    "message": "支持本地同步盘、GitHub Gist、S3/R2 与 WebDAV 的端到端加密多设备网站登录态自动同步扩展"
+  },
+  "cmdRotateAccountNext": {
+    "description": "切换当前网站下一个账号快捷键描述",
+    "message": "切换到当前网站下一个账号"
+  },
+  "cmdRotateAccountPrev": {
+    "description": "切换当前网站上一个账号快捷键描述",
+    "message": "切换到当前网站上一个账号"
+  },
+  "cmdSyncCurrentSite": {
+    "description": "立即同步当前网站快捷键描述",
+    "message": "立即同步当前网站登录态"
+  },
+  "cmdCopyCurrentCurl": {
+    "description": "复制当前网站 cURL 命令快捷键描述",
+    "message": "复制当前网站请求为 cURL"
   }
 }

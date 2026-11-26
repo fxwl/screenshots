@@ -2,14 +2,14 @@ import type {
   BrowserCandidateSite,
   CapabilityReport,
   InitialJoinReport,
+  PairingPayload,
   PendingSiteDecision,
   RemoteSpacePasswordVerifyResult,
   RemoteSpaceProbeItem,
   SpaceSettings,
+  StorageProviderConfig,
   SyncScopeMode,
   SyncTimingMode,
-  WebDAVAuthType,
-  WebDAVConfig,
 } from '@sessionmesh/core';
 import { unwrapCommand } from '@sessionmesh/shared';
 import {
@@ -38,59 +38,80 @@ import {
   ArrowLeft,
   ArrowRight,
   Ban,
+  BookOpen,
   Check,
   CheckCircle2,
   ChevronDown,
   ChevronUp,
-  Cloud,
   CloudUpload,
+  Copy,
   Crown,
+  Dices,
   Eye,
   EyeOff,
+  FolderOpen,
   FolderPlus,
   Globe,
   KeyRound,
-  Layers,
+  Laptop,
   Loader2,
   Lock,
   PanelRightOpen,
   Plus,
   QrCode,
   RefreshCw,
+  Rocket,
   Search,
   Server,
-  ShieldAlert,
   ShieldCheck,
+  Sliders,
   Sparkles,
   X,
 } from 'lucide-react';
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { toast } from 'sonner';
 import {
+  copyToClipboard,
   detectDefaultDeviceName,
   extractErrorMessage,
   formatRelativeTime,
+  generateShortPairingPin,
+  getStorageProviderMeta,
   openSidePanelFromWindow,
   PRESET_BLACKLIST_OPTIONS,
   saveUiNonSensitiveMeta,
   useUiBannerPrefs,
-  WEBDAV_PRESETS,
+  useUxOnboardingPrefs,
   type PresetBlacklistCategory,
 } from '../utils/helpers';
+import { isDirectoryPickerSupported, pickAndStoreLocalDirectory } from '../utils/localDirHandles';
 import { CapabilityReportView } from './CapabilityReportView';
 import { PendingDecisionsPanel } from './PendingDecisionsPanel';
+import {
+  buildStorageConfigFromDraft,
+  createDefaultStorageDraft,
+  draftFromStorageConfig,
+  extractStorageSecretForCompare,
+  getStorageVerifyIdentity,
+  StorageProviderForm,
+  stripWebdavProvider,
+  toNonSensitiveMetaPatch,
+  validateStorageDraft,
+  type StorageFormDraft,
+} from './StorageProviderForm';
 
-interface OnboardingWizardProps {
+export interface OnboardingWizardProps {
   alreadyConfigured?: boolean;
+  initialEntryMode?: 'new_device' | 'pair_code';
   onComplete: () => void | Promise<void>;
   onCancel?: () => void;
+  onOpenTutorials?: () => void;
 }
 
 const STEPS = [
-  { id: 1, title: '连接 WebDAV', subtitle: '支持配对码快填与自动空间探测' },
-  { id: 2, title: '同步空间与加密', subtitle: '加入已有空间或创建新空间' },
-  { id: 3, title: '纳管范围与安全', subtitle: '按需纳管、主基准设备与黑名单' },
-  { id: 4, title: '选择同步网站', subtitle: '勾选纳管网站与处理重叠决策' },
+  { id: 1, title: '选择存储位置', subtitle: '本地同步盘 / Gist / R2 / WebDAV' },
+  { id: 2, title: '设置加密密码', subtitle: '保护登录数据，仅你自己可解' },
+  { id: 3, title: '勾选同步网站', subtitle: '挑出需要多端共享的网站' },
 ] as const;
 
 function resolveProbeSpaceId(item: RemoteSpaceProbeItem): string {
@@ -107,31 +128,53 @@ function resolveProbeSpaceName(item: RemoteSpaceProbeItem): string {
   return item.spaceId || item.opaqueId;
 }
 
-export function OnboardingWizard({ alreadyConfigured = false, onComplete, onCancel }: OnboardingWizardProps) {
-  const { isBannerVisible, dismissBanner } = useUiBannerPrefs();
-  const [step, setStep] = useState<1 | 2 | 3 | 4>(1);
+function parseSmartPairingInput(raw: string): { code: string; pin?: string } {
+  const codeMatch = raw.match(/smesh:\/\/pair\/[A-Za-z0-9._~+/=-]+/);
+  const pinMatch = raw.match(/(?:口令|PIN|密码)\s*[:：]\s*([^\s\r\n]+)/i);
+  return {
+    code: codeMatch ? codeMatch[0] : raw.trim(),
+    pin: pinMatch ? pinMatch[1].trim() : undefined,
+  };
+}
 
-  // Step 1: Pairing code quick-fill
-  const [pairingOpen, setPairingOpen] = useState(false);
+function readInitialEntryMode(propMode?: 'new_device' | 'pair_code'): 'new_device' | 'pair_code' {
+  if (propMode) return propMode;
+  try {
+    const params = new URLSearchParams(window.location.search);
+    if (params.get('mode') === 'pair') return 'pair_code';
+  } catch {
+    // ignore
+  }
+  return 'new_device';
+}
+
+export function OnboardingWizard({
+  alreadyConfigured = false,
+  initialEntryMode,
+  onComplete,
+  onCancel,
+  onOpenTutorials,
+}: OnboardingWizardProps) {
+  const { isBannerVisible, dismissBanner } = useUiBannerPrefs();
+  const { prefs: uxPrefs, updatePrefs: updateUxPrefs, markGuideTaskDone } = useUxOnboardingPrefs();
+  const expertMode = uxPrefs.onboardingExpertMode;
+
+  const [entryMode, setEntryMode] = useState<'new_device' | 'pair_code'>(() => readInitialEntryMode(initialEntryMode));
+  const [step, setStep] = useState<1 | 2 | 3>(1);
+
+  // Express Pairing state (Channel B)
   const [pairingCode, setPairingCode] = useState('');
   const [pairingPassphrase, setPairingPassphrase] = useState('');
   const [decodingPairing, setDecodingPairing] = useState(false);
   const [pairedFromDevice, setPairedFromDevice] = useState<string | null>(null);
+  const [pickingPairedLocalDir, setPickingPairedLocalDir] = useState(false);
 
-  // Step 1: WebDAV connection form
-  const [url, setUrl] = useState('');
-  const [authType, setAuthType] = useState<WebDAVAuthType>('basic');
-  const [username, setUsername] = useState('');
-  const [password, setPassword] = useState('');
-  const [bearerToken, setBearerToken] = useState('');
-  const [rootPath, setRootPath] = useState('/SessionMesh');
-  const [showWebdavSecret, setShowWebdavSecret] = useState(false);
-  const [allowLocalHttp, setAllowLocalHttp] = useState(false);
-  const [storageFormat, setStorageFormat] = useState<'binary_enc' | 'base64_txt' | undefined>(undefined);
-  const [activePresetTip, setActivePresetTip] = useState<string | null>(null);
-
-  // Step 1: Capability test
+  // Step 1: Multi-backend storage form (default to easiest beginner option if supported, or webdav)
+  const [storageDraft, setStorageDraft] = useState<StorageFormDraft>(() =>
+    createDefaultStorageDraft(isDirectoryPickerSupported() ? 'local_directory' : 'github_gist'),
+  );
   const [testingConn, setTestingConn] = useState(false);
+  const [advancingStep1, setAdvancingStep1] = useState(false);
   const [capabilityReport, setCapabilityReport] = useState<CapabilityReport | null>(null);
   const [step1Error, setStep1Error] = useState<string | null>(null);
 
@@ -143,7 +186,9 @@ export function OnboardingWizard({ alreadyConfigured = false, onComplete, onCanc
   const [spaceMode, setSpaceMode] = useState<'create' | 'join'>('create');
   const [spaceId, setSpaceId] = useState('default');
   const [spaceName, setSpaceName] = useState('默认同步空间');
+  const [showCustomSpaceMeta, setShowCustomSpaceMeta] = useState(false);
   const userEditedStep2Ref = useRef(false);
+  const storageVersionRef = useRef(0);
   const [deviceName, setDeviceName] = useState(() => detectDefaultDeviceName());
   const [encryptionPassword, setEncryptionPassword] = useState('');
   const [confirmPassword, setConfirmPassword] = useState('');
@@ -155,7 +200,8 @@ export function OnboardingWizard({ alreadyConfigured = false, onComplete, onCanc
     message: string;
   } | null>(null);
 
-  // Step 3: Managed scope, authority device, security & blacklist presets + settings
+  // Step 2 Collapsible Advanced Policy Settings
+  const [policyExpanded, setPolicyExpanded] = useState(false);
   const [syncScopeMode, setSyncScopeMode] = useState<SyncScopeMode>('managed_only');
   const [setAsPrimaryAuthority, setSetAsPrimaryAuthority] = useState(false);
   const [selectedPresets, setSelectedPresets] = useState<PresetBlacklistCategory[]>(() =>
@@ -171,12 +217,12 @@ export function OnboardingWizard({ alreadyConfigured = false, onComplete, onCanc
   const [joiningSpace, setJoiningSpace] = useState(false);
   const [joinError, setJoinError] = useState<string | null>(null);
 
-  // Step 4: InitialJoinReport + Opt-In Managed Sites picker state
+  // Step 3: InitialJoinReport + Opt-In Managed Sites picker + Instant Pairing Generator
   const [joinReport, setJoinReport] = useState<InitialJoinReport | null>(null);
   const [pendingDecisions, setPendingDecisions] = useState<PendingSiteDecision[]>([]);
   const [blacklistedUploaded, setBlacklistedUploaded] = useState<Record<string, boolean>>({});
   const [blacklistingSite, setBlacklistingSite] = useState<Record<string, boolean>>({});
-  const [showExcludedList, setShowExcludedList] = useState(false);
+  const [showReportDetails, setShowReportDetails] = useState(false);
 
   const [candidateSites, setCandidateSites] = useState<BrowserCandidateSite[]>([]);
   const [loadingCandidates, setLoadingCandidates] = useState(false);
@@ -185,78 +231,67 @@ export function OnboardingWizard({ alreadyConfigured = false, onComplete, onCanc
   const [selectedCandidateKeys, setSelectedCandidateKeys] = useState<Record<string, boolean>>({});
   const [addingManaged, setAddingManaged] = useState(false);
 
-  // Scroll cleanly to top whenever moving between onboarding steps
+  // Instant pairing generator on Step 3 finish screen
+  const [finishPairingOpen, setFinishPairingOpen] = useState(false);
+  const [finishPairingPin, setFinishPairingPin] = useState('');
+  const [finishPairingCode, setFinishPairingCode] = useState('');
+  const [generatingFinishPair, setGeneratingFinishPair] = useState(false);
+
   useEffect(() => {
     try {
       window.scrollTo({ top: 0, behavior: 'instant' });
     } catch {
       window.scrollTo(0, 0);
     }
-  }, [step]);
+  }, [step, entryMode]);
 
-  // Auto-hint Nutstore low-frequency mode when URL matches jianguoyun.com
   useEffect(() => {
-    if (url.toLowerCase().includes('jianguoyun.com')) {
+    if (expertMode) {
+      setShowCustomSpaceMeta(true);
+      setPolicyExpanded(true);
+    }
+  }, [expertMode]);
+
+  useEffect(() => {
+    if (storageDraft.provider === 'webdav' && storageDraft.webdavUrl.toLowerCase().includes('jianguoyun.com')) {
       setLowFrequencyMode(true);
     }
-  }, [url]);
+  }, [storageDraft.provider, storageDraft.webdavUrl]);
 
-  const buildWebDAVConfig = (): WebDAVConfig => {
-    const trimmedUrl = url.trim();
-    const rawRoot = (rootPath.trim() || '/SessionMesh').replace(/\/+$/, '');
-    const normalizedRoot = rawRoot ? (rawRoot.startsWith('/') ? rawRoot : `/${rawRoot}`) : '/SessionMesh';
-    const isLocalhost = /^http:\/\/(localhost|127\.0\.0\.1)(:\d+)?(\/|$)/i.test(trimmedUrl);
-    return {
-      url: trimmedUrl,
-      authType,
-      username: authType === 'bearer' ? undefined : username.trim(),
-      password: authType === 'bearer' ? undefined : password,
-      bearerToken: authType === 'bearer' ? bearerToken.trim() : undefined,
-      rootPath: normalizedRoot,
-      retryPolicy: lowFrequencyMode ? 'low_frequency_nutstore' : 'standard',
-      storageFormat,
-      allowInsecureLocalhostForTesting: allowLocalHttp && isLocalhost ? true : undefined,
-    };
+  const handleStorageDraftChange = (next: StorageFormDraft) => {
+    storageVersionRef.current += 1;
+    setStorageDraft(next);
+    setStep1Error(null);
+    setHasProbedSpaces(false);
+    setProbeError(null);
+    setCapabilityReport(null);
+    userEditedStep2Ref.current = false;
   };
 
-  const validateStep1 = (): string | null => {
-    const trimmed = url.trim();
-    if (!trimmed) return '请填写 WebDAV 服务器地址。';
-    const isHttps = trimmed.startsWith('https://');
-    const isLocalHttp = /^http:\/\/(localhost|127\.0\.0\.1)(:\d+)?(\/|$)/i.test(trimmed);
-    if (!isHttps && !(allowLocalHttp && isLocalHttp)) {
-      return '出于凭据安全要求，WebDAV 服务器必须使用 https:// 协议（禁止不安全的明文 HTTP）。';
-    }
-    try {
-      new URL(trimmed);
-    } catch {
-      return 'WebDAV URL 格式无效，请检查协议、主机名与路径。';
-    }
-    if (authType === 'bearer') {
-      if (!bearerToken.trim()) return '请填写 Bearer Token。';
-    } else {
-      if (!username.trim()) return '请填写 WebDAV 用户名。';
-      if (!password) return '请填写 WebDAV 密码或应用专用密码。';
-    }
-    return null;
-  };
-
-  const probeSpaces = async (explicitConfig?: WebDAVConfig) => {
-    if (!explicitConfig) {
-      const errMsg = validateStep1();
+  const probeSpaces = async (
+    explicitStorage?: StorageProviderConfig,
+    expectedVersion?: number,
+  ): Promise<RemoteSpaceProbeItem[]> => {
+    const versionAtStart = expectedVersion ?? storageVersionRef.current;
+    if (!explicitStorage) {
+      const errMsg = validateStorageDraft(storageDraft);
       if (errMsg) {
         setStep1Error(errMsg);
-        return;
+        return [];
       }
       setStep1Error(null);
     }
     setProbingSpaces(true);
     setProbeError(null);
     try {
+      const storage = explicitStorage ?? buildStorageConfigFromDraft(storageDraft, { lowFrequencyMode });
       const list = await unwrapCommand<RemoteSpaceProbeItem[]>({
-        type: 'PROBE_REMOTE_SPACES',
-        config: explicitConfig ?? buildWebDAVConfig(),
+        type: 'PROBE_STORAGE_SPACES',
+        storage,
       });
+      if (storageVersionRef.current !== versionAtStart) {
+        return [];
+      }
       const safeList = Array.isArray(list) ? list : [];
       setRemoteSpaces(safeList);
       setHasProbedSpaces(true);
@@ -265,63 +300,169 @@ export function OnboardingWizard({ alreadyConfigured = false, onComplete, onCanc
           setSpaceMode('join');
           const first = safeList[0];
           if (first) {
-            const targetId = resolveProbeSpaceId(first);
-            const targetName = resolveProbeSpaceName(first);
-            setSpaceId(targetId);
-            setSpaceName(targetName);
+            setSpaceId(resolveProbeSpaceId(first));
+            setSpaceName(resolveProbeSpaceName(first));
           }
         } else {
           setSpaceMode('create');
         }
       }
+      return safeList;
     } catch (err) {
-      setProbeError(extractErrorMessage(err));
-      setHasProbedSpaces(true);
+      if (storageVersionRef.current === versionAtStart) {
+        setProbeError(extractErrorMessage(err));
+        setHasProbedSpaces(true);
+      }
+      return [];
     } finally {
       setProbingSpaces(false);
     }
   };
 
+  const runCapabilityTestInternal = async (opts?: { silentSuccessToast?: boolean }): Promise<boolean> => {
+    const errMsg = validateStorageDraft(storageDraft);
+    if (errMsg) {
+      setStep1Error(errMsg);
+      return false;
+    }
+    const versionAtStart = storageVersionRef.current;
+    const draftSnapshot = storageDraft;
+    setStep1Error(null);
+    setTestingConn(true);
+    try {
+      const cfg = buildStorageConfigFromDraft(draftSnapshot, { lowFrequencyMode });
+      const report = await unwrapCommand<CapabilityReport>({
+        type: 'TEST_STORAGE_CONNECTION',
+        storage: cfg,
+      });
+      if (storageVersionRef.current !== versionAtStart) {
+        return false;
+      }
+      setCapabilityReport(report);
+
+      let nextDraft = draftSnapshot;
+      let nextCfg = cfg;
+      if (report.overallOk && report.recommendedStorageFormat && draftSnapshot.provider === 'webdav') {
+        nextDraft = { ...nextDraft, webdavStorageFormat: report.recommendedStorageFormat };
+        setStorageDraft(prev =>
+          storageVersionRef.current === versionAtStart && prev.provider === 'webdav'
+            ? { ...prev, webdavStorageFormat: report.recommendedStorageFormat }
+            : prev,
+        );
+        nextCfg = buildStorageConfigFromDraft(nextDraft, { lowFrequencyMode });
+      }
+      if (
+        report.overallOk &&
+        report.resolvedGistId &&
+        draftSnapshot.provider === 'github_gist' &&
+        !draftSnapshot.gistId.trim()
+      ) {
+        nextDraft = { ...nextDraft, gistId: report.resolvedGistId };
+        setStorageDraft(prev =>
+          storageVersionRef.current === versionAtStart && prev.provider === 'github_gist' && !prev.gistId.trim()
+            ? { ...prev, gistId: report.resolvedGistId! }
+            : prev,
+        );
+        nextCfg = buildStorageConfigFromDraft(nextDraft, { lowFrequencyMode });
+      }
+
+      await saveUiNonSensitiveMeta({
+        ...toNonSensitiveMetaPatch(nextDraft),
+        lastCapabilityReport: report,
+      });
+      if (storageVersionRef.current !== versionAtStart) {
+        return false;
+      }
+      if (report.overallOk) {
+        if (!opts?.silentSuccessToast) {
+          toast.success('存储连接检测通过！');
+        }
+        await probeSpaces(nextCfg, versionAtStart);
+        return true;
+      }
+      toast.error('存储连接检测未通过，请展开下方检测详情排查');
+      return false;
+    } catch (err) {
+      if (storageVersionRef.current === versionAtStart) {
+        const msg = extractErrorMessage(err);
+        setStep1Error(msg);
+        toast.error(`连接失败：${msg}`);
+      }
+      return false;
+    } finally {
+      setTestingConn(false);
+    }
+  };
+
   const handleSelectRemoteSpaceAndAdvance = (item: RemoteSpaceProbeItem) => {
-    const targetId = resolveProbeSpaceId(item);
-    const targetName = resolveProbeSpaceName(item);
     setSpaceMode('join');
-    setSpaceId(targetId);
-    setSpaceName(targetName);
+    setSpaceId(resolveProbeSpaceId(item));
+    setSpaceName(resolveProbeSpaceName(item));
     setStep1Error(null);
     setStep(2);
   };
 
-  const handleDecodePairingCode = async () => {
-    if (!pairingCode.trim() || !pairingPassphrase) {
-      toast.warning('请同时输入 smesh://pair/... 配对码和解密口令');
+  const goToStep2 = async () => {
+    const errMsg = validateStorageDraft(storageDraft);
+    if (errMsg) {
+      setStep1Error(errMsg);
       return;
     }
-    setDecodingPairing(true);
+    if (capabilityReport?.overallOk) {
+      setStep1Error(null);
+      setStep(2);
+      if (!hasProbedSpaces) {
+        void probeSpaces();
+      }
+      return;
+    }
+    setAdvancingStep1(true);
     try {
-      const decoded = await unwrapCommand<{
-        webdav: WebDAVConfig;
-        spaceId: string;
-        spaceName: string;
-        fromDeviceName: string;
-      }>({
+      const ok = await runCapabilityTestInternal({ silentSuccessToast: true });
+      if (ok) {
+        setStep(2);
+      }
+    } finally {
+      setAdvancingStep1(false);
+    }
+  };
+
+  const handleDecodePairingCode = async () => {
+    const parsed = parseSmartPairingInput(pairingCode);
+    const effectiveCode = parsed.code;
+    const effectivePassphrase = pairingPassphrase || parsed.pin || '';
+
+    if (!effectiveCode || !effectivePassphrase) {
+      toast.warning('请粘贴 smesh://pair/... 配对码并填写配对口令');
+      return;
+    }
+    if (parsed.pin && !pairingPassphrase) {
+      setPairingPassphrase(parsed.pin);
+    }
+    if (effectiveCode !== pairingCode.trim()) {
+      setPairingCode(effectiveCode);
+    }
+
+    setDecodingPairing(true);
+    setJoinError(null);
+    try {
+      const decoded = await unwrapCommand<PairingPayload>({
         type: 'DECODE_PAIRING_CODE',
-        code: pairingCode.trim(),
-        passphrase: pairingPassphrase,
+        code: effectiveCode,
+        passphrase: effectivePassphrase,
       });
 
-      setUrl(decoded.webdav.url || '');
-      setAuthType(decoded.webdav.authType || 'basic');
-      setUsername(decoded.webdav.username || '');
-      setPassword(decoded.webdav.password || '');
-      setBearerToken(decoded.webdav.bearerToken || '');
-      setRootPath(decoded.webdav.rootPath || '/SessionMesh');
-      if (decoded.webdav.allowInsecureLocalhostForTesting) {
-        setAllowLocalHttp(true);
+      const resolvedStorage: StorageProviderConfig | undefined =
+        decoded.storage ?? (decoded.webdav ? { provider: 'webdav', ...decoded.webdav } : undefined);
+
+      if (resolvedStorage) {
+        storageVersionRef.current += 1;
+        setStorageDraft(draftFromStorageConfig(resolvedStorage));
+        if (resolvedStorage.provider === 'webdav' && resolvedStorage.url.toLowerCase().includes('jianguoyun.com')) {
+          setLowFrequencyMode(true);
+        }
       }
-      if (decoded.webdav.storageFormat) {
-        setStorageFormat(decoded.webdav.storageFormat);
-      }
+
       if (decoded.spaceId) {
         setSpaceId(decoded.spaceId);
         setSpaceMode('join');
@@ -330,10 +471,15 @@ export function OnboardingWizard({ alreadyConfigured = false, onComplete, onCanc
         setSpaceName(decoded.spaceName);
       }
       setPairedFromDevice(decoded.fromDeviceName || '其他设备');
-      setPairingOpen(false);
       setStep1Error(null);
       setHasProbedSpaces(false);
-      toast.success(`已从「${decoded.fromDeviceName || '其他设备'}」配对码自动填入 WebDAV 与空间信息`);
+      setCapabilityReport(null);
+
+      if (resolvedStorage?.provider === 'local_directory') {
+        toast.info('配对码已解密！请点击下方按钮选择本机对应的云盘同步文件夹。');
+      } else {
+        toast.success(`配对码解密成功！输入空间主密码即可一键接入「${decoded.spaceName || decoded.spaceId}」`);
+      }
     } catch (err) {
       toast.error(`配对码解密失败：${extractErrorMessage(err)}`);
     } finally {
@@ -341,105 +487,58 @@ export function OnboardingWizard({ alreadyConfigured = false, onComplete, onCanc
     }
   };
 
-  const handleRunCapabilityTest = async () => {
-    const errMsg = validateStep1();
-    if (errMsg) {
-      setStep1Error(errMsg);
-      return;
-    }
-    setStep1Error(null);
-    setTestingConn(true);
+  const handlePickPairedLocalDir = async () => {
+    setPickingPairedLocalDir(true);
     try {
-      const cfg = buildWebDAVConfig();
-      const report = await unwrapCommand<CapabilityReport>({
-        type: 'TEST_WEBDAV_CONNECTION',
-        config: cfg,
-      });
-      setCapabilityReport(report);
-      if (report.recommendedStorageFormat) {
-        setStorageFormat(report.recommendedStorageFormat);
-      }
-      await saveUiNonSensitiveMeta({
-        webdavUrl: cfg.url,
-        authType: cfg.authType,
-        rootPath: cfg.rootPath,
-        username: cfg.username,
-        lastCapabilityReport: report,
-      });
-      if (report.overallOk) {
-        toast.success(
-          `19 项检测完成：${report.consistencyLevel === 'strong_cas' ? '强一致 CAS 模式' : '单写者追加兼容模式'}`,
-        );
-        // Pillar 2: Immediately auto-detect remote spaces right in Step 1!
-        await probeSpaces({
-          ...cfg,
-          storageFormat: report.recommendedStorageFormat ?? cfg.storageFormat,
-        });
-      } else {
-        toast.error('WebDAV 能力检测未通过，请展开清单查看失败项');
-      }
+      const picked = await pickAndStoreLocalDirectory();
+      setStorageDraft(prev => ({
+        ...prev,
+        localDirHandleKey: picked.handleKey,
+        localDirLabel: picked.directoryLabel,
+      }));
+      toast.success(`已选择同步文件夹「${picked.directoryLabel}」`);
     } catch (err) {
-      const msg = extractErrorMessage(err);
-      setStep1Error(msg);
-      toast.error(`连接测试失败：${msg}`);
+      const isAbort = err instanceof Error && err.name === 'AbortError';
+      if (!isAbort) {
+        toast.error(`选择文件夹失败：${extractErrorMessage(err)}`);
+      }
     } finally {
-      setTestingConn(false);
+      setPickingPairedLocalDir(false);
     }
   };
 
-  const goToStep2 = async () => {
-    const errMsg = validateStep1();
-    if (errMsg) {
-      setStep1Error(errMsg);
-      return;
-    }
-    if (capabilityReport && !capabilityReport.overallOk) {
-      toast.warning('当前服务器未通过能力检测，请先修复 WebDAV 配置后再继续');
-      return;
-    }
-    setStep1Error(null);
-    setStep(2);
-    if (!hasProbedSpaces) {
-      void probeSpaces();
-    }
-  };
-
-  const currentVerifyKey = `${url.trim()}|${rootPath.trim()}|${spaceMode}|${spaceId.trim()}|${encryptionPassword}`;
+  const currentVerifyKey = `${getStorageVerifyIdentity(storageDraft)}|${spaceMode}|${spaceId.trim()}|${encryptionPassword}`;
 
   const verifyStep2EncryptionPassword = async (): Promise<boolean> => {
-    const trimmedSpaceId = spaceId.trim();
-    if (!trimmedSpaceId) {
-      toast.warning('请先填写同步空间 ID（如 default）');
-      return false;
-    }
+    const trimmedSpaceId = spaceId.trim() || 'default';
     if (!encryptionPassword || encryptionPassword.length < 6) {
       toast.warning('请输入至少 6 位的端到端加密主密码');
       return false;
     }
     if (spaceMode === 'create' && encryptionPassword !== confirmPassword) {
-      toast.warning('两次输入的端到端加密密码不一致，请核对');
+      toast.warning('两次输入的加密主密码不一致，请核对');
       return false;
     }
 
     setVerifyingPassword(true);
     try {
-      const cfg = buildWebDAVConfig();
+      const cfg = buildStorageConfigFromDraft(storageDraft, { lowFrequencyMode });
       const res = await unwrapCommand<RemoteSpacePasswordVerifyResult>({
-        type: 'VERIFY_SPACE_PASSWORD',
-        webdav: cfg,
+        type: 'VERIFY_STORAGE_SPACE_PASSWORD',
+        storage: cfg,
         spaceId: trimmedSpaceId,
         encryptionPassword,
       });
 
       if (spaceMode === 'join') {
         if (!res.exists) {
-          const msg = `远端 WebDAV 未找到 ID 为「${trimmedSpaceId}」的同步空间，请核对空间 ID 或切换为「创建新同步空间」`;
+          const msg = `存储中未找到空间「${trimmedSpaceId}」，请检查存储目录或切换为「创建新空间」`;
           setPasswordVerifyState({ ok: false, key: currentVerifyKey, message: msg });
           toast.error(msg);
           return false;
         }
         if (!res.verified) {
-          const msg = res.errorMessage || '端到端加密主密码错误，无法解密远端空间元数据，请核对后重试';
+          const msg = res.errorMessage || '加密主密码不正确，无法解锁远端空间，请核对当初在首台电脑设置的密码';
           setPasswordVerifyState({ ok: false, key: currentVerifyKey, message: msg });
           toast.error(msg);
           return false;
@@ -447,15 +546,15 @@ export function OnboardingWizard({ alreadyConfigured = false, onComplete, onCanc
         if (res.spaceName) {
           setSpaceName(res.spaceName);
         }
-        const okMsg = `主密码验证通过：已成功解密远端空间「${res.spaceName || res.spaceId || trimmedSpaceId}」`;
+        const okMsg = `主密码验证通过：已解锁空间「${res.spaceName || res.spaceId || trimmedSpaceId}」`;
         setPasswordVerifyState({ ok: true, key: currentVerifyKey, message: okMsg });
-        toast.success(okMsg);
         return true;
       }
 
       // spaceMode === 'create'
       if (res.exists && !res.verified) {
-        const msg = `远端已存在 ID 为「${trimmedSpaceId}」的同步空间，但当前主密码无法解密。请更换全新的空间 ID，或切换为「加入已有同步空间」并输入原主密码。`;
+        const msg = `存储中已存在空间「${trimmedSpaceId}」，且当前密码无法解锁它。若这是您的第 2 台电脑，请输入原主密码；若想另建新空间，请点开「自定义空间名称/ID」更换空间 ID。`;
+        setShowCustomSpaceMeta(true);
         setPasswordVerifyState({ ok: false, key: currentVerifyKey, message: msg });
         toast.error(msg);
         return false;
@@ -465,19 +564,21 @@ export function OnboardingWizard({ alreadyConfigured = false, onComplete, onCanc
           setSpaceName(res.spaceName);
         }
         setSpaceMode('join');
-        const nextKey = `${url.trim()}|${rootPath.trim()}|join|${trimmedSpaceId}|${encryptionPassword}`;
-        const okMsg = `检测到远端已存在空间「${res.spaceName || res.spaceId || trimmedSpaceId}」且主密码校验通过，已自动切换为加入模式`;
+        const nextKey = `${getStorageVerifyIdentity(storageDraft)}|join|${trimmedSpaceId}|${encryptionPassword}`;
+        const okMsg = `检测到已有空间「${res.spaceName || trimmedSpaceId}」且主密码匹配，已自动切换为加入该空间`;
         setPasswordVerifyState({ ok: true, key: nextKey, message: okMsg });
         toast.success(okMsg);
         return true;
       }
 
-      const okMsg = `校验通过：远端空间 ID「${trimmedSpaceId}」尚未占用，主密码可用于初始化新空间`;
-      setPasswordVerifyState({ ok: true, key: currentVerifyKey, message: okMsg });
-      toast.success(okMsg);
+      setPasswordVerifyState({
+        ok: true,
+        key: currentVerifyKey,
+        message: '主密码校验就绪，可安全初始化加密空间',
+      });
       return true;
     } catch (err) {
-      const msg = `主密码校验失败：${extractErrorMessage(err)}`;
+      const msg = `校验失败：${extractErrorMessage(err)}`;
       setPasswordVerifyState({ ok: false, key: currentVerifyKey, message: msg });
       toast.error(msg);
       return false;
@@ -486,35 +587,98 @@ export function OnboardingWizard({ alreadyConfigured = false, onComplete, onCanc
     }
   };
 
-  const goToStep3 = async () => {
-    if (!spaceId.trim()) {
-      toast.warning('请填写同步空间 ID（如 default）');
+  const executeVerifyAndJoin = async () => {
+    const draftErr = validateStorageDraft(storageDraft);
+    if (draftErr) {
+      setJoinError(draftErr);
+      toast.warning(draftErr);
       return;
     }
     if (!deviceName.trim()) {
-      toast.warning('请填写本机设备名称（如 Windows Edge）');
+      toast.warning('请填写本机名称（例如：公司台式机 / 家用笔记本）');
       return;
     }
     if (!encryptionPassword || encryptionPassword.length < 6) {
-      toast.warning('请输入至少 6 位的端到端加密密码');
+      toast.warning('请输入至少 6 位的端到端加密主密码');
       return;
     }
     if (spaceMode === 'create' && encryptionPassword !== confirmPassword) {
-      toast.warning('两次输入的端到端加密密码不一致，请核对');
+      toast.warning('两次输入的加密主密码不一致，请核对');
       return;
     }
-    if (authType !== 'bearer' && password && encryptionPassword === password) {
-      toast.warning('强烈建议端到端加密密码与 WebDAV 密码不同，以防云盘密码泄漏导致密文被解');
+
+    const storageSecret = extractStorageSecretForCompare(storageDraft);
+    if (storageSecret && encryptionPassword === storageSecret) {
+      toast.warning('建议加密主密码与存储凭据设置不同密码，安全性更高');
     }
 
-    // Always verify E2E encryption password against remote WebDAV before leaving Step 2
-    if (!passwordVerifyState?.ok || passwordVerifyState.key !== currentVerifyKey) {
-      const ok = await verifyStep2EncryptionPassword();
-      if (!ok) {
-        return;
+    setJoiningSpace(true);
+    setJoinError(null);
+    try {
+      if (!passwordVerifyState?.ok || passwordVerifyState.key !== currentVerifyKey) {
+        const verified = await verifyStep2EncryptionPassword();
+        if (!verified) {
+          setJoiningSpace(false);
+          return;
+        }
       }
+
+      const effectiveSpaceId = spaceId.trim() || 'default';
+      const cfg = buildStorageConfigFromDraft(storageDraft, { lowFrequencyMode });
+      const settingsPatch: Partial<SpaceSettings> = {
+        autoSync,
+        syncTimingMode,
+        syncLocalStorage,
+        autoRefresh,
+        refreshProtection,
+        lowFrequencyMode,
+        sessionLockEnabled,
+        pollingIntervalSec: lowFrequencyMode ? 300 : 60,
+        syncScopeMode,
+      };
+      const report = await unwrapCommand<InitialJoinReport>({
+        type: 'SAVE_AND_JOIN_SPACE',
+        storage: cfg,
+        webdav: cfg.provider === 'webdav' ? stripWebdavProvider(cfg) : undefined,
+        spaceId: effectiveSpaceId,
+        spaceName: spaceName.trim() || effectiveSpaceId,
+        encryptionPassword,
+        deviceName: deviceName.trim(),
+        presetCategories: selectedPresets,
+        settingsPatch,
+      });
+
+      if (setAsPrimaryAuthority && report.deviceId) {
+        try {
+          await unwrapCommand({
+            type: 'SET_SPACE_AUTHORITY_POLICY',
+            authorityMode: 'primary_device',
+            primaryDeviceId: report.deviceId,
+          });
+        } catch (authErr) {
+          toast.warning(`已开启空间，但设为主基准设备失败：${extractErrorMessage(authErr)}`);
+        }
+      }
+
+      await saveUiNonSensitiveMeta({
+        ...toNonSensitiveMetaPatch(storageDraft),
+        lastCapabilityReport: capabilityReport ?? undefined,
+      });
+
+      setJoinReport(report);
+      setPendingDecisions(report.pendingDecisions ?? []);
+      setEntryMode('new_device');
+      setStep(3);
+      toast.success(
+        report.isNewSpace ? `已创建加密同步空间「${report.spaceName}」` : `已加入同步空间「${report.spaceName}」`,
+      );
+    } catch (err) {
+      const msg = extractErrorMessage(err);
+      setJoinError(msg);
+      toast.error(`开启同步失败：${msg}`);
+    } finally {
+      setJoiningSpace(false);
     }
-    setStep(3);
   };
 
   const togglePreset = (cat: PresetBlacklistCategory) => {
@@ -542,7 +706,7 @@ export function OnboardingWizard({ alreadyConfigured = false, onComplete, onCanc
   }, []);
 
   useEffect(() => {
-    if (step === 4 && joinReport) {
+    if (step === 3 && joinReport) {
       void loadCandidateSites();
     }
   }, [step, joinReport, loadCandidateSites]);
@@ -585,14 +749,12 @@ export function OnboardingWizard({ alreadyConfigured = false, onComplete, onCanc
     });
   };
 
-  const handleClearCandidateSelection = () => {
-    setSelectedCandidateKeys({});
-  };
-
-  const handleAddSelectedManagedSites = async () => {
+  const handleAddSelectedManagedSites = async (silentIfEmpty = false): Promise<boolean> => {
     if (selectedCandidateList.length === 0) {
-      toast.warning('请先勾选至少一个需要纳入同步管理的网站');
-      return;
+      if (!silentIfEmpty) {
+        toast.warning('请先勾选至少一个需要同步的网站');
+      }
+      return true;
     }
     setAddingManaged(true);
     try {
@@ -600,75 +762,16 @@ export function OnboardingWizard({ alreadyConfigured = false, onComplete, onCanc
         type: 'ADD_MANAGED_SITES',
         siteKeys: selectedCandidateList,
       });
-      toast.success(`已将 ${selectedCandidateList.length} 个网站纳入同步管理并开始加密同步`);
+      await markGuideTaskDone('first_site');
+      toast.success(`已开启 ${selectedCandidateList.length} 个网站的自动加密同步`);
       setSelectedCandidateKeys({});
       await loadCandidateSites();
+      return true;
     } catch (err) {
-      toast.error(`纳入同步管理失败：${extractErrorMessage(err)}`);
+      toast.error(`添加同步网站失败：${extractErrorMessage(err)}`);
+      return false;
     } finally {
       setAddingManaged(false);
-    }
-  };
-
-  const handleSaveAndJoin = async () => {
-    setJoiningSpace(true);
-    setJoinError(null);
-    try {
-      const cfg = buildWebDAVConfig();
-      const settingsPatch: Partial<SpaceSettings> = {
-        autoSync,
-        syncTimingMode,
-        syncLocalStorage,
-        autoRefresh,
-        refreshProtection,
-        lowFrequencyMode,
-        sessionLockEnabled,
-        pollingIntervalSec: lowFrequencyMode ? 300 : 60,
-        syncScopeMode,
-      };
-      const report = await unwrapCommand<InitialJoinReport>({
-        type: 'SAVE_AND_JOIN_SPACE',
-        webdav: cfg,
-        spaceId: spaceId.trim(),
-        spaceName: spaceName.trim() || spaceId.trim(),
-        encryptionPassword,
-        deviceName: deviceName.trim(),
-        presetCategories: selectedPresets,
-        settingsPatch,
-      });
-
-      if (setAsPrimaryAuthority && report.deviceId) {
-        try {
-          await unwrapCommand({
-            type: 'SET_SPACE_AUTHORITY_POLICY',
-            authorityMode: 'primary_device',
-            primaryDeviceId: report.deviceId,
-          });
-        } catch (authErr) {
-          toast.warning(`已加入空间，但设置主基准设备失败：${extractErrorMessage(authErr)}`);
-        }
-      }
-
-      await saveUiNonSensitiveMeta({
-        webdavUrl: cfg.url,
-        authType: cfg.authType,
-        rootPath: cfg.rootPath,
-        username: cfg.username,
-        lastCapabilityReport: capabilityReport ?? undefined,
-      });
-
-      setJoinReport(report);
-      setPendingDecisions(report.pendingDecisions ?? []);
-      setStep(4);
-      toast.success(
-        report.isNewSpace ? `已创建新同步空间「${report.spaceName}」` : `已成功加入同步空间「${report.spaceName}」`,
-      );
-    } catch (err) {
-      const msg = extractErrorMessage(err);
-      setJoinError(msg);
-      toast.error(`加入空间失败：${msg}`);
-    } finally {
-      setJoiningSpace(false);
     }
   };
 
@@ -681,1486 +784,1317 @@ export function OnboardingWizard({ alreadyConfigured = false, onComplete, onCanc
           pattern: siteKey,
           matchType: 'subdomain',
           scope: 'device',
-          reason: '首次配置向导快速拉黑',
+          reason: '首次向导快速拉黑',
           presetCategory: 'custom',
         },
       });
       setBlacklistedUploaded(prev => ({ ...prev, [siteKey]: true }));
-      toast.success(`已将 ${siteKey} 加入本机黑名单，不再同步`);
+      toast.success(`已将 ${siteKey} 加入本机排除黑名单`);
     } catch (err) {
-      toast.error(`拉黑失败：${extractErrorMessage(err)}`);
+      toast.error(`操作失败：${extractErrorMessage(err)}`);
     } finally {
       setBlacklistingSite(prev => ({ ...prev, [siteKey]: false }));
     }
   };
 
+  const handleGenerateInstantPairBundle = async () => {
+    const pin = finishPairingPin.trim() || generateShortPairingPin(6);
+    setFinishPairingPin(pin);
+    setGeneratingFinishPair(true);
+    try {
+      const res = await unwrapCommand<string | { code: string }>({
+        type: 'GENERATE_PAIRING_CODE',
+        passphrase: pin,
+      });
+      const codeStr = typeof res === 'string' ? res : res?.code || '';
+      if (!codeStr) throw new Error('未能生成配对码');
+      setFinishPairingCode(codeStr);
+      await markGuideTaskDone('second_device');
+      toast.success('已生成跨设备配对码与口令！');
+    } catch (err) {
+      toast.error(`生成配对码失败：${extractErrorMessage(err)}`);
+    } finally {
+      setGeneratingFinishPair(false);
+    }
+  };
+
+  const handleFinishWizard = async () => {
+    if (selectedCandidateList.length > 0) {
+      const ok = await handleAddSelectedManagedSites(true);
+      if (!ok) return;
+    }
+    if (window.location.search.includes('onboarding=1') || window.location.search.includes('mode=pair')) {
+      window.history.replaceState({}, '', window.location.pathname);
+    }
+    await onComplete();
+  };
+
+  const pairedProviderMeta = getStorageProviderMeta(storageDraft.provider);
+
   return (
     <div className="mx-auto w-full max-w-4xl px-4 py-6">
       {/* Header */}
-      <div className="mb-6 flex flex-wrap items-center justify-between gap-4">
+      <div className="mb-5 flex flex-wrap items-center justify-between gap-3">
         <div className="flex items-center gap-3">
           <div className="flex h-11 w-11 items-center justify-center rounded-xl bg-primary/10 ring-1 ring-primary/20">
             <img src={chrome.runtime.getURL('options/logo.png')} alt="SessionMesh" className="h-8 w-8 object-contain" />
           </div>
           <div>
-            <h1 className="text-xl font-bold tracking-tight text-foreground">SessionMesh 首次配置向导</h1>
+            <h1 className="text-xl font-bold tracking-tight text-foreground">欢迎使用 SessionMesh</h1>
             <p className="text-xs text-muted-foreground">
-              4 步连接通用 WebDAV · 端到端 AES-256-GCM 加密 · 多设备自动发现与轨道决策
+              多台电脑无感共享网站登录状态 · 你的数据只加密存在你自己的网盘或文件夹里
             </p>
           </div>
         </div>
-        {alreadyConfigured && onCancel ? (
-          <Button type="button" variant="outline" size="sm" onClick={onCancel}>
-            <ArrowLeft className="mr-1.5 h-4 w-4" />
-            返回控制中心
-          </Button>
-        ) : null}
-      </div>
 
-      {/* 4-Step Progress Bar */}
-      <div className="mb-6 grid grid-cols-2 gap-2 sm:grid-cols-4">
-        {STEPS.map(item => {
-          const done = step > item.id;
-          const active = step === item.id;
-          return (
-            <div
-              key={item.id}
-              className={`rounded-xl border px-3 py-2.5 transition-all ${
-                active
-                  ? 'border-primary bg-primary/8 shadow-sm'
-                  : done
-                    ? 'border-emerald-500/35 bg-emerald-500/5'
-                    : 'border-border bg-card/60 opacity-75'
-              }`}>
-              <div className="flex items-center gap-2">
-                <span
-                  className={`flex h-6 w-6 shrink-0 items-center justify-center rounded-full text-xs font-bold ${
-                    done
-                      ? 'bg-emerald-600 text-white'
-                      : active
-                        ? 'bg-primary text-primary-foreground'
-                        : 'bg-muted text-muted-foreground'
-                  }`}>
-                  {done ? <Check className="h-3.5 w-3.5" /> : item.id}
-                </span>
-                <span className="truncate text-xs font-semibold text-foreground">{item.title}</span>
-              </div>
-              <p className="mt-1 truncate pl-8 text-[11px] text-muted-foreground">{item.subtitle}</p>
-            </div>
-          );
-        })}
-      </div>
+        <div className="flex flex-wrap items-center gap-2">
+          <button
+            type="button"
+            onClick={() => {
+              const next = !expertMode;
+              void updateUxPrefs({ onboardingExpertMode: next });
+              toast.info(next ? '已切换至专家模式（展开全部高级参数）' : '已切换至极简模式（隐藏低频工程选项）');
+            }}
+            className={`inline-flex items-center gap-1.5 rounded-full border px-3 py-1.5 text-xs font-medium transition-colors ${
+              expertMode
+                ? 'border-primary bg-primary/10 text-primary'
+                : 'border-border bg-muted/50 text-muted-foreground hover:text-foreground'
+            }`}>
+            <Sliders className="h-3.5 w-3.5" />
+            {expertMode ? '专家模式：已开启' : '极简向导模式'}
+          </button>
 
-      {/* STEP 1 */}
-      {step === 1 ? (
-        <div className="space-y-4">
-          {/* Collapsible Pairing Code Card */}
-          <Card className="border-primary/30 bg-primary/[0.03]">
-            <button
-              type="button"
-              onClick={() => setPairingOpen(prev => !prev)}
-              className="flex w-full items-center justify-between px-5 py-3.5 text-left">
-              <div className="flex items-center gap-2.5">
-                <div className="flex h-8 w-8 items-center justify-center rounded-lg bg-primary/15 text-primary">
-                  <QrCode className="h-4 w-4" />
-                </div>
-                <div>
-                  <div className="text-sm font-semibold text-foreground">
-                    已有其他设备？粘贴 <code className="rounded bg-muted px-1.5 py-0.5 text-xs">smesh://pair/...</code>{' '}
-                    配对码一键填入
-                  </div>
-                  <p className="text-xs text-muted-foreground">
-                    10 秒完成设备 B/C 接入，自动解密填充 WebDAV 地址、凭据、根目录与空间信息
-                  </p>
-                </div>
-              </div>
-              {pairingOpen ? (
-                <ChevronUp className="h-4 w-4 text-muted-foreground" />
-              ) : (
-                <ChevronDown className="h-4 w-4 text-muted-foreground" />
-              )}
-            </button>
-
-            {pairingOpen ? (
-              <CardContent className="border-t border-border/60 pt-4 space-y-3">
-                <div className="space-y-1.5">
-                  <Label htmlFor="pairingCode">加密配对码</Label>
-                  <Textarea
-                    id="pairingCode"
-                    rows={3}
-                    value={pairingCode}
-                    onChange={e => setPairingCode(e.target.value)}
-                    placeholder="粘贴从设备 A 生成的 smesh://pair/v1.xxxx..."
-                    className="font-mono text-xs"
-                  />
-                </div>
-                <div className="flex flex-col gap-2 sm:flex-row sm:items-end">
-                  <div className="flex-1 space-y-1.5">
-                    <Label htmlFor="pairingPassphrase">配对解密口令</Label>
-                    <Input
-                      id="pairingPassphrase"
-                      type="password"
-                      value={pairingPassphrase}
-                      onChange={e => setPairingPassphrase(e.target.value)}
-                      placeholder="输入生成配对码时设置的口令（通常为空间加密密码）"
-                    />
-                  </div>
-                  <Button
-                    type="button"
-                    onClick={handleDecodePairingCode}
-                    disabled={decodingPairing}
-                    className="sm:w-44">
-                    {decodingPairing ? (
-                      <Loader2 className="mr-2 h-4 w-4 animate-spin" />
-                    ) : (
-                      <Sparkles className="mr-2 h-4 w-4" />
-                    )}
-                    解密并一键填入
-                  </Button>
-                </div>
-              </CardContent>
-            ) : null}
-          </Card>
-
-          {pairedFromDevice ? (
-            <Alert className="border-emerald-500/40 bg-emerald-500/10 pr-10">
-              <CheckCircle2 className="h-4 w-4 text-emerald-600" />
-              <AlertTitle className="text-sm">已从「{pairedFromDevice}」配对码自动填入</AlertTitle>
-              <AlertDescription className="text-xs">
-                目标同步空间：<strong>{spaceName}</strong>（ID: <code>{spaceId}</code>
-                ）。建议先点击下方测试连接，再进入下一步输入空间主加密密码。
-              </AlertDescription>
-              <button
-                type="button"
-                aria-label="关闭提示"
-                onClick={() => setPairedFromDevice(null)}
-                className="absolute right-3 top-3 rounded p-1 text-muted-foreground hover:bg-background/60 hover:text-foreground">
-                <X className="h-3.5 w-3.5" />
-              </button>
-            </Alert>
+          {alreadyConfigured && onOpenTutorials ? (
+            <Button type="button" variant="ghost" size="sm" onClick={onOpenTutorials}>
+              <BookOpen className="mr-1.5 h-4 w-4" />
+              图文教程
+            </Button>
           ) : null}
 
-          <Card>
-            <CardHeader>
-              <CardTitle className="flex items-center gap-2 text-lg">
-                <Server className="h-5 w-5 text-primary" />
-                Step 1 · 连接 WebDAV 服务器
-              </CardTitle>
-              <CardDescription>
-                支持任意标准 RFC 4918 HTTPS WebDAV 服务。所有同步数据在离开浏览器前均强制端到端加密。
-              </CardDescription>
-            </CardHeader>
-            <CardContent className="space-y-4">
-              {/* Provider Quick-Hint Chips */}
-              <div className="space-y-2">
-                <Label className="text-xs text-muted-foreground">常见 WebDAV 服务地址示例（点击快速参考/填充）：</Label>
-                <div className="flex flex-wrap gap-2">
-                  {WEBDAV_PRESETS.map(preset => (
-                    <button
-                      key={preset.id}
-                      type="button"
-                      onClick={() => {
-                        setUrl(preset.exampleUrl);
-                        setAuthType(preset.defaultAuthType);
-                        setRootPath(preset.defaultRootPath);
-                        setActivePresetTip(preset.tip);
-                        if (preset.recommendLowFreq) setLowFrequencyMode(true);
-                      }}
-                      className="inline-flex items-center gap-1.5 rounded-full border border-border bg-secondary/60 px-3 py-1 text-xs font-medium text-secondary-foreground transition-colors hover:border-primary/50 hover:bg-primary/10">
-                      <Cloud className="h-3 w-3 text-primary" />
-                      {preset.label}
-                    </button>
-                  ))}
-                </div>
-                {activePresetTip ? (
-                  <p className="rounded-lg bg-muted/60 px-3 py-2 text-xs text-muted-foreground">{activePresetTip}</p>
-                ) : null}
+          {alreadyConfigured && onCancel ? (
+            <Button type="button" variant="outline" size="sm" onClick={onCancel}>
+              <ArrowLeft className="mr-1.5 h-4 w-4" />
+              返回控制中心
+            </Button>
+          ) : null}
+        </div>
+      </div>
+
+      {/* Top Entry Fork (First Device vs Second Device Pairing) — shown before final Step 3 */}
+      {step < 3 ? (
+        <div className="mb-5 grid gap-3 sm:grid-cols-2">
+          <button
+            type="button"
+            onClick={() => setEntryMode('new_device')}
+            className={`flex items-start gap-3 rounded-xl border p-3.5 text-left transition-all ${
+              entryMode === 'new_device'
+                ? 'border-primary bg-primary/[0.07] ring-1 ring-primary/40 shadow-2xs'
+                : 'border-border bg-card hover:border-primary/40 hover:bg-muted/30'
+            }`}>
+            <div
+              className={`mt-0.5 flex h-9 w-9 shrink-0 items-center justify-center rounded-xl ${
+                entryMode === 'new_device' ? 'bg-primary text-primary-foreground' : 'bg-muted text-muted-foreground'
+              }`}>
+              <Rocket className="h-4 w-4" />
+            </div>
+            <div className="min-w-0">
+              <div className="flex items-center gap-2">
+                <span className="text-sm font-bold text-foreground">我是第 1 台电脑（从零开始）</span>
+                <Badge variant="success" className="px-1.5 py-0 text-[10px]">
+                  3 步完成
+                </Badge>
               </div>
+              <p className="mt-0.5 text-xs text-muted-foreground">
+                选择本地同步盘、GitHub Gist 或云盘，设置加密主密码并挑出要同步的网站
+              </p>
+            </div>
+          </button>
 
-              <div className="grid gap-4 sm:grid-cols-2">
-                <div className="space-y-1.5 sm:col-span-2">
-                  <Label htmlFor="webdavUrl">WebDAV 服务器地址（强制 HTTPS）*</Label>
-                  <Input
-                    id="webdavUrl"
-                    type="url"
-                    value={url}
-                    onChange={e => {
-                      setUrl(e.target.value);
-                      setStep1Error(null);
-                      setHasProbedSpaces(false);
-                      userEditedStep2Ref.current = false;
-                    }}
-                    placeholder="https://dav.jianguoyun.com/dav/ 或 https://cloud.example.com/remote.php/dav/files/user/"
-                  />
-                </div>
-
-                <div className="space-y-1.5">
-                  <Label>认证方式</Label>
-                  <Select value={authType} onValueChange={val => setAuthType(val as WebDAVAuthType)}>
-                    <SelectTrigger>
-                      <SelectValue placeholder="选择认证方式" />
-                    </SelectTrigger>
-                    <SelectContent>
-                      <SelectItem value="basic">Basic 账号密码</SelectItem>
-                      <SelectItem value="app_password">应用专用密码（坚果云 / Nextcloud 推荐）</SelectItem>
-                      <SelectItem value="bearer">Bearer Token</SelectItem>
-                    </SelectContent>
-                  </Select>
-                </div>
-
-                <div className="space-y-1.5">
-                  <Label htmlFor="rootPath">远端根目录</Label>
-                  <Input
-                    id="rootPath"
-                    value={rootPath}
-                    onChange={e => {
-                      setRootPath(e.target.value);
-                      setHasProbedSpaces(false);
-                      userEditedStep2Ref.current = false;
-                    }}
-                    placeholder="/SessionMesh"
-                  />
-                </div>
-
-                {authType === 'bearer' ? (
-                  <div className="space-y-1.5 sm:col-span-2">
-                    <div className="flex items-center justify-between">
-                      <Label htmlFor="bearerToken">Bearer Token *</Label>
-                      <button
-                        type="button"
-                        onClick={() => setShowWebdavSecret(prev => !prev)}
-                        className="inline-flex items-center gap-1 text-xs text-muted-foreground hover:text-foreground">
-                        {showWebdavSecret ? <EyeOff className="h-3.5 w-3.5" /> : <Eye className="h-3.5 w-3.5" />}
-                        {showWebdavSecret ? '隐藏' : '显示'}
-                      </button>
-                    </div>
-                    <Input
-                      id="bearerToken"
-                      type={showWebdavSecret ? 'text' : 'password'}
-                      value={bearerToken}
-                      onChange={e => setBearerToken(e.target.value)}
-                      placeholder="输入 Bearer Access Token"
-                    />
-                  </div>
-                ) : (
-                  <>
-                    <div className="space-y-1.5">
-                      <Label htmlFor="webdavUser">用户名 / 邮箱 *</Label>
-                      <Input
-                        id="webdavUser"
-                        value={username}
-                        onChange={e => setUsername(e.target.value)}
-                        placeholder="user@example.com"
-                      />
-                    </div>
-                    <div className="space-y-1.5">
-                      <div className="flex items-center justify-between">
-                        <Label htmlFor="webdavPass">{authType === 'app_password' ? '应用专用密码 *' : '密码 *'}</Label>
-                        <button
-                          type="button"
-                          onClick={() => setShowWebdavSecret(prev => !prev)}
-                          className="inline-flex items-center gap-1 text-xs text-muted-foreground hover:text-foreground">
-                          {showWebdavSecret ? <EyeOff className="h-3.5 w-3.5" /> : <Eye className="h-3.5 w-3.5" />}
-                          {showWebdavSecret ? '隐藏' : '显示'}
-                        </button>
-                      </div>
-                      <Input
-                        id="webdavPass"
-                        type={showWebdavSecret ? 'text' : 'password'}
-                        value={password}
-                        onChange={e => setPassword(e.target.value)}
-                        placeholder="输入 WebDAV 密码或应用专用密码"
-                      />
-                    </div>
-                  </>
-                )}
+          <button
+            type="button"
+            onClick={() => setEntryMode('pair_code')}
+            className={`flex items-start gap-3 rounded-xl border p-3.5 text-left transition-all ${
+              entryMode === 'pair_code'
+                ? 'border-primary bg-primary/[0.07] ring-1 ring-primary/40 shadow-2xs'
+                : 'border-border bg-card hover:border-primary/40 hover:bg-muted/30'
+            }`}>
+            <div
+              className={`mt-0.5 flex h-9 w-9 shrink-0 items-center justify-center rounded-xl ${
+                entryMode === 'pair_code' ? 'bg-primary text-primary-foreground' : 'bg-muted text-muted-foreground'
+              }`}>
+              <QrCode className="h-4 w-4" />
+            </div>
+            <div className="min-w-0">
+              <div className="flex items-center gap-2">
+                <span className="text-sm font-bold text-foreground">我有配对码（接入第 2 台电脑）</span>
+                <Badge variant="info" className="px-1.5 py-0 text-[10px]">
+                  10 秒一步接入
+                </Badge>
               </div>
-
-              {/* Local HTTP testing option (only visibly helpful if localhost URL entered) */}
-              {url.trim().startsWith('http://localhost') || url.trim().startsWith('http://127.0.0.1') ? (
-                <div className="flex items-center justify-between rounded-lg border border-amber-500/35 bg-amber-500/10 px-3 py-2 text-xs">
-                  <span>检测到本机回环地址，仅限开发或本地 Mock 测试允许放行 HTTP：</span>
-                  <Switch checked={allowLocalHttp} onCheckedChange={setAllowLocalHttp} />
-                </div>
-              ) : null}
-
-              {step1Error ? (
-                <Alert variant="destructive" className="pr-10">
-                  <AlertTriangle className="h-4 w-4" />
-                  <AlertTitle className="text-sm">配置校验提示</AlertTitle>
-                  <AlertDescription className="text-xs">{step1Error}</AlertDescription>
-                  <button
-                    type="button"
-                    aria-label="关闭提示"
-                    onClick={() => setStep1Error(null)}
-                    className="absolute right-3 top-3 rounded p-1 text-destructive/80 hover:bg-destructive/10 hover:text-destructive">
-                    <X className="h-3.5 w-3.5" />
-                  </button>
-                </Alert>
-              ) : null}
-
-              <div className="flex flex-wrap items-center justify-between gap-3 pt-2">
-                <div className="flex flex-wrap items-center gap-2">
-                  <Button
-                    type="button"
-                    variant="secondary"
-                    disabled={testingConn || probingSpaces}
-                    onClick={handleRunCapabilityTest}>
-                    {testingConn ? (
-                      <Loader2 className="mr-2 h-4 w-4 animate-spin" />
-                    ) : (
-                      <ShieldCheck className="mr-2 h-4 w-4" />
-                    )}
-                    测试连接（19 项能力检测）
-                  </Button>
-
-                  <Button
-                    type="button"
-                    variant="outline"
-                    disabled={probingSpaces || testingConn}
-                    onClick={() => void probeSpaces()}>
-                    {probingSpaces ? (
-                      <Loader2 className="mr-2 h-4 w-4 animate-spin" />
-                    ) : (
-                      <Search className="mr-2 h-4 w-4" />
-                    )}
-                    检测已有同步空间
-                  </Button>
-                </div>
-
-                <Button type="button" onClick={goToStep2}>
-                  下一步：选择空间与加密
-                  <ArrowRight className="ml-2 h-4 w-4" />
-                </Button>
-              </div>
-
-              {/* Pillar 2: Auto-Detected Remote Spaces Card Right Inside Step 1 */}
-              {probingSpaces || hasProbedSpaces || probeError ? (
-                <div className="rounded-xl border border-primary/35 bg-primary/[0.03] p-4 space-y-3">
-                  <div className="flex flex-wrap items-center justify-between gap-2">
-                    <div className="flex items-center gap-2 text-sm font-semibold text-foreground">
-                      <Layers className="h-4 w-4 text-primary" />
-                      远端同步空间自动检测结果
-                    </div>
-                    <Button
-                      type="button"
-                      size="sm"
-                      variant="ghost"
-                      disabled={probingSpaces}
-                      onClick={() => void probeSpaces()}
-                      className="h-7 px-2 text-xs">
-                      {probingSpaces ? (
-                        <Loader2 className="mr-1.5 h-3.5 w-3.5 animate-spin" />
-                      ) : (
-                        <RefreshCw className="mr-1.5 h-3.5 w-3.5" />
-                      )}
-                      重新检测
-                    </Button>
-                  </div>
-
-                  {probingSpaces ? (
-                    <div className="flex items-center gap-2 text-xs text-muted-foreground py-2">
-                      <Loader2 className="h-4 w-4 animate-spin text-primary" />
-                      正在自动扫描 WebDAV 目录中的已有同步空间...
-                    </div>
-                  ) : probeError ? (
-                    <Alert variant="destructive" className="pr-10">
-                      <AlertTriangle className="h-4 w-4" />
-                      <AlertTitle className="text-xs font-semibold">远端空间探测异常</AlertTitle>
-                      <AlertDescription className="text-xs">
-                        {probeError}（您仍可直接进入下一步手动输入空间 ID 创建或加入）
-                      </AlertDescription>
-                      <button
-                        type="button"
-                        aria-label="关闭提示"
-                        onClick={() => setProbeError(null)}
-                        className="absolute right-3 top-3 rounded p-1 text-destructive/80 hover:bg-destructive/10 hover:text-destructive">
-                        <X className="h-3.5 w-3.5" />
-                      </button>
-                    </Alert>
-                  ) : remoteSpaces.length > 0 ? (
-                    <div className="space-y-3">
-                      <div className="rounded-lg border border-emerald-500/35 bg-emerald-500/10 px-3 py-2 text-xs font-medium text-emerald-900 dark:text-emerald-200">
-                        🎉 检测到服务器上已有 {remoteSpaces.length}{' '}
-                        个同步空间！直接点击下方空间即可一键选用并进入下一步。
-                      </div>
-                      <div className="grid gap-2.5 sm:grid-cols-2">
-                        {remoteSpaces.map(s => {
-                          const displayName = s.spaceName || s.hintId || s.opaqueId;
-                          const displayId = s.spaceId || s.hintId || s.opaqueId;
-                          return (
-                            <div
-                              key={s.opaqueId}
-                              role="button"
-                              tabIndex={0}
-                              onClick={() => handleSelectRemoteSpaceAndAdvance(s)}
-                              onKeyDown={e => {
-                                if (e.key === 'Enter' || e.key === ' ') {
-                                  e.preventDefault();
-                                  handleSelectRemoteSpaceAndAdvance(s);
-                                }
-                              }}
-                              className="flex cursor-pointer flex-col justify-between gap-2.5 rounded-xl border border-border bg-background p-3.5 text-left transition-all hover:border-primary hover:shadow-sm">
-                              <div className="space-y-1">
-                                <div className="flex items-center justify-between gap-2">
-                                  <span className="truncate text-sm font-semibold text-foreground">{displayName}</span>
-                                  <Badge variant="info" className="shrink-0 text-[10px]">
-                                    已有空间
-                                  </Badge>
-                                </div>
-                                <div className="font-mono text-xs text-muted-foreground break-all">
-                                  (ID: {displayId})
-                                </div>
-                                {s.updatedAt ? (
-                                  <div className="text-[11px] text-muted-foreground">
-                                    最近更新：{formatRelativeTime(s.updatedAt)}
-                                  </div>
-                                ) : null}
-                              </div>
-                              <Button
-                                type="button"
-                                size="sm"
-                                className="h-8 w-full text-xs"
-                                onClick={e => {
-                                  e.stopPropagation();
-                                  handleSelectRemoteSpaceAndAdvance(s);
-                                }}>
-                                选用此空间并进入下一步
-                                <ArrowRight className="ml-1.5 h-3.5 w-3.5" />
-                              </Button>
-                            </div>
-                          );
-                        })}
-                      </div>
-                    </div>
-                  ) : (
-                    <div className="rounded-lg border border-sky-500/35 bg-sky-500/10 px-3 py-2.5 text-xs font-medium text-sky-900 dark:text-sky-200">
-                      ✨ 当前 WebDAV 目录尚无同步空间，下一步将直接为您创建新空间
-                    </div>
-                  )}
-                </div>
-              ) : null}
-
-              {capabilityReport ? (
-                <div className="pt-2">
-                  <CapabilityReportView report={capabilityReport} defaultExpanded={!capabilityReport.overallOk} />
-                </div>
-              ) : null}
-            </CardContent>
-          </Card>
+              <p className="mt-0.5 text-xs text-muted-foreground">
+                粘贴另一台电脑生成的 <code className="rounded bg-muted px-1">smesh://pair/...</code>{' '}
+                配对码，免填服务器配置
+              </p>
+            </div>
+          </button>
         </div>
       ) : null}
 
-      {/* STEP 2 */}
-      {step === 2 ? (
-        <Card>
+      {/* CHANNEL B: Express One-Screen Pairing Flow */}
+      {entryMode === 'pair_code' && step < 3 ? (
+        <Card className="border-primary/35">
           <CardHeader>
-            <div className="flex flex-wrap items-center justify-between gap-2">
-              <div>
-                <CardTitle className="flex items-center gap-2 text-lg">
-                  <KeyRound className="h-5 w-5 text-primary" />
-                  Step 2 · 同步空间与端到端加密密码
-                </CardTitle>
-                <CardDescription>
-                  自动探测 WebDAV 远端是否已有同步空间：支持设备 B/C 一键加入已有空间，或首台设备 A 创建新空间。
-                </CardDescription>
-              </div>
-              <Button
-                type="button"
-                variant="outline"
-                size="sm"
-                disabled={probingSpaces}
-                onClick={() => void probeSpaces()}>
-                {probingSpaces ? (
-                  <Loader2 className="mr-1.5 h-3.5 w-3.5 animate-spin" />
-                ) : (
-                  <RefreshCw className="mr-1.5 h-3.5 w-3.5" />
-                )}
-                重新探测远端空间
-              </Button>
-            </div>
+            <CardTitle className="flex items-center gap-2 text-lg">
+              <QrCode className="h-5 w-5 text-primary" />
+              使用配对码快速接入现有同步空间
+            </CardTitle>
+            <CardDescription>
+              在已配置好的第 1 台电脑打开「控制中心 → 设备与同步空间 →
+              跨设备配对」生成配对码，直接整段粘贴到下方即可自动识别。
+            </CardDescription>
           </CardHeader>
-          <CardContent className="space-y-5">
-            {/* Probed remote spaces */}
-            <div className="space-y-2.5">
-              <div className="flex items-center justify-between">
-                <Label className="text-sm font-medium">选择加入模式</Label>
-                {probingSpaces ? (
-                  <span className="inline-flex items-center gap-1.5 text-xs text-muted-foreground">
-                    <Loader2 className="h-3.5 w-3.5 animate-spin" />
-                    正在扫描远端目录...
-                  </span>
-                ) : (
-                  <Badge variant={remoteSpaces.length > 0 ? 'info' : 'secondary'}>
-                    {remoteSpaces.length > 0 ? `探测到 ${remoteSpaces.length} 个远端空间` : '远端暂无已有空间'}
-                  </Badge>
-                )}
-              </div>
-
-              {probeError ? (
-                <div className="relative rounded-lg border border-amber-500/35 bg-amber-500/10 px-3 py-2 pr-9 text-xs text-amber-900 dark:text-amber-200">
-                  远端空间探测提示：{probeError}（你仍可手动填写空间 ID 创建或加入）
-                  <button
-                    type="button"
-                    aria-label="关闭提示"
-                    onClick={() => setProbeError(null)}
-                    className="absolute right-2 top-1.5 rounded p-1 text-amber-800/80 hover:bg-amber-500/20 dark:text-amber-200">
-                    <X className="h-3.5 w-3.5" />
-                  </button>
-                </div>
-              ) : null}
-
-              <div className="grid gap-3 sm:grid-cols-2">
-                <button
-                  type="button"
-                  onClick={() => {
-                    userEditedStep2Ref.current = true;
-                    setSpaceMode('create');
-                    if (!spaceId) setSpaceId('default');
-                  }}
-                  className={`rounded-xl border p-3.5 text-left transition-all ${
-                    spaceMode === 'create'
-                      ? 'border-primary bg-primary/8 ring-1 ring-primary/40'
-                      : 'border-border bg-card hover:border-primary/40'
-                  }`}>
-                  <div className="flex items-center gap-2 font-semibold text-sm">
-                    <FolderPlus className="h-4 w-4 text-primary" />
-                    创建新同步空间 — 首台设备 A
-                  </div>
-                  <p className="mt-1 text-xs text-muted-foreground">
-                    在 WebDAV 初始化全新加密空间，下一步可自由选择需要同步管理的网站。
-                  </p>
-                </button>
-
-                <button
-                  type="button"
-                  onClick={() => {
-                    userEditedStep2Ref.current = true;
-                    setSpaceMode('join');
-                  }}
-                  className={`rounded-xl border p-3.5 text-left transition-all ${
-                    spaceMode === 'join'
-                      ? 'border-primary bg-primary/8 ring-1 ring-primary/40'
-                      : 'border-border bg-card hover:border-primary/40'
-                  }`}>
-                  <div className="flex items-center gap-2 font-semibold text-sm">
-                    <Layers className="h-4 w-4 text-primary" />
-                    加入已有同步空间 — 设备 B / C
-                  </div>
-                  <p className="mt-1 text-xs text-muted-foreground">
-                    先校验密码并拉取远端元数据，绝不覆盖云端数据；重叠站点按基准策略或询问决策处理。
-                  </p>
-                </button>
-              </div>
-
-              {remoteSpaces.length > 0 && spaceMode === 'join' ? (
-                <div className="space-y-2 rounded-xl border border-border bg-muted/25 p-3">
-                  <div className="text-xs font-medium text-muted-foreground">点击选择探测到的远端空间：</div>
-                  <div className="grid gap-2 sm:grid-cols-2">
-                    {remoteSpaces.map(sp => {
-                      const candidateId = resolveProbeSpaceId(sp);
-                      const candidateName = resolveProbeSpaceName(sp);
-                      const selected = spaceId === candidateId;
-                      return (
-                        <button
-                          key={sp.opaqueId}
-                          type="button"
-                          onClick={() => {
-                            setSpaceId(candidateId);
-                            setSpaceName(candidateName);
-                          }}
-                          className={`flex items-center justify-between gap-2 rounded-lg border px-3 py-2.5 text-left text-xs transition-colors ${
-                            selected
-                              ? 'border-primary bg-primary/10 text-foreground'
-                              : 'border-border bg-background hover:border-primary/40'
-                          }`}>
-                          <div className="min-w-0 space-y-0.5">
-                            <div className="font-semibold truncate text-foreground">{candidateName}</div>
-                            <div className="font-mono text-[11px] text-muted-foreground truncate">
-                              ID: {candidateId}
-                            </div>
-                            {sp.updatedAt ? (
-                              <div className="text-[10px] text-muted-foreground">
-                                更新于：{formatRelativeTime(sp.updatedAt)}
-                              </div>
-                            ) : null}
-                          </div>
-                          {selected ? <Badge variant="default">已选</Badge> : <Badge variant="outline">选择</Badge>}
-                        </button>
-                      );
-                    })}
-                  </div>
-                </div>
-              ) : null}
-            </div>
-
-            <div className="grid gap-4 sm:grid-cols-3">
+          <CardContent className="space-y-4">
+            <div className="space-y-3 rounded-xl border border-border bg-muted/15 p-4">
               <div className="space-y-1.5">
-                <Label htmlFor="spaceId">同步空间 ID *</Label>
-                <Input
-                  id="spaceId"
-                  value={spaceId}
+                <Label htmlFor="expressPairingCode">1. 粘贴配对码（支持直接粘贴整段配对消息，自动提取口令）*</Label>
+                <Textarea
+                  id="expressPairingCode"
+                  rows={3}
+                  value={pairingCode}
                   onChange={e => {
-                    userEditedStep2Ref.current = true;
-                    setSpaceId(e.target.value);
+                    const val = e.target.value;
+                    setPairingCode(val);
+                    const parsed = parseSmartPairingInput(val);
+                    if (parsed.pin && !pairingPassphrase) {
+                      setPairingPassphrase(parsed.pin);
+                    }
                   }}
-                  placeholder="default"
+                  placeholder="粘贴 smesh://pair/v1.xxxx...（或整段包含配对码与口令的文本）"
+                  className="font-mono text-xs"
                 />
-                <p className="text-[11px] text-muted-foreground">同一空间的多台设备需填写相同 ID</p>
-              </div>
-              <div className="space-y-1.5">
-                <Label htmlFor="spaceName">空间显示名称</Label>
-                <Input
-                  id="spaceName"
-                  value={spaceName}
-                  onChange={e => {
-                    userEditedStep2Ref.current = true;
-                    setSpaceName(e.target.value);
-                  }}
-                  placeholder="我的主力空间"
-                />
-              </div>
-              <div className="space-y-1.5">
-                <Label htmlFor="deviceName">本机设备名称 *</Label>
-                <Input
-                  id="deviceName"
-                  value={deviceName}
-                  onChange={e => setDeviceName(e.target.value)}
-                  placeholder="Windows Edge"
-                />
-                <p className="text-[11px] text-muted-foreground">用于区分轨道来源（如「公司台式机」）</p>
-              </div>
-            </div>
-
-            {/* E2E Encryption Password */}
-            <div className="rounded-xl border border-primary/30 bg-primary/[0.04] p-4 space-y-3">
-              <div className="flex items-start gap-2.5">
-                <Lock className="mt-0.5 h-5 w-5 shrink-0 text-primary" />
-                <div className="space-y-1">
-                  <div className="text-sm font-semibold text-foreground">
-                    端到端加密主密码（E2E Encryption Password）
-                  </div>
-                  <p className="text-xs text-muted-foreground">
-                    该密码<strong>永不发送至 WebDAV 服务器</strong>，仅在本地通过 PBKDF2-SHA256 + AES-256-GCM
-                    加解密空间密钥。 请务必设置与 WebDAV 登录密码<strong>不同</strong>
-                    的强密码并妥善保管，遗忘后任何人都无法恢复云端加密数据。
-                  </p>
-                </div>
               </div>
 
-              <div className="grid gap-3 sm:grid-cols-2">
-                <div className="space-y-1.5">
-                  <div className="flex items-center justify-between">
-                    <Label htmlFor="encPass">
-                      {spaceMode === 'join' ? '输入该空间的端到端加密密码 *' : '设置端到端加密密码 *'}
-                    </Label>
-                    <button
-                      type="button"
-                      onClick={() => setShowEncPassword(prev => !prev)}
-                      className="inline-flex items-center gap-1 text-xs text-muted-foreground hover:text-foreground">
-                      {showEncPassword ? <EyeOff className="h-3.5 w-3.5" /> : <Eye className="h-3.5 w-3.5" />}
-                      {showEncPassword ? '隐藏' : '显示'}
-                    </button>
-                  </div>
+              <div className="flex flex-col gap-2.5 sm:flex-row sm:items-end">
+                <div className="flex-1 space-y-1.5">
+                  <Label htmlFor="expressPairingPin">2. 输入配对口令 *</Label>
                   <Input
-                    id="encPass"
-                    type={showEncPassword ? 'text' : 'password'}
-                    value={encryptionPassword}
-                    onChange={e => {
-                      setEncryptionPassword(e.target.value);
-                      setPasswordVerifyState(null);
-                    }}
+                    id="expressPairingPin"
+                    type="password"
+                    value={pairingPassphrase}
+                    onChange={e => setPairingPassphrase(e.target.value)}
                     onKeyDown={e => {
-                      if (e.key === 'Enter' && encryptionPassword.length >= 6 && !verifyingPassword) {
-                        e.preventDefault();
-                        void verifyStep2EncryptionPassword();
-                      }
+                      if (e.key === 'Enter') void handleDecodePairingCode();
                     }}
-                    placeholder="至少 6 位，建议包含字母、数字与符号"
+                    placeholder="生成配对码时的 6 位口令或自定义口令"
                   />
                 </div>
+                <Button
+                  type="button"
+                  onClick={() => void handleDecodePairingCode()}
+                  disabled={decodingPairing}
+                  variant={pairedFromDevice ? 'outline' : 'default'}
+                  className="sm:w-44">
+                  {decodingPairing ? (
+                    <Loader2 className="mr-2 h-4 w-4 animate-spin" />
+                  ) : (
+                    <Sparkles className="mr-2 h-4 w-4" />
+                  )}
+                  {pairedFromDevice ? '重新解析配对码' : '解析配对码'}
+                </Button>
+              </div>
+            </div>
 
-                {spaceMode === 'create' ? (
-                  <div className="space-y-1.5">
-                    <Label htmlFor="confirmEncPass">确认端到端加密密码 *</Label>
-                    <Input
-                      id="confirmEncPass"
-                      type={showEncPassword ? 'text' : 'password'}
-                      value={confirmPassword}
-                      onChange={e => {
-                        setConfirmPassword(e.target.value);
-                        setPasswordVerifyState(null);
-                      }}
-                      placeholder="再次输入以防误填"
-                    />
+            {pairedFromDevice ? (
+              <div className="space-y-4 rounded-xl border border-emerald-500/40 bg-emerald-500/[0.04] p-4">
+                <div className="flex flex-wrap items-start justify-between gap-2">
+                  <div className="flex items-start gap-2.5">
+                    <CheckCircle2 className="mt-0.5 h-5 w-5 shrink-0 text-emerald-600 dark:text-emerald-400" />
+                    <div>
+                      <div className="text-sm font-bold text-foreground">
+                        已识别来自「{pairedFromDevice}」的空间：{spaceName}（ID: <code>{spaceId}</code>）
+                      </div>
+                      <p className="mt-0.5 text-xs text-muted-foreground">
+                        存储方式：{pairedProviderMeta.label} · 确认本机名称并输入空间加密主密码即可完成接入
+                      </p>
+                    </div>
                   </div>
-                ) : (
-                  <div className="flex flex-col justify-end gap-2">
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setEntryMode('new_device');
+                      setStep(1);
+                    }}
+                    className="text-xs text-primary hover:underline">
+                    查看/微调存储详情 →
+                  </button>
+                </div>
+
+                {storageDraft.provider === 'local_directory' ? (
+                  <div className="flex flex-wrap items-center justify-between gap-2 rounded-lg border border-amber-500/40 bg-amber-500/10 p-3 text-xs">
+                    <span>
+                      当前空间使用本地同步盘，请在本机选择对应的 OneDrive / iCloud / Dropbox 同步文件夹：
+                      {storageDraft.localDirLabel ? <strong>（已选：{storageDraft.localDirLabel}）</strong> : null}
+                    </span>
                     <Button
                       type="button"
-                      variant="outline"
                       size="sm"
-                      disabled={verifyingPassword || encryptionPassword.length < 6 || !spaceId.trim()}
-                      onClick={() => void verifyStep2EncryptionPassword()}
-                      className="h-9 w-fit text-xs">
-                      {verifyingPassword ? (
+                      disabled={pickingPairedLocalDir}
+                      onClick={() => void handlePickPairedLocalDir()}>
+                      {pickingPairedLocalDir ? (
                         <Loader2 className="mr-1.5 h-3.5 w-3.5 animate-spin" />
                       ) : (
-                        <ShieldCheck className="mr-1.5 h-3.5 w-3.5 text-primary" />
+                        <FolderOpen className="mr-1.5 h-3.5 w-3.5" />
                       )}
-                      立即验证主密码
+                      选择本机同步文件夹
                     </Button>
-                    <span className="text-[11px] text-muted-foreground">
-                      将只读解密校验 <code>metadata/space.enc</code>，密码错误立即拦截且零破坏。
-                    </span>
                   </div>
-                )}
-              </div>
+                ) : null}
 
-              {spaceMode === 'create' ? (
-                <div className="flex flex-wrap items-center justify-between gap-2 text-xs">
-                  <div className="text-[11px] text-muted-foreground">
-                    {confirmPassword && encryptionPassword !== confirmPassword ? (
-                      <span className="text-destructive font-medium">两次输入的加密主密码不一致</span>
-                    ) : encryptionPassword.length > 0 && encryptionPassword.length < 6 ? (
-                      <span className="text-amber-600 dark:text-amber-400">主密码至少需要 6 位字符</span>
-                    ) : encryptionPassword.length >= 6 && encryptionPassword === confirmPassword ? (
-                      <span className="text-emerald-600 dark:text-emerald-400">
-                        两次输入一致，可校验远端空间 ID 是否可用
-                      </span>
-                    ) : (
-                      <span>点击「校验空间与密码」或「下一步」时将自动核验远端空间状态</span>
-                    )}
+                <div className="grid gap-3 sm:grid-cols-2">
+                  <div className="space-y-1.5">
+                    <Label htmlFor="pairedDeviceName">给这台电脑起个名字 *</Label>
+                    <Input
+                      id="pairedDeviceName"
+                      value={deviceName}
+                      onChange={e => setDeviceName(e.target.value)}
+                      placeholder="例如：家里笔记本 / MacBook"
+                    />
                   </div>
+                  <div className="space-y-1.5">
+                    <div className="flex items-center justify-between gap-2">
+                      <Label htmlFor="pairedEncPass">输入该空间的加密主密码 *</Label>
+                      {pairingPassphrase.length >= 6 && encryptionPassword !== pairingPassphrase ? (
+                        <button
+                          type="button"
+                          onClick={() => setEncryptionPassword(pairingPassphrase)}
+                          className="text-[11px] text-primary hover:underline">
+                          与配对口令相同？点此填入
+                        </button>
+                      ) : null}
+                    </div>
+                    <Input
+                      id="pairedEncPass"
+                      type={showEncPassword ? 'text' : 'password'}
+                      value={encryptionPassword}
+                      onChange={e => {
+                        setEncryptionPassword(e.target.value);
+                        setPasswordVerifyState(null);
+                      }}
+                      onKeyDown={e => {
+                        if (e.key === 'Enter' && !joiningSpace) void executeVerifyAndJoin();
+                      }}
+                      placeholder="输入首台电脑设置的端到端加密主密码"
+                    />
+                  </div>
+                </div>
+
+                {joinError ? (
+                  <Alert variant="destructive">
+                    <AlertTriangle className="h-4 w-4" />
+                    <AlertTitle className="text-xs font-semibold">接入提示</AlertTitle>
+                    <AlertDescription className="text-xs">{joinError}</AlertDescription>
+                  </Alert>
+                ) : null}
+
+                <div className="flex justify-end">
+                  <Button
+                    type="button"
+                    disabled={joiningSpace || verifyingPassword}
+                    onClick={() => void executeVerifyAndJoin()}
+                    className="min-w-[210px]">
+                    {joiningSpace || verifyingPassword ? (
+                      <>
+                        <Loader2 className="mr-2 h-4 w-4 animate-spin" />
+                        正在验证密码并同步空间...
+                      </>
+                    ) : (
+                      <>
+                        <ShieldCheck className="mr-2 h-4 w-4" />
+                        一键验证并完成接入
+                      </>
+                    )}
+                  </Button>
+                </div>
+              </div>
+            ) : null}
+          </CardContent>
+        </Card>
+      ) : null}
+
+      {/* CHANNEL A: 3-Step Streamlined Flow */}
+      {entryMode === 'new_device' || step === 3 ? (
+        <>
+          {/* 3-Step Progress Bar */}
+          <div className="mb-5 grid grid-cols-3 gap-2.5">
+            {STEPS.map(item => {
+              const done = step > item.id;
+              const active = step === item.id;
+              return (
+                <div
+                  key={item.id}
+                  className={`rounded-xl border px-3 py-2.5 transition-all ${
+                    active
+                      ? 'border-primary bg-primary/8 shadow-2xs'
+                      : done
+                        ? 'border-emerald-500/35 bg-emerald-500/5'
+                        : 'border-border bg-card/60 opacity-75'
+                  }`}>
+                  <div className="flex items-center gap-2">
+                    <span
+                      className={`flex h-6 w-6 shrink-0 items-center justify-center rounded-full text-xs font-bold ${
+                        done
+                          ? 'bg-emerald-600 text-white'
+                          : active
+                            ? 'bg-primary text-primary-foreground'
+                            : 'bg-muted text-muted-foreground'
+                      }`}>
+                      {done ? <Check className="h-3.5 w-3.5" /> : item.id}
+                    </span>
+                    <span className="truncate text-xs font-semibold text-foreground sm:text-sm">{item.title}</span>
+                  </div>
+                  <p className="mt-1 hidden truncate pl-8 text-[11px] text-muted-foreground sm:block">
+                    {item.subtitle}
+                  </p>
+                </div>
+              );
+            })}
+          </div>
+
+          {/* STEP 1: Choose Storage Location */}
+          {step === 1 ? (
+            <Card>
+              <CardHeader>
+                <CardTitle className="flex items-center gap-2 text-lg">
+                  <Server className="h-5 w-5 text-primary" />第 1 步 · 选择把加密登录数据存放在哪里
+                </CardTitle>
+                <CardDescription>
+                  SessionMesh 没有第三方中心服务器，所有登录状态都会在浏览器本地用 AES-256-GCM 加密后存入你选的位置。
+                </CardDescription>
+              </CardHeader>
+              <CardContent className="space-y-4">
+                <StorageProviderForm
+                  draft={storageDraft}
+                  onChange={handleStorageDraftChange}
+                  onLowFrequencyHint={recommended => {
+                    if (recommended) setLowFrequencyMode(true);
+                  }}
+                  notifyPermissionOnGrant={false}
+                  expertMode={expertMode}
+                />
+
+                {step1Error ? (
+                  <Alert variant="destructive" className="pr-10">
+                    <AlertTriangle className="h-4 w-4" />
+                    <AlertTitle className="text-sm">请检查存储配置</AlertTitle>
+                    <AlertDescription className="text-xs">{step1Error}</AlertDescription>
+                    <button
+                      type="button"
+                      aria-label="关闭提示"
+                      onClick={() => setStep1Error(null)}
+                      className="absolute right-3 top-3 rounded p-1 text-destructive/80 hover:bg-destructive/10 hover:text-destructive">
+                      <X className="h-3.5 w-3.5" />
+                    </button>
+                  </Alert>
+                ) : null}
+
+                {/* Auto-Detected Remote Spaces Card (if user clicked Test Connection on Step 1) */}
+                {remoteSpaces.length > 0 ? (
+                  <div className="rounded-xl border border-emerald-500/35 bg-emerald-500/[0.06] p-3.5 space-y-2.5">
+                    <div className="text-xs font-semibold text-emerald-900 dark:text-emerald-200">
+                      🎉 在该存储位置检测到已有同步空间！点击即可直接加入：
+                    </div>
+                    <div className="grid gap-2 sm:grid-cols-2">
+                      {remoteSpaces.map(s => {
+                        const displayName = resolveProbeSpaceName(s);
+                        const displayId = resolveProbeSpaceId(s);
+                        return (
+                          <button
+                            key={s.opaqueId}
+                            type="button"
+                            onClick={() => handleSelectRemoteSpaceAndAdvance(s)}
+                            className="flex items-center justify-between gap-2 rounded-lg border border-emerald-500/30 bg-background px-3 py-2.5 text-left text-xs transition-all hover:border-primary hover:shadow-2xs">
+                            <div className="min-w-0">
+                              <div className="truncate font-semibold text-foreground">{displayName}</div>
+                              <div className="truncate font-mono text-[11px] text-muted-foreground">
+                                ID: {displayId}
+                                {s.updatedAt ? ` · ${formatRelativeTime(s.updatedAt)}` : ''}
+                              </div>
+                            </div>
+                            <Badge variant="default" className="shrink-0">
+                              选用并下一步 →
+                            </Badge>
+                          </button>
+                        );
+                      })}
+                    </div>
+                  </div>
+                ) : null}
+
+                {capabilityReport ? (
+                  <div className="pt-1">
+                    <CapabilityReportView report={capabilityReport} defaultExpanded={!capabilityReport.overallOk} />
+                  </div>
+                ) : null}
+
+                <div className="flex flex-wrap items-center justify-between gap-3 border-t border-border pt-4">
                   <Button
                     type="button"
                     variant="outline"
                     size="sm"
-                    disabled={
-                      verifyingPassword ||
-                      encryptionPassword.length < 6 ||
-                      encryptionPassword !== confirmPassword ||
-                      !spaceId.trim()
-                    }
-                    onClick={() => void verifyStep2EncryptionPassword()}
-                    className="h-7 px-2.5 text-[11px]">
-                    {verifyingPassword ? (
-                      <Loader2 className="mr-1 h-3 w-3 animate-spin" />
+                    disabled={testingConn || advancingStep1 || probingSpaces}
+                    onClick={() => void runCapabilityTestInternal()}>
+                    {testingConn && !advancingStep1 ? (
+                      <Loader2 className="mr-1.5 h-4 w-4 animate-spin" />
                     ) : (
-                      <ShieldCheck className="mr-1 h-3 w-3 text-primary" />
+                      <ShieldCheck className="mr-1.5 h-4 w-4" />
                     )}
-                    校验空间与密码
+                    先测试连通性
+                  </Button>
+
+                  <Button
+                    type="button"
+                    disabled={testingConn || advancingStep1}
+                    onClick={() => void goToStep2()}
+                    className="min-w-[200px]">
+                    {advancingStep1 ? (
+                      <>
+                        <Loader2 className="mr-2 h-4 w-4 animate-spin" />
+                        正在验证连接与空间...
+                      </>
+                    ) : (
+                      <>
+                        下一步：设置加密密码
+                        <ArrowRight className="ml-2 h-4 w-4" />
+                      </>
+                    )}
                   </Button>
                 </div>
-              ) : null}
-
-              {passwordVerifyState && passwordVerifyState.key === currentVerifyKey ? (
-                <div
-                  className={`flex items-center gap-2 rounded-lg border px-3 py-2 text-xs ${
-                    passwordVerifyState.ok
-                      ? 'border-emerald-500/35 bg-emerald-500/10 text-emerald-700 dark:text-emerald-300'
-                      : 'border-destructive/40 bg-destructive/10 text-destructive'
-                  }`}>
-                  {passwordVerifyState.ok ? (
-                    <CheckCircle2 className="h-4 w-4 shrink-0" />
-                  ) : (
-                    <AlertTriangle className="h-4 w-4 shrink-0" />
-                  )}
-                  <span>{passwordVerifyState.message}</span>
-                </div>
-              ) : null}
-
-              {authType !== 'bearer' &&
-              password &&
-              encryptionPassword &&
-              encryptionPassword === password &&
-              isBannerVisible('onboarding_same_password_warn', 'security') ? (
-                <div className="flex items-center justify-between gap-2 rounded-lg border border-amber-500/35 bg-amber-500/10 px-3 py-2 text-xs text-amber-800 dark:text-amber-200">
-                  <div className="flex items-center gap-1.5">
-                    <AlertTriangle className="h-3.5 w-3.5 shrink-0" />
-                    <span>提示：当前端到端加密密码与 WebDAV 密码一致，强烈建议使用独立密码。</span>
-                  </div>
-                  <button
-                    type="button"
-                    onClick={() => void dismissBanner('onboarding_same_password_warn')}
-                    className="inline-flex shrink-0 items-center gap-1 rounded px-1.5 py-0.5 text-[11px] hover:bg-amber-500/20">
-                    不再提示
-                    <X className="h-3 w-3" />
-                  </button>
-                </div>
-              ) : null}
-            </div>
-
-            <div className="flex items-center justify-between pt-2">
-              <Button type="button" variant="outline" onClick={() => setStep(1)} disabled={verifyingPassword}>
-                <ArrowLeft className="mr-2 h-4 w-4" />
-                上一步
-              </Button>
-              <Button type="button" onClick={() => void goToStep3()} disabled={verifyingPassword}>
-                {verifyingPassword ? (
-                  <>
-                    <Loader2 className="mr-2 h-4 w-4 animate-spin" />
-                    正在校验主密码...
-                  </>
-                ) : (
-                  <>
-                    下一步：安全须知与黑名单
-                    <ArrowRight className="ml-2 h-4 w-4" />
-                  </>
-                )}
-              </Button>
-            </div>
-          </CardContent>
-        </Card>
-      ) : null}
-
-      {/* STEP 3 */}
-      {step === 3 ? (
-        <Card>
-          <CardHeader>
-            <CardTitle className="flex items-center gap-2 text-lg">
-              <ShieldAlert className="h-5 w-5 text-amber-600 dark:text-amber-400" />
-              Step 3 · 同步纳管范围、主基准设备与敏感黑名单
-            </CardTitle>
-            <CardDescription>
-              选择「仅同步已选网站（按需纳管）」或「全站自动同步」，并配置敏感站点黑名单预设。所有选项均可随时在控制中心修改。
-            </CardDescription>
-          </CardHeader>
-          <CardContent className="space-y-5">
-            {isBannerVisible('onboarding_step3_security_notice', 'security') ? (
-              <Alert className="border-amber-500/40 bg-amber-500/10 pr-24">
-                <ShieldAlert className="h-4 w-4 text-amber-600 dark:text-amber-400" />
-                <AlertTitle className="text-sm font-semibold">凭据加密同步安全须知</AlertTitle>
-                <AlertDescription className="text-xs leading-relaxed">
-                  纳入同步管理的网站登录态（Cookie 与 LocalStorage）将经 AES-256-GCM
-                  加密后同步至你同一空间下的其他受信任设备。
-                  请勿在公共电脑登录同步空间，并建议勾选下方敏感站点黑名单预设，确保网银、密码管理器及 WebDAV
-                  管理页始终仅保留在本机。
-                </AlertDescription>
-                <div className="absolute right-3 top-3 flex items-center gap-1">
-                  <button
-                    type="button"
-                    onClick={() => void dismissBanner('onboarding_step3_security_notice')}
-                    className="rounded px-1.5 py-0.5 text-[11px] text-amber-900/80 hover:bg-amber-500/20 dark:text-amber-200">
-                    不再提示
-                  </button>
-                  <button
-                    type="button"
-                    aria-label="关闭安全须知"
-                    onClick={() => void dismissBanner('onboarding_step3_security_notice')}
-                    className="rounded p-1 text-amber-900/80 hover:bg-amber-500/20 dark:text-amber-200">
-                    <X className="h-3.5 w-3.5" />
-                  </button>
-                </div>
-              </Alert>
-            ) : null}
-
-            {/* Pillar 1: Sync Scope Mode Selector */}
-            <div className="space-y-2.5">
-              <Label className="text-sm font-semibold">同步纳管范围</Label>
-              <div className="grid gap-3 sm:grid-cols-2">
-                <button
-                  type="button"
-                  onClick={() => setSyncScopeMode('managed_only')}
-                  className={`rounded-xl border p-3.5 text-left transition-all ${
-                    syncScopeMode === 'managed_only'
-                      ? 'border-primary bg-primary/8 ring-1 ring-primary/40'
-                      : 'border-border bg-card hover:border-primary/40'
-                  }`}>
-                  <div className="flex items-center justify-between gap-2">
-                    <span className="text-sm font-semibold text-foreground">
-                      仅同步已纳入管理的网站（managed_only）
-                    </span>
-                    <Badge variant="success" className="shrink-0 text-[10px]">
-                      推荐
-                    </Badge>
-                  </div>
-                  <p className="mt-1.5 text-xs text-muted-foreground leading-relaxed">
-                    推荐：仅纳入我选择的网站才同步，不抓取无关浏览网页。下一步可直接勾选本机需要同步的网站，或随时在弹窗/右键菜单一键加入。
-                  </p>
-                </button>
-
-                <button
-                  type="button"
-                  onClick={() => setSyncScopeMode('all_sites')}
-                  className={`rounded-xl border p-3.5 text-left transition-all ${
-                    syncScopeMode === 'all_sites'
-                      ? 'border-primary bg-primary/8 ring-1 ring-primary/40'
-                      : 'border-border bg-card hover:border-primary/40'
-                  }`}>
-                  <div className="flex items-center justify-between gap-2">
-                    <span className="text-sm font-semibold text-foreground">全站自动纳管（all_sites）</span>
-                    <Badge variant="outline" className="shrink-0 text-[10px]">
-                      全量抓取
-                    </Badge>
-                  </div>
-                  <p className="mt-1.5 text-xs text-muted-foreground leading-relaxed">
-                    全站无差别自动抓取并同步除黑名单以外的所有浏览网站登录态，适合希望零手动挑站的用户。
-                  </p>
-                </button>
-              </div>
-            </div>
-
-            {/* Pillar 3: Optional Set As Primary Authority Device */}
-            <div
-              className={`flex items-start gap-3 rounded-xl border p-3.5 transition-colors ${
-                setAsPrimaryAuthority
-                  ? 'border-primary/60 bg-primary/[0.05]'
-                  : 'border-border bg-card hover:bg-muted/30'
-              }`}>
-              <input
-                id="onboarding-primary-authority"
-                type="checkbox"
-                checked={setAsPrimaryAuthority}
-                onChange={e => setSetAsPrimaryAuthority(e.target.checked)}
-                className="mt-1 h-4 w-4 cursor-pointer rounded border-input accent-primary"
-              />
-              <label htmlFor="onboarding-primary-authority" className="block flex-1 cursor-pointer space-y-1">
-                <span className="flex flex-wrap items-center gap-2 text-sm font-semibold text-foreground">
-                  <Crown className="h-4 w-4 text-amber-500" />
-                  将本机设为此空间的主基准设备（其他跟随设备冲突时默认以本机为准）
-                </span>
-                <span className="block text-xs text-muted-foreground">
-                  勾选后会将空间基准策略设为「统一以指定基准设备为准（primary_device）」并指向本机。其他未配置独立策略的设备遇到重叠站点时将自动跟随本机版本，免去逐一确认弹窗。
-                </span>
-              </label>
-            </div>
-
-            {/* Preset Blacklist Categories */}
-            <div className="space-y-2.5">
-              <Label className="text-sm font-semibold">敏感黑名单预设（加入空间级 / 本机排除列表）</Label>
-              <div className="grid gap-2.5 sm:grid-cols-2">
-                {PRESET_BLACKLIST_OPTIONS.map(opt => {
-                  const checked = selectedPresets.includes(opt.category);
-                  const inputId = `preset-bl-${opt.category}`;
-                  return (
-                    <div
-                      key={opt.category}
-                      className={`flex items-start gap-3 rounded-xl border p-3.5 transition-colors ${
-                        checked ? 'border-primary/50 bg-primary/[0.04]' : 'border-border bg-card hover:bg-muted/30'
-                      }`}>
-                      <input
-                        id={inputId}
-                        type="checkbox"
-                        checked={checked}
-                        onChange={() => togglePreset(opt.category)}
-                        className="mt-1 h-4 w-4 cursor-pointer rounded border-input accent-primary"
-                      />
-                      <label htmlFor={inputId} className="block flex-1 cursor-pointer space-y-1">
-                        <span className="block text-sm font-medium text-foreground">{opt.title}</span>
-                        <span className="block text-xs text-muted-foreground">{opt.description}</span>
-                        <span className="block font-mono text-[11px] text-muted-foreground/80">{opt.examples}</span>
-                      </label>
-                    </div>
-                  );
-                })}
-              </div>
-            </div>
-
-            {/* Strategy Toggles */}
-            <div className="space-y-2.5">
-              <Label className="text-sm font-semibold">初始同步与保护策略</Label>
-              <div className="divide-y divide-border rounded-xl border border-border bg-card">
-                <div className="flex items-center justify-between gap-4 p-3.5">
-                  <div>
-                    <div className="text-sm font-medium">自动同步</div>
-                    <p className="text-xs text-muted-foreground">自动聚合上传并按需同步云端最新登录态</p>
-                  </div>
-                  <Switch checked={autoSync} onCheckedChange={setAutoSync} />
-                </div>
-
-                <div className="flex flex-wrap items-center justify-between gap-4 p-3.5">
-                  <div>
-                    <div className="flex items-center gap-2 text-sm font-medium">
-                      上传时机
-                      <Badge variant="info" className="text-[10px]">
-                        推荐离开页面时
-                      </Badge>
-                    </div>
-                    <p className="text-xs text-muted-foreground">
-                      推荐在关闭或离开网页时合并上传最终状态，避免浏览过程中频繁请求网盘或双端互刷
-                    </p>
-                  </div>
-                  <Select
-                    value={syncTimingMode}
-                    disabled={!autoSync}
-                    onValueChange={v => setSyncTimingMode(v as SyncTimingMode)}>
-                    <SelectTrigger className="w-48 h-9 text-xs">
-                      <SelectValue />
-                    </SelectTrigger>
-                    <SelectContent>
-                      <SelectItem value="on_page_leave">关闭/离开页面时上传（推荐）</SelectItem>
-                      <SelectItem value="realtime">网页变动实时上传</SelectItem>
-                    </SelectContent>
-                  </Select>
-                </div>
-
-                <div className="flex items-center justify-between gap-4 p-3.5">
-                  <div>
-                    <div className="text-sm font-medium">LocalStorage 自动同步</div>
-                    <p className="text-xs text-muted-foreground">
-                      严格按 Origin 隔离同步前端 Token / SPA 登录态，支持未打开站点待上下文缓存
-                    </p>
-                  </div>
-                  <Switch checked={syncLocalStorage} onCheckedChange={setSyncLocalStorage} />
-                </div>
-
-                <div className="flex items-center justify-between gap-4 p-3.5">
-                  <div>
-                    <div className="text-sm font-medium">手动同步后自动刷新网页（默认关闭）</div>
-                    <p className="text-xs text-muted-foreground">
-                      默认静默更新 Cookie 不打断正在浏览的网页；开启后仅在手动同步或切换轨道时生效，后台轮询绝不强刷页面
-                    </p>
-                  </div>
-                  <div className="flex items-center gap-3">
-                    <div className="flex items-center gap-1.5 text-xs text-muted-foreground">
-                      <Label
-                        htmlFor="onboarding-refresh-protection"
-                        className="text-xs font-normal text-muted-foreground">
-                        表单保护
-                      </Label>
-                      <Switch
-                        id="onboarding-refresh-protection"
-                        checked={refreshProtection}
-                        disabled={!autoRefresh}
-                        onCheckedChange={setRefreshProtection}
-                      />
-                    </div>
-                    <Switch checked={autoRefresh} onCheckedChange={setAutoRefresh} />
-                  </div>
-                </div>
-
-                <div className="flex items-center justify-between gap-4 p-3.5">
-                  <div>
-                    <div className="flex items-center gap-2 text-sm font-medium">
-                      坚果云低频省流模式
-                      {url.toLowerCase().includes('jianguoyun.com') ? (
-                        <Badge variant="info" className="text-[10px]">
-                          已为坚果云自动推荐
-                        </Badge>
-                      ) : null}
-                    </div>
-                    <p className="text-xs text-muted-foreground">
-                      降低后台轮询频率并充分利用 ETag 短路与批次合并，避免触发网盘 API 限流（429）
-                    </p>
-                  </div>
-                  <Switch checked={lowFrequencyMode} onCheckedChange={setLowFrequencyMode} />
-                </div>
-
-                <div className="flex items-center justify-between gap-4 p-3.5">
-                  <div>
-                    <div className="text-sm font-medium">浏览器重启主密码锁（高安全模式）</div>
-                    <p className="text-xs text-muted-foreground">
-                      开启后，每次彻底关闭并重启浏览器时需重新输入端到端主密码解锁同步引擎
-                    </p>
-                  </div>
-                  <Switch checked={sessionLockEnabled} onCheckedChange={setSessionLockEnabled} />
-                </div>
-              </div>
-            </div>
-
-            {joinError ? (
-              <Alert variant="destructive" className="pr-10">
-                <AlertTriangle className="h-4 w-4" />
-                <AlertTitle className="text-sm">保存并加入空间失败（本地与云端数据均安全保留）</AlertTitle>
-                <AlertDescription className="text-xs">{joinError}</AlertDescription>
-                <button
-                  type="button"
-                  aria-label="关闭错误提示"
-                  onClick={() => setJoinError(null)}
-                  className="absolute right-3 top-3 rounded p-1 text-destructive/80 hover:bg-destructive/10 hover:text-destructive">
-                  <X className="h-3.5 w-3.5" />
-                </button>
-              </Alert>
-            ) : null}
-
-            <div className="flex items-center justify-between pt-2">
-              <Button type="button" variant="outline" disabled={joiningSpace} onClick={() => setStep(2)}>
-                <ArrowLeft className="mr-2 h-4 w-4" />
-                上一步
-              </Button>
-              <Button type="button" disabled={joiningSpace} onClick={handleSaveAndJoin} className="min-w-[180px]">
-                {joiningSpace ? (
-                  <>
-                    <Loader2 className="mr-2 h-4 w-4 animate-spin" />
-                    正在校验并扫描站点...
-                  </>
-                ) : (
-                  <>
-                    <ShieldCheck className="mr-2 h-4 w-4" />
-                    保存并加入同步空间
-                  </>
-                )}
-              </Button>
-            </div>
-          </CardContent>
-        </Card>
-      ) : null}
-
-      {/* STEP 4 */}
-      {step === 4 && joinReport ? (
-        <div className="space-y-4">
-          <Card className="border-emerald-500/40 bg-emerald-500/5">
-            <CardHeader className="pb-3">
-              <div className="flex flex-wrap items-center justify-between gap-2">
-                <div className="flex items-center gap-2.5">
-                  <CheckCircle2 className="h-6 w-6 text-emerald-600 dark:text-emerald-400" />
-                  <div>
-                    <CardTitle className="text-lg">
-                      {joinReport.isNewSpace ? '同步空间创建成功！' : '已成功加入同步空间！'}
-                    </CardTitle>
-                    <CardDescription>
-                      空间「{joinReport.spaceName}」（ID: {joinReport.spaceId}）·{' '}
-                      {syncScopeMode === 'managed_only'
-                        ? '已启用按需纳管模式，请在下方勾选需要同步的网站'
-                        : '已完成首次全站自动识别'}
-                    </CardDescription>
-                  </div>
-                </div>
-                <div className="flex flex-wrap items-center gap-1.5">
-                  {setAsPrimaryAuthority ? (
-                    <Badge variant="warning" className="text-[11px]">
-                      <Crown className="mr-1 h-3 w-3" />
-                      空间主基准设备
-                    </Badge>
-                  ) : null}
-                  <Badge variant="success">设备 ID: {joinReport.deviceId.slice(0, 12)}</Badge>
-                </div>
-              </div>
-            </CardHeader>
-            <CardContent>
-              <div className="grid grid-cols-2 gap-3 sm:grid-cols-4">
-                <div className="rounded-lg border border-border bg-background p-3">
-                  <div className="text-xs text-muted-foreground">已自动同步到本地</div>
-                  <div className="mt-1 text-2xl font-bold text-emerald-600 dark:text-emerald-400">
-                    {joinReport.autoSyncedSites.length}
-                  </div>
-                </div>
-                <div className="rounded-lg border border-border bg-background p-3">
-                  <div className="text-xs text-muted-foreground">本机已有加密上传</div>
-                  <div className="mt-1 text-2xl font-bold text-primary">{joinReport.localUploadedSites.length}</div>
-                </div>
-                <div className="rounded-lg border border-border bg-background p-3">
-                  <div className="text-xs text-muted-foreground">待确认决策网站</div>
-                  <div className="mt-1 text-2xl font-bold text-amber-600 dark:text-amber-400">
-                    {pendingDecisions.length}
-                  </div>
-                </div>
-                <div className="rounded-lg border border-border bg-background p-3">
-                  <div className="text-xs text-muted-foreground">黑名单已跳过</div>
-                  <div className="mt-1 text-2xl font-bold text-muted-foreground">
-                    {joinReport.excludedBlacklistedSites.length}
-                  </div>
-                </div>
-              </div>
-            </CardContent>
-          </Card>
-
-          {/* Pillar 1: Searchable Opt-In Managed Sites Picker */}
-          <Card className="border-primary/40">
-            <CardHeader className="pb-3">
-              <div className="flex flex-wrap items-start justify-between gap-2">
-                <div>
-                  <CardTitle className="flex items-center gap-2 text-base">
-                    <Globe className="h-5 w-5 text-primary" />
-                    勾选本机需要纳入同步管理的网站
-                  </CardTitle>
-                  <CardDescription>
-                    扫描本机浏览器中已有 Cookie 的站点；仅勾选的网站会上传加密同步（其余日常浏览网页保持仅本地）。
-                  </CardDescription>
-                </div>
-                <Button
-                  type="button"
-                  size="sm"
-                  variant="outline"
-                  disabled={loadingCandidates}
-                  onClick={() => void loadCandidateSites()}>
-                  {loadingCandidates ? (
-                    <Loader2 className="mr-1.5 h-3.5 w-3.5 animate-spin" />
-                  ) : (
-                    <RefreshCw className="mr-1.5 h-3.5 w-3.5" />
-                  )}
-                  重新扫描
-                </Button>
-              </div>
-            </CardHeader>
-            <CardContent className="space-y-3">
-              {candidateError ? (
-                <Alert variant="destructive" className="pr-10">
-                  <AlertTriangle className="h-4 w-4" />
-                  <AlertTitle className="text-xs font-semibold">扫描浏览器站点失败</AlertTitle>
-                  <AlertDescription className="text-xs">{candidateError}</AlertDescription>
-                  <button
-                    type="button"
-                    aria-label="关闭提示"
-                    onClick={() => setCandidateError(null)}
-                    className="absolute right-3 top-3 rounded p-1 text-destructive/80 hover:bg-destructive/10 hover:text-destructive">
-                    <X className="h-3.5 w-3.5" />
-                  </button>
-                </Alert>
-              ) : null}
-
-              <div className="flex flex-wrap items-center gap-2">
-                <div className="relative flex-1 min-w-[200px]">
-                  <Search className="pointer-events-none absolute left-2.5 top-1/2 h-3.5 w-3.5 -translate-y-1/2 text-muted-foreground" />
-                  <Input
-                    value={candidateSearch}
-                    onChange={e => setCandidateSearch(e.target.value)}
-                    placeholder="搜索站点域名（如 github.com、bilibili.com）..."
-                    className="h-9 pl-8 text-xs"
-                  />
-                </div>
-                <Button
-                  type="button"
-                  size="sm"
-                  variant="outline"
-                  disabled={selectableVisibleCandidates.length === 0}
-                  onClick={handleSelectAllVisibleCandidates}
-                  className="h-9 text-xs">
-                  全选 ({selectableVisibleCandidates.length})
-                </Button>
-                <Button
-                  type="button"
-                  size="sm"
-                  variant="ghost"
-                  disabled={selectedCandidateList.length === 0}
-                  onClick={handleClearCandidateSelection}
-                  className="h-9 text-xs">
-                  清空
-                </Button>
-              </div>
-
-              {loadingCandidates ? (
-                <div className="flex items-center justify-center py-8 text-xs text-muted-foreground">
-                  <Loader2 className="mr-2 h-4 w-4 animate-spin text-primary" />
-                  正在扫描本机浏览器已登录站点...
-                </div>
-              ) : filteredCandidates.length === 0 ? (
-                <div className="rounded-lg border border-dashed border-border py-6 text-center text-xs text-muted-foreground">
-                  {candidateSites.length === 0
-                    ? '本机浏览器当前未检测到可纳管站点 Cookie，后续访问任意网站时可在扩展弹窗或右键菜单一键纳入管理。'
-                    : '未找到匹配搜索关键词的网站。'}
-                </div>
-              ) : (
-                <div className="max-h-72 overflow-y-auto divide-y divide-border rounded-xl border border-border">
-                  {filteredCandidates.map(site => {
-                    const disabled = site.alreadyManaged || site.blacklisted;
-                    const checked = !!selectedCandidateKeys[site.siteKey];
-                    return (
-                      <label
-                        key={site.siteKey}
-                        className={`flex items-center justify-between gap-3 px-3.5 py-2.5 text-xs transition-colors ${
-                          disabled
-                            ? 'bg-muted/20 opacity-75'
-                            : checked
-                              ? 'cursor-pointer bg-primary/[0.06]'
-                              : 'cursor-pointer hover:bg-muted/35'
-                        }`}>
-                        <div className="flex min-w-0 items-center gap-2.5">
-                          <input
-                            type="checkbox"
-                            disabled={disabled}
-                            checked={site.alreadyManaged ? true : checked}
-                            onChange={() => !disabled && toggleCandidateSelection(site.siteKey)}
-                            className="h-4 w-4 rounded border-input accent-primary"
-                          />
-                          <div className="min-w-0">
-                            <div className="truncate font-semibold text-foreground">{site.siteKey}</div>
-                            {site.domains.length > 1 ? (
-                              <div className="truncate text-[10px] text-muted-foreground">
-                                包含域名：{site.domains.slice(0, 3).join(', ')}
-                                {site.domains.length > 3 ? ` 等 ${site.domains.length} 个` : ''}
-                              </div>
-                            ) : null}
-                          </div>
-                        </div>
-
-                        <div className="flex shrink-0 items-center gap-1.5">
-                          <Badge variant="outline" className="text-[10px]">
-                            {site.cookieCount} Cookie
-                          </Badge>
-                          {site.alreadyManaged ? (
-                            <Badge variant="success" className="text-[10px]">
-                              已纳管
-                            </Badge>
-                          ) : site.blacklisted ? (
-                            <Badge variant="destructive" className="text-[10px]">
-                              黑名单
-                            </Badge>
-                          ) : null}
-                        </div>
-                      </label>
-                    );
-                  })}
-                </div>
-              )}
-
-              <div className="flex flex-wrap items-center justify-between gap-2 pt-1">
-                <span className="text-xs text-muted-foreground">
-                  共扫描到 {candidateSites.length} 个站点，当前已勾选 <strong>{selectedCandidateList.length}</strong>{' '}
-                  个待纳管网站
-                </span>
-                <Button
-                  type="button"
-                  size="sm"
-                  disabled={selectedCandidateList.length === 0 || addingManaged}
-                  onClick={handleAddSelectedManagedSites}>
-                  {addingManaged ? (
-                    <Loader2 className="mr-1.5 h-4 w-4 animate-spin" />
-                  ) : (
-                    <Plus className="mr-1.5 h-4 w-4" />
-                  )}
-                  将所选网站纳入同步管理
-                  {selectedCandidateList.length > 0 ? ` (${selectedCandidateList.length})` : ''}
-                </Button>
-              </div>
-            </CardContent>
-          </Card>
-
-          {/* Pending Decisions (Device B & Device C) */}
-          {pendingDecisions.length > 0 ? (
-            <Card className="border-amber-500/40">
-              <CardHeader className="pb-3">
-                <CardTitle className="flex items-center gap-2 text-base">
-                  <AlertTriangle className="h-5 w-5 text-amber-600 dark:text-amber-400" />
-                  待您确认的网站（{pendingDecisions.length}）
-                </CardTitle>
-                <CardDescription>
-                  以下站点在本机与云端同时存在登录态，或云端存在多条账号轨道。请逐项或批量选择同步策略。
-                </CardDescription>
-              </CardHeader>
-              <CardContent>
-                <PendingDecisionsPanel
-                  decisions={pendingDecisions}
-                  onResolved={resolvedKeys => {
-                    setPendingDecisions(prev => prev.filter(d => !resolvedKeys.includes(d.siteKey)));
-                  }}
-                />
               </CardContent>
             </Card>
           ) : null}
 
-          {/* Auto-synced sites */}
-          <Card>
-            <CardHeader className="pb-3">
-              <CardTitle className="flex items-center gap-2 text-base">
-                <CheckCircle2 className="h-4 w-4 text-emerald-600 dark:text-emerald-400" />
-                已自动覆盖同步到本地的网站（{joinReport.autoSyncedSites.length}）
-              </CardTitle>
-              <CardDescription>云端已有单条轨道且本机无旧登录态，已自动拉取并绑定双向同步。</CardDescription>
-            </CardHeader>
-            <CardContent>
-              {joinReport.autoSyncedSites.length === 0 ? (
-                <p className="text-xs text-muted-foreground">本次无新增自动拉取覆盖的网站。</p>
-              ) : (
-                <div className="flex flex-wrap gap-2">
-                  {joinReport.autoSyncedSites.map(site => (
-                    <Badge key={site} variant="success" className="px-2.5 py-1 text-xs">
-                      {site}
-                    </Badge>
-                  ))}
-                </div>
-              )}
-            </CardContent>
-          </Card>
-
-          {/* Local uploaded sites with quick Blacklist button */}
-          <Card>
-            <CardHeader className="pb-3">
-              <CardTitle className="flex items-center gap-2 text-base">
-                <CloudUpload className="h-4 w-4 text-primary" />
-                本机已有并加密上传的网站（{joinReport.localUploadedSites.length}）
-              </CardTitle>
-              <CardDescription>
-                以下本机站点已自动建立初始轨道并加密上传。如有不希望同步的网站，可点击右侧按钮一键加入黑名单。
-              </CardDescription>
-            </CardHeader>
-            <CardContent>
-              {joinReport.localUploadedSites.length === 0 ? (
-                <p className="text-xs text-muted-foreground">本次无本机独有站点上传。</p>
-              ) : (
-                <div className="grid gap-2 sm:grid-cols-2">
-                  {joinReport.localUploadedSites.map(site => {
-                    const doneBl = !!blacklistedUploaded[site];
-                    const busyBl = !!blacklistingSite[site];
-                    return (
-                      <div
-                        key={site}
-                        className="flex items-center justify-between gap-2 rounded-lg border border-border bg-muted/20 px-3 py-2">
-                        <span className="truncate text-sm font-medium text-foreground">{site}</span>
-                        {doneBl ? (
-                          <Badge variant="secondary" className="text-[11px]">
-                            已拉黑
-                          </Badge>
-                        ) : (
-                          <Button
-                            type="button"
-                            size="sm"
-                            variant="ghost"
-                            disabled={busyBl}
-                            onClick={() => handleQuickBlacklistUploaded(site)}
-                            className="h-7 px-2 text-xs text-destructive hover:text-destructive">
-                            {busyBl ? (
-                              <Loader2 className="mr-1 h-3 w-3 animate-spin" />
-                            ) : (
-                              <Ban className="mr-1 h-3 w-3" />
-                            )}
-                            加入黑名单
-                          </Button>
-                        )}
-                      </div>
-                    );
-                  })}
-                </div>
-              )}
-            </CardContent>
-          </Card>
-
-          {/* Excluded Blacklisted Sites */}
-          {joinReport.excludedBlacklistedSites.length > 0 ? (
+          {/* STEP 2: Encryption Master Password + Smart Recommended Policy */}
+          {step === 2 ? (
             <Card>
-              <button
-                type="button"
-                onClick={() => setShowExcludedList(prev => !prev)}
-                className="flex w-full items-center justify-between px-6 py-4 text-left">
-                <span className="text-sm font-medium text-muted-foreground">
-                  已按敏感黑名单自动跳过 {joinReport.excludedBlacklistedSites.length} 个站点
-                </span>
-                {showExcludedList ? <ChevronUp className="h-4 w-4" /> : <ChevronDown className="h-4 w-4" />}
-              </button>
-              {showExcludedList ? (
-                <CardContent className="pt-0">
-                  <div className="flex flex-wrap gap-1.5">
-                    {joinReport.excludedBlacklistedSites.map(site => (
-                      <Badge key={site} variant="secondary" className="text-xs">
-                        {site}
-                      </Badge>
-                    ))}
+              <CardHeader>
+                <div className="flex flex-wrap items-center justify-between gap-2">
+                  <div>
+                    <CardTitle className="flex items-center gap-2 text-lg">
+                      <KeyRound className="h-5 w-5 text-primary" />第 2 步 ·{' '}
+                      {spaceMode === 'join' ? '输入主密码加入已有空间' : '设置加密主密码'}
+                    </CardTitle>
+                    <CardDescription>
+                      {spaceMode === 'join'
+                        ? `检测到已有空间「${spaceName}」，输入当初设置的加密主密码即可安全同步。`
+                        : '给你的登录数据加一把私人密码锁，多台电脑输入同一个主密码即可互通。'}
+                    </CardDescription>
                   </div>
-                </CardContent>
-              ) : null}
+                  <div className="flex items-center gap-1.5">
+                    <button
+                      type="button"
+                      onClick={() => {
+                        userEditedStep2Ref.current = true;
+                        setSpaceMode(prev => (prev === 'create' ? 'join' : 'create'));
+                      }}
+                      className="rounded-lg border border-border bg-muted/40 px-2.5 py-1.5 text-xs font-medium text-muted-foreground hover:text-foreground">
+                      {spaceMode === 'create' ? '改为加入已有空间' : '改为新建独立空间'}
+                    </button>
+                  </div>
+                </div>
+              </CardHeader>
+
+              <CardContent className="space-y-5">
+                {probeError ? (
+                  <div className="flex items-center justify-between gap-2 rounded-lg border border-amber-500/35 bg-amber-500/10 px-3 py-2 text-xs text-amber-900 dark:text-amber-200">
+                    <span>远端空间扫描提示：{probeError}（仍可直接继续初始化或加入）</span>
+                    <button
+                      type="button"
+                      aria-label="关闭提示"
+                      onClick={() => setProbeError(null)}
+                      className="rounded p-0.5 hover:bg-amber-500/20">
+                      <X className="h-3.5 w-3.5" />
+                    </button>
+                  </div>
+                ) : null}
+
+                {remoteSpaces.length > 1 && spaceMode === 'join' ? (
+                  <div className="space-y-2 rounded-xl border border-border bg-muted/25 p-3">
+                    <div className="text-xs font-medium text-muted-foreground">选择要加入的同步空间：</div>
+                    <div className="grid gap-2 sm:grid-cols-2">
+                      {remoteSpaces.map(sp => {
+                        const candidateId = resolveProbeSpaceId(sp);
+                        const candidateName = resolveProbeSpaceName(sp);
+                        const selected = spaceId === candidateId;
+                        return (
+                          <button
+                            key={sp.opaqueId}
+                            type="button"
+                            onClick={() => {
+                              setSpaceId(candidateId);
+                              setSpaceName(candidateName);
+                            }}
+                            className={`flex items-center justify-between gap-2 rounded-lg border px-3 py-2 text-left text-xs ${
+                              selected ? 'border-primary bg-primary/10' : 'border-border bg-background'
+                            }`}>
+                            <span className="truncate font-semibold">{candidateName}</span>
+                            <Badge variant={selected ? 'default' : 'outline'}>{selected ? '已选' : '选择'}</Badge>
+                          </button>
+                        );
+                      })}
+                    </div>
+                  </div>
+                ) : null}
+
+                {/* E2E Encryption Password Card */}
+                <div className="rounded-xl border border-primary/30 bg-primary/[0.04] p-4 space-y-3.5">
+                  <div className="flex items-start gap-2.5">
+                    <Lock className="mt-0.5 h-5 w-5 shrink-0 text-primary" />
+                    <div className="space-y-0.5">
+                      <div className="text-sm font-semibold text-foreground">端到端加密主密码（请牢记）</div>
+                      <p className="text-xs text-muted-foreground leading-relaxed">
+                        此密码<strong>绝不上传任何服务器</strong>。即使网盘或 GitHub 账号泄漏，没有此密码也无法解密你的
+                        Cookie。建议使用与网盘密码不同的独立密码并记入密码本（遗忘后无法找回）。
+                      </p>
+                    </div>
+                  </div>
+
+                  <div className="grid gap-3 sm:grid-cols-2">
+                    <div className="space-y-1.5">
+                      <div className="flex items-center justify-between">
+                        <Label htmlFor="encPass">
+                          {spaceMode === 'join' ? '输入该空间的加密主密码 *' : '设置加密主密码（至少 6 位）*'}
+                        </Label>
+                        <button
+                          type="button"
+                          onClick={() => setShowEncPassword(prev => !prev)}
+                          className="inline-flex items-center gap-1 text-xs text-muted-foreground hover:text-foreground">
+                          {showEncPassword ? <EyeOff className="h-3.5 w-3.5" /> : <Eye className="h-3.5 w-3.5" />}
+                          {showEncPassword ? '隐藏' : '显示'}
+                        </button>
+                      </div>
+                      <Input
+                        id="encPass"
+                        type={showEncPassword ? 'text' : 'password'}
+                        value={encryptionPassword}
+                        onChange={e => {
+                          setEncryptionPassword(e.target.value);
+                          setPasswordVerifyState(null);
+                        }}
+                        placeholder="至少 6 位字母、数字或符号"
+                      />
+                    </div>
+
+                    {spaceMode === 'create' ? (
+                      <div className="space-y-1.5">
+                        <Label htmlFor="confirmEncPass">再次输入主密码确认 *</Label>
+                        <Input
+                          id="confirmEncPass"
+                          type={showEncPassword ? 'text' : 'password'}
+                          value={confirmPassword}
+                          onChange={e => {
+                            setConfirmPassword(e.target.value);
+                            setPasswordVerifyState(null);
+                          }}
+                          placeholder="再次输入以防误填"
+                        />
+                      </div>
+                    ) : (
+                      <div className="space-y-1.5">
+                        <Label htmlFor="deviceNameJoin">给这台电脑起个名字 *</Label>
+                        <Input
+                          id="deviceNameJoin"
+                          value={deviceName}
+                          onChange={e => setDeviceName(e.target.value)}
+                          placeholder="例如：公司电脑 / 家用笔记本"
+                        />
+                      </div>
+                    )}
+                  </div>
+
+                  {spaceMode === 'create' && confirmPassword && encryptionPassword !== confirmPassword ? (
+                    <p className="text-xs font-medium text-destructive">两次输入的加密主密码不一致，请核对</p>
+                  ) : null}
+
+                  {extractStorageSecretForCompare(storageDraft) &&
+                  encryptionPassword &&
+                  encryptionPassword === extractStorageSecretForCompare(storageDraft) &&
+                  isBannerVisible('onboarding_same_password_warn', 'security') ? (
+                    <div className="flex items-center justify-between gap-2 rounded-lg border border-amber-500/35 bg-amber-500/10 px-3 py-2 text-xs text-amber-800 dark:text-amber-200">
+                      <span>提示：当前加密主密码与存储密钥相同，建议换一个独立密码更安全。</span>
+                      <button
+                        type="button"
+                        onClick={() => void dismissBanner('onboarding_same_password_warn')}
+                        className="shrink-0 rounded px-1.5 py-0.5 text-[11px] hover:bg-amber-500/20">
+                        知道了
+                      </button>
+                    </div>
+                  ) : null}
+                </div>
+
+                {/* Device Name (in create mode) + Optional Custom Space Name/ID */}
+                <div className="space-y-3">
+                  {spaceMode === 'create' ? (
+                    <div className="flex flex-wrap items-end justify-between gap-3">
+                      <div className="flex-1 min-w-[220px] space-y-1.5">
+                        <Label htmlFor="deviceNameCreate">给这台电脑起个好认的名字 *</Label>
+                        <Input
+                          id="deviceNameCreate"
+                          value={deviceName}
+                          onChange={e => setDeviceName(e.target.value)}
+                          placeholder="例如：公司台式机 / MacBook"
+                        />
+                      </div>
+                      <button
+                        type="button"
+                        onClick={() => setShowCustomSpaceMeta(prev => !prev)}
+                        className="inline-flex items-center gap-1 pb-2 text-xs text-muted-foreground hover:text-foreground">
+                        <FolderPlus className="h-3.5 w-3.5" />
+                        {showCustomSpaceMeta
+                          ? '收起空间 ID 设置'
+                          : `自定义空间名称 / ID（当前：${spaceName} · ${spaceId}）`}
+                      </button>
+                    </div>
+                  ) : (
+                    <div className="flex justify-end">
+                      <button
+                        type="button"
+                        onClick={() => setShowCustomSpaceMeta(prev => !prev)}
+                        className="inline-flex items-center gap-1 text-xs text-muted-foreground hover:text-foreground">
+                        {showCustomSpaceMeta ? '收起空间 ID 设置' : `手动指定空间 ID（当前：${spaceId}）`}
+                      </button>
+                    </div>
+                  )}
+
+                  {showCustomSpaceMeta ? (
+                    <div className="grid gap-3 rounded-xl border border-border bg-muted/20 p-3.5 sm:grid-cols-2">
+                      <div className="space-y-1.5">
+                        <Label htmlFor="spaceId">同步空间 ID *</Label>
+                        <Input
+                          id="spaceId"
+                          value={spaceId}
+                          onChange={e => {
+                            userEditedStep2Ref.current = true;
+                            setSpaceId(e.target.value);
+                          }}
+                          placeholder="default"
+                        />
+                        <p className="text-[11px] text-muted-foreground">
+                          用于隔离工作/个人不同空间，大多数用户保持 default 即可
+                        </p>
+                      </div>
+                      <div className="space-y-1.5">
+                        <Label htmlFor="spaceName">空间显示名称</Label>
+                        <Input
+                          id="spaceName"
+                          value={spaceName}
+                          onChange={e => {
+                            userEditedStep2Ref.current = true;
+                            setSpaceName(e.target.value);
+                          }}
+                          placeholder="默认同步空间"
+                        />
+                      </div>
+                    </div>
+                  ) : null}
+                </div>
+
+                {/* Smart Recommended Safety Summary + Collapsible Expert Policy */}
+                <div className="rounded-xl border border-border bg-card">
+                  <div className="flex flex-wrap items-center justify-between gap-2 px-4 py-3">
+                    <div className="flex items-start gap-2.5">
+                      <ShieldCheck className="mt-0.5 h-4 w-4 shrink-0 text-emerald-600 dark:text-emerald-400" />
+                      <div className="text-xs">
+                        <span className="font-semibold text-foreground">已自动启用新手安全推荐配置：</span>
+                        <span className="text-muted-foreground">
+                          {syncScopeMode === 'managed_only' ? '仅同步你选中的网站' : '全站自动同步'} ·
+                          自动排除网银与密码库 ·{' '}
+                          {syncTimingMode === 'on_page_leave' ? '离开网页时合并上传' : '实时上传'}
+                        </span>
+                      </div>
+                    </div>
+                    <button
+                      type="button"
+                      onClick={() => setPolicyExpanded(prev => !prev)}
+                      className="inline-flex items-center gap-1 text-xs font-medium text-primary hover:underline">
+                      {policyExpanded ? '收起高级策略' : '自定义同步策略'}
+                      {policyExpanded ? <ChevronUp className="h-3.5 w-3.5" /> : <ChevronDown className="h-3.5 w-3.5" />}
+                    </button>
+                  </div>
+
+                  {policyExpanded ? (
+                    <div className="space-y-4 border-t border-border p-4">
+                      <div className="grid gap-3 sm:grid-cols-2">
+                        <button
+                          type="button"
+                          onClick={() => setSyncScopeMode('managed_only')}
+                          className={`rounded-xl border p-3 text-left transition-all ${
+                            syncScopeMode === 'managed_only'
+                              ? 'border-primary bg-primary/8 ring-1 ring-primary/40'
+                              : 'border-border bg-background'
+                          }`}>
+                          <div className="flex items-center justify-between gap-2">
+                            <span className="text-xs font-semibold text-foreground">仅同步我选中的网站</span>
+                            <Badge variant="success" className="text-[10px]">
+                              推荐
+                            </Badge>
+                          </div>
+                          <p className="mt-1 text-[11px] text-muted-foreground">
+                            只同步您在下一步勾选或平时手动开启的网站，不上传无关浏览记录。
+                          </p>
+                        </button>
+
+                        <button
+                          type="button"
+                          onClick={() => setSyncScopeMode('all_sites')}
+                          className={`rounded-xl border p-3 text-left transition-all ${
+                            syncScopeMode === 'all_sites'
+                              ? 'border-primary bg-primary/8 ring-1 ring-primary/40'
+                              : 'border-border bg-background'
+                          }`}>
+                          <div className="text-xs font-semibold text-foreground">全站自动同步（黑名单除外）</div>
+                          <p className="mt-1 text-[11px] text-muted-foreground">
+                            自动同步所有访问网站的登录状态，无需逐个挑站。
+                          </p>
+                        </button>
+                      </div>
+
+                      <div className="flex items-start gap-2.5 rounded-xl border border-border bg-muted/20 p-3 text-xs">
+                        <input
+                          id="onboarding-primary-authority"
+                          type="checkbox"
+                          checked={setAsPrimaryAuthority}
+                          onChange={e => setSetAsPrimaryAuthority(e.target.checked)}
+                          className="mt-0.5 h-4 w-4 cursor-pointer rounded accent-primary"
+                        />
+                        <label htmlFor="onboarding-primary-authority" className="flex-1 cursor-pointer">
+                          <strong className="inline-flex items-center gap-1 text-foreground">
+                            <Crown className="h-3.5 w-3.5 text-amber-500" />
+                            将这台电脑设为主力基准设备
+                          </strong>
+                          <span className="mt-0.5 block text-muted-foreground">
+                            勾选后，其他电脑遇到同名网站登录冲突时将默认跟随本机登录态，省去手动弹窗确认。
+                          </span>
+                        </label>
+                      </div>
+
+                      <div className="space-y-2">
+                        <div className="text-xs font-semibold text-foreground">自动排除敏感网站（推荐保持勾选）：</div>
+                        <div className="grid gap-2 sm:grid-cols-2">
+                          {PRESET_BLACKLIST_OPTIONS.map(opt => {
+                            const checked = selectedPresets.includes(opt.category);
+                            const presetId = `onboarding-preset-${opt.category}`;
+                            return (
+                              <div
+                                key={opt.category}
+                                className="flex items-start gap-2 rounded-lg border border-border p-2.5 text-xs">
+                                <input
+                                  id={presetId}
+                                  type="checkbox"
+                                  checked={checked}
+                                  onChange={() => togglePreset(opt.category)}
+                                  className="mt-0.5 h-4 w-4 cursor-pointer rounded accent-primary"
+                                />
+                                <label htmlFor={presetId} className="flex-1 cursor-pointer">
+                                  <strong className="block text-foreground">{opt.title}</strong>
+                                  <span className="text-[11px] text-muted-foreground">{opt.examples}</span>
+                                </label>
+                              </div>
+                            );
+                          })}
+                        </div>
+                      </div>
+
+                      <div className="divide-y divide-border rounded-xl border border-border text-xs">
+                        <div className="flex items-center justify-between gap-3 p-3">
+                          <div>
+                            <div className="font-medium text-foreground">开启自动同步</div>
+                            <div className="text-[11px] text-muted-foreground">关闭后仅在手动点击同步时上传或拉取</div>
+                          </div>
+                          <Switch checked={autoSync} onCheckedChange={setAutoSync} />
+                        </div>
+                        <div className="flex items-center justify-between gap-3 p-3">
+                          <div>
+                            <div className="font-medium text-foreground">上传时机</div>
+                            <div className="text-[11px] text-muted-foreground">离开页面时合并上传最省网盘请求</div>
+                          </div>
+                          <Select
+                            value={syncTimingMode}
+                            disabled={!autoSync}
+                            onValueChange={v => setSyncTimingMode(v as SyncTimingMode)}>
+                            <SelectTrigger className="h-8 w-44 text-xs">
+                              <SelectValue />
+                            </SelectTrigger>
+                            <SelectContent>
+                              <SelectItem value="on_page_leave">离开网页时上传（推荐）</SelectItem>
+                              <SelectItem value="realtime">实时立即上传</SelectItem>
+                            </SelectContent>
+                          </Select>
+                        </div>
+                        <div className="flex items-center justify-between gap-3 p-3">
+                          <div>
+                            <div className="font-medium text-foreground">同步 LocalStorage 前端登录态</div>
+                            <div className="text-[11px] text-muted-foreground">许多现代网页将登录 Token 存在此处</div>
+                          </div>
+                          <Switch checked={syncLocalStorage} onCheckedChange={setSyncLocalStorage} />
+                        </div>
+                        <div className="flex items-center justify-between gap-3 p-3">
+                          <div>
+                            <div className="font-medium text-foreground">手动同步后自动刷新网页</div>
+                            <div className="text-[11px] text-muted-foreground">默认关闭以防打断正在输入的表单</div>
+                          </div>
+                          <div className="flex items-center gap-2.5">
+                            <div className="flex items-center gap-1 text-[11px] text-muted-foreground">
+                              <Label htmlFor="onboarding-refresh-guard" className="text-[11px] font-normal">
+                                表单保护
+                              </Label>
+                              <Switch
+                                id="onboarding-refresh-guard"
+                                checked={refreshProtection}
+                                disabled={!autoRefresh}
+                                onCheckedChange={setRefreshProtection}
+                              />
+                            </div>
+                            <Switch checked={autoRefresh} onCheckedChange={setAutoRefresh} />
+                          </div>
+                        </div>
+                        <div className="flex items-center justify-between gap-3 p-3">
+                          <div>
+                            <div className="font-medium text-foreground">坚果云低频省流模式</div>
+                            <div className="text-[11px] text-muted-foreground">降低轮询频率避免网盘 429 限流</div>
+                          </div>
+                          <Switch checked={lowFrequencyMode} onCheckedChange={setLowFrequencyMode} />
+                        </div>
+                        <div className="flex items-center justify-between gap-3 p-3">
+                          <div>
+                            <div className="font-medium text-foreground">关闭浏览器自动上锁（高安全模式）</div>
+                            <div className="text-[11px] text-muted-foreground">每次重启浏览器需重新输入加密主密码</div>
+                          </div>
+                          <Switch checked={sessionLockEnabled} onCheckedChange={setSessionLockEnabled} />
+                        </div>
+                      </div>
+                    </div>
+                  ) : null}
+                </div>
+
+                {joinError ? (
+                  <Alert variant="destructive">
+                    <AlertTriangle className="h-4 w-4" />
+                    <AlertTitle className="text-xs font-semibold">未能完成开启</AlertTitle>
+                    <AlertDescription className="text-xs">{joinError}</AlertDescription>
+                  </Alert>
+                ) : null}
+
+                <div className="flex items-center justify-between pt-1">
+                  <Button
+                    type="button"
+                    variant="outline"
+                    disabled={joiningSpace || verifyingPassword}
+                    onClick={() => setStep(1)}>
+                    <ArrowLeft className="mr-2 h-4 w-4" />
+                    上一步
+                  </Button>
+                  <Button
+                    type="button"
+                    disabled={joiningSpace || verifyingPassword}
+                    onClick={() => void executeVerifyAndJoin()}
+                    className="min-w-[200px]">
+                    {joiningSpace || verifyingPassword ? (
+                      <>
+                        <Loader2 className="mr-2 h-4 w-4 animate-spin" />
+                        正在加密初始化空间...
+                      </>
+                    ) : (
+                      <>
+                        <ShieldCheck className="mr-2 h-4 w-4" />
+                        下一步：勾选同步网站
+                      </>
+                    )}
+                  </Button>
+                </div>
+              </CardContent>
             </Card>
           ) : null}
 
-          <div className="flex flex-wrap items-center justify-end gap-3 pt-2">
-            <Button type="button" variant="outline" onClick={openSidePanelFromWindow}>
-              <PanelRightOpen className="mr-2 h-4 w-4" />
-              打开侧边栏完整管理台
-            </Button>
-            <Button
-              type="button"
-              onClick={async () => {
-                // Remove ?onboarding=1 query param cleanly
-                if (window.location.search.includes('onboarding=1')) {
-                  window.history.replaceState({}, '', window.location.pathname);
-                }
-                await onComplete();
-              }}>
-              进入 SessionMesh 控制中心
-              <ArrowRight className="ml-2 h-4 w-4" />
-            </Button>
-          </div>
-        </div>
+          {/* STEP 3: Pick Websites to Sync + Optional Quick Pair 2nd Computer */}
+          {step === 3 && joinReport ? (
+            <div className="space-y-4">
+              <Card className="border-emerald-500/40 bg-emerald-500/5">
+                <CardHeader className="pb-3">
+                  <div className="flex flex-wrap items-center justify-between gap-2">
+                    <div className="flex items-center gap-2.5">
+                      <CheckCircle2 className="h-6 w-6 text-emerald-600 dark:text-emerald-400" />
+                      <div>
+                        <CardTitle className="text-lg">
+                          {joinReport.isNewSpace ? '🎉 加密同步空间已就绪！' : '🎉 已成功连入同步空间！'}
+                        </CardTitle>
+                        <CardDescription>
+                          最后一步：勾选这台电脑上希望多端共享登录的网站（以后也可以随时点击浏览器右上角扩展图标一键开启）。
+                        </CardDescription>
+                      </div>
+                    </div>
+                    <Badge variant="success">设备：{deviceName}</Badge>
+                  </div>
+                </CardHeader>
+              </Card>
+
+              {/* Pending Decisions first when joining Device B/C */}
+              {pendingDecisions.length > 0 ? (
+                <Card className="border-amber-500/40">
+                  <CardHeader className="pb-3">
+                    <CardTitle className="flex items-center gap-2 text-base">
+                      <AlertTriangle className="h-5 w-5 text-amber-600 dark:text-amber-400" />
+                      请确认这 {pendingDecisions.length} 个重叠网站用哪边的账号
+                    </CardTitle>
+                    <CardDescription>
+                      这台电脑和云端都已经登录过以下网站，为防误覆盖，请您选一下用云端账号还是本机账号：
+                    </CardDescription>
+                  </CardHeader>
+                  <CardContent>
+                    <PendingDecisionsPanel
+                      decisions={pendingDecisions}
+                      onResolved={resolvedKeys => {
+                        setPendingDecisions(prev => prev.filter(d => !resolvedKeys.includes(d.siteKey)));
+                      }}
+                    />
+                  </CardContent>
+                </Card>
+              ) : null}
+
+              {/* Searchable Website Picker */}
+              <Card className="border-primary/40">
+                <CardHeader className="pb-3">
+                  <div className="flex flex-wrap items-start justify-between gap-2">
+                    <div>
+                      <CardTitle className="flex items-center gap-2 text-base">
+                        <Globe className="h-5 w-5 text-primary" />
+                        勾选本机已登录、需要同步到其他电脑的网站
+                      </CardTitle>
+                      <CardDescription>
+                        未勾选的日常网页仅保留在本机，不会上传。勾选后点击下方「完成配置」也会自动为您保存开启！
+                      </CardDescription>
+                    </div>
+                    <Button
+                      type="button"
+                      size="sm"
+                      variant="outline"
+                      disabled={loadingCandidates}
+                      onClick={() => void loadCandidateSites()}>
+                      {loadingCandidates ? (
+                        <Loader2 className="mr-1.5 h-3.5 w-3.5 animate-spin" />
+                      ) : (
+                        <RefreshCw className="mr-1.5 h-3.5 w-3.5" />
+                      )}
+                      刷新列表
+                    </Button>
+                  </div>
+                </CardHeader>
+                <CardContent className="space-y-3">
+                  {candidateError ? (
+                    <Alert variant="destructive">
+                      <AlertTriangle className="h-4 w-4" />
+                      <AlertDescription className="text-xs">{candidateError}</AlertDescription>
+                    </Alert>
+                  ) : null}
+
+                  <div className="flex flex-wrap items-center gap-2">
+                    <div className="relative flex-1 min-w-[200px]">
+                      <Search className="pointer-events-none absolute left-2.5 top-1/2 h-3.5 w-3.5 -translate-y-1/2 text-muted-foreground" />
+                      <Input
+                        value={candidateSearch}
+                        onChange={e => setCandidateSearch(e.target.value)}
+                        placeholder="搜索网站域名（如 github.com、bilibili.com）..."
+                        className="h-9 pl-8 text-xs"
+                      />
+                    </div>
+                    <Button
+                      type="button"
+                      size="sm"
+                      variant="outline"
+                      disabled={selectableVisibleCandidates.length === 0}
+                      onClick={handleSelectAllVisibleCandidates}
+                      className="h-9 text-xs">
+                      全选 ({selectableVisibleCandidates.length})
+                    </Button>
+                    <Button
+                      type="button"
+                      size="sm"
+                      variant="ghost"
+                      disabled={selectedCandidateList.length === 0}
+                      onClick={() => setSelectedCandidateKeys({})}
+                      className="h-9 text-xs">
+                      清空勾选
+                    </Button>
+                  </div>
+
+                  {loadingCandidates ? (
+                    <div className="flex items-center justify-center py-8 text-xs text-muted-foreground">
+                      <Loader2 className="mr-2 h-4 w-4 animate-spin text-primary" />
+                      正在扫描当前浏览器已登录的网站...
+                    </div>
+                  ) : filteredCandidates.length === 0 ? (
+                    <div className="rounded-lg border border-dashed border-border py-6 text-center text-xs text-muted-foreground">
+                      {candidateSites.length === 0
+                        ? '当前浏览器暂无已登录网站 Cookie。稍后打开任意网站登录时，点击右上角 SessionMesh 图标即可一键开启同步！'
+                        : '没有匹配该关键词的网站。'}
+                    </div>
+                  ) : (
+                    <div className="max-h-72 overflow-y-auto divide-y divide-border rounded-xl border border-border">
+                      {filteredCandidates.map(site => {
+                        const disabled = site.alreadyManaged || site.blacklisted;
+                        const checked = !!selectedCandidateKeys[site.siteKey];
+                        return (
+                          <label
+                            key={site.siteKey}
+                            className={`flex items-center justify-between gap-3 px-3.5 py-2.5 text-xs transition-colors ${
+                              disabled
+                                ? 'bg-muted/20 opacity-75'
+                                : checked
+                                  ? 'cursor-pointer bg-primary/[0.06]'
+                                  : 'cursor-pointer hover:bg-muted/35'
+                            }`}>
+                            <div className="flex min-w-0 items-center gap-2.5">
+                              <input
+                                type="checkbox"
+                                disabled={disabled}
+                                checked={site.alreadyManaged ? true : checked}
+                                onChange={() => !disabled && toggleCandidateSelection(site.siteKey)}
+                                className="h-4 w-4 rounded border-input accent-primary"
+                              />
+                              <div className="min-w-0">
+                                <div className="truncate font-semibold text-foreground">{site.siteKey}</div>
+                                {site.domains.length > 1 ? (
+                                  <div className="truncate text-[10px] text-muted-foreground">
+                                    包含子域：{site.domains.slice(0, 3).join(', ')}
+                                    {site.domains.length > 3 ? ` 等 ${site.domains.length} 个` : ''}
+                                  </div>
+                                ) : null}
+                              </div>
+                            </div>
+
+                            <div className="flex shrink-0 items-center gap-1.5">
+                              <Badge variant="outline" className="text-[10px]">
+                                {site.cookieCount} 条登录凭据
+                              </Badge>
+                              {site.alreadyManaged ? (
+                                <Badge variant="success" className="text-[10px]">
+                                  同步中
+                                </Badge>
+                              ) : site.blacklisted ? (
+                                <Badge variant="destructive" className="text-[10px]">
+                                  已排除
+                                </Badge>
+                              ) : null}
+                            </div>
+                          </label>
+                        );
+                      })}
+                    </div>
+                  )}
+
+                  {selectedCandidateList.length > 0 ? (
+                    <div className="flex flex-wrap items-center justify-between gap-2 rounded-lg bg-primary/[0.06] px-3 py-2">
+                      <span className="text-xs text-foreground">
+                        已勾选 <strong>{selectedCandidateList.length}</strong> 个网站
+                      </span>
+                      <Button
+                        type="button"
+                        size="sm"
+                        disabled={addingManaged}
+                        onClick={() => void handleAddSelectedManagedSites()}>
+                        {addingManaged ? (
+                          <Loader2 className="mr-1.5 h-3.5 w-3.5 animate-spin" />
+                        ) : (
+                          <Plus className="mr-1.5 h-3.5 w-3.5" />
+                        )}
+                        立即开启同步 ({selectedCandidateList.length})
+                      </Button>
+                    </div>
+                  ) : null}
+                </CardContent>
+              </Card>
+
+              {/* Quick Pair 2nd Computer Card right inside Finish Step */}
+              <Card className="border-primary/25 bg-primary/[0.02]">
+                <button
+                  type="button"
+                  onClick={() => setFinishPairingOpen(prev => !prev)}
+                  className="flex w-full items-center justify-between px-5 py-3.5 text-left">
+                  <div className="flex items-center gap-2.5">
+                    <div className="flex h-8 w-8 items-center justify-center rounded-lg bg-primary/15 text-primary">
+                      <Laptop className="h-4 w-4" />
+                    </div>
+                    <div>
+                      <div className="text-sm font-semibold text-foreground">
+                        想顺便连上第 2 台电脑？一键生成跨设备配对码
+                      </div>
+                      <p className="text-xs text-muted-foreground">
+                        不用在另一台电脑重填服务器密钥，复制配对码发过去 10 秒即可连入
+                      </p>
+                    </div>
+                  </div>
+                  {finishPairingOpen ? <ChevronUp className="h-4 w-4" /> : <ChevronDown className="h-4 w-4" />}
+                </button>
+                {finishPairingOpen ? (
+                  <CardContent className="space-y-3 border-t border-border pt-4">
+                    <div className="flex flex-wrap items-center gap-2">
+                      <Button
+                        type="button"
+                        size="sm"
+                        disabled={generatingFinishPair}
+                        onClick={() => void handleGenerateInstantPairBundle()}>
+                        {generatingFinishPair ? (
+                          <Loader2 className="mr-1.5 h-3.5 w-3.5 animate-spin" />
+                        ) : (
+                          <Dices className="mr-1.5 h-3.5 w-3.5" />
+                        )}
+                        一键生成随机口令与配对码
+                      </Button>
+                      <span className="text-xs text-muted-foreground">
+                        在另一台电脑安装扩展后选择「我有配对码」，整段粘贴即可自动识别
+                      </span>
+                    </div>
+
+                    {finishPairingCode ? (
+                      <div className="space-y-2 rounded-xl border border-border bg-background p-3 text-xs">
+                        <div className="flex flex-wrap items-center justify-between gap-2">
+                          <span>
+                            随机配对口令：
+                            <code className="rounded bg-muted px-2 py-0.5 font-bold">{finishPairingPin}</code>
+                          </span>
+                          <div className="flex items-center gap-1.5">
+                            <Button
+                              type="button"
+                              size="sm"
+                              variant="outline"
+                              className="h-7 text-[11px]"
+                              onClick={() => void copyToClipboard(finishPairingCode, '已仅复制配对码')}>
+                              <Copy className="mr-1 h-3 w-3" />
+                              仅复制配对码
+                            </Button>
+                            <Button
+                              type="button"
+                              size="sm"
+                              className="h-7 text-[11px]"
+                              onClick={() =>
+                                void copyToClipboard(
+                                  `SessionMesh 跨设备配对码：\n${finishPairingCode}\n口令：${finishPairingPin}\n（在向导选择「我有配对码」整段粘贴，再输入空间加密主密码即可接入；用完请删除聊天记录）`,
+                                  '已复制完整配对信息，发到另一台电脑粘贴即可！',
+                                )
+                              }>
+                              <Copy className="mr-1 h-3 w-3" />
+                              复制完整配对包（含口令）
+                            </Button>
+                          </div>
+                        </div>
+                        <Textarea value={finishPairingCode} readOnly rows={2} className="font-mono text-[11px]" />
+                      </div>
+                    ) : null}
+                  </CardContent>
+                ) : null}
+              </Card>
+
+              {/* Compact Collapsible Sync Details (Auto-synced / Uploaded / Blacklisted) */}
+              {joinReport.autoSyncedSites.length > 0 ||
+              joinReport.localUploadedSites.length > 0 ||
+              joinReport.excludedBlacklistedSites.length > 0 ? (
+                <Card>
+                  <button
+                    type="button"
+                    onClick={() => setShowReportDetails(prev => !prev)}
+                    className="flex w-full items-center justify-between px-5 py-3 text-left text-xs text-muted-foreground hover:text-foreground">
+                    <span>
+                      首次同步摘要：自动同步到本地 {joinReport.autoSyncedSites.length} 个 · 本机上传{' '}
+                      {joinReport.localUploadedSites.length} 个 · 敏感黑名单自动保护跳过{' '}
+                      {joinReport.excludedBlacklistedSites.length} 个
+                    </span>
+                    {showReportDetails ? <ChevronUp className="h-4 w-4" /> : <ChevronDown className="h-4 w-4" />}
+                  </button>
+                  {showReportDetails ? (
+                    <CardContent className="space-y-3 border-t border-border pt-3 text-xs">
+                      {joinReport.autoSyncedSites.length > 0 ? (
+                        <div>
+                          <div className="mb-1.5 font-medium text-foreground">已从云端自动同步到本地：</div>
+                          <div className="flex flex-wrap gap-1.5">
+                            {joinReport.autoSyncedSites.map(site => (
+                              <Badge key={site} variant="success">
+                                {site}
+                              </Badge>
+                            ))}
+                          </div>
+                        </div>
+                      ) : null}
+                      {joinReport.localUploadedSites.length > 0 ? (
+                        <div>
+                          <div className="mb-1.5 flex items-center gap-1 font-medium text-foreground">
+                            <CloudUpload className="h-3.5 w-3.5 text-primary" />
+                            本机已加密上传站点（可快速排除）：
+                          </div>
+                          <div className="grid gap-1.5 sm:grid-cols-2">
+                            {joinReport.localUploadedSites.map(site => (
+                              <div
+                                key={site}
+                                className="flex items-center justify-between rounded-lg border border-border px-2.5 py-1.5">
+                                <span className="truncate">{site}</span>
+                                {blacklistedUploaded[site] ? (
+                                  <Badge variant="secondary">已排除</Badge>
+                                ) : (
+                                  <button
+                                    type="button"
+                                    disabled={blacklistingSite[site]}
+                                    onClick={() => void handleQuickBlacklistUploaded(site)}
+                                    className="inline-flex items-center gap-1 text-destructive hover:underline">
+                                    <Ban className="h-3 w-3" />
+                                    不同步此站
+                                  </button>
+                                )}
+                              </div>
+                            ))}
+                          </div>
+                        </div>
+                      ) : null}
+                      {joinReport.excludedBlacklistedSites.length > 0 ? (
+                        <div>
+                          <div className="mb-1.5 font-medium text-muted-foreground">敏感黑名单已自动跳过：</div>
+                          <div className="flex flex-wrap gap-1.5">
+                            {joinReport.excludedBlacklistedSites.map(site => (
+                              <Badge key={site} variant="secondary">
+                                {site}
+                              </Badge>
+                            ))}
+                          </div>
+                        </div>
+                      ) : null}
+                    </CardContent>
+                  ) : null}
+                </Card>
+              ) : null}
+
+              <div className="flex flex-wrap items-center justify-between gap-3 pt-2">
+                <p className="text-xs text-muted-foreground">
+                  💡 提示：建议把浏览器右上角的 <strong>SessionMesh 拼图图标固定（Pin）在工具栏</strong>
+                  ，平时点一下就能切号或开同步。
+                </p>
+                <div className="flex flex-wrap items-center gap-2.5">
+                  <Button type="button" variant="outline" onClick={openSidePanelFromWindow}>
+                    <PanelRightOpen className="mr-1.5 h-4 w-4" />
+                    打开侧边栏
+                  </Button>
+                  <Button
+                    type="button"
+                    disabled={addingManaged}
+                    onClick={() => void handleFinishWizard()}
+                    className="min-w-[190px]">
+                    {addingManaged ? <Loader2 className="mr-2 h-4 w-4 animate-spin" /> : null}
+                    {selectedCandidateList.length > 0
+                      ? `保存所选 (${selectedCandidateList.length}) 并完成`
+                      : '完成配置，开始使用'}
+                    <ArrowRight className="ml-2 h-4 w-4" />
+                  </Button>
+                </div>
+              </div>
+            </div>
+          ) : null}
+        </>
       ) : null}
     </div>
   );

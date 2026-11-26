@@ -1,4 +1,10 @@
-export { buildCookieLogicalId, buildLocalStorageLogicalId, normalizeCookieStoreScope } from './ids';
+export {
+  buildCookieLogicalId,
+  buildLocalStorageLogicalId,
+  buildSessionStorageLogicalId,
+  buildIndexedDbLogicalId,
+  normalizeCookieStoreScope,
+} from './ids';
 export {
   HlcClock,
   incrementVectorClock,

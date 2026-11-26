@@ -5,8 +5,10 @@ import {
   copyToClipboard,
   downloadJsonFile,
   formatRelativeTime,
+  formatRemainingDuration,
   getBindingMeta,
   getCookieSyncStatusMeta,
+  getExpiryBadgeMeta,
   shortId,
 } from '@console/lib/format';
 import type {
@@ -63,7 +65,9 @@ import { StatusBadge } from './common/Badge';
 import { EmptyState } from './common/EmptyState';
 import { JsonImportModal } from './common/JsonImportModal';
 import { Modal } from './common/Modal';
+import { AccountAppearanceFields, sliceBadgeCodePoints, TrackBadges } from './common/TrackAppearance';
 import { CookieDetailView } from './CookieDetailView';
+import { SessionShareImportModal } from './SessionShareImportModal';
 import { UnmanageSiteModal } from './UnmanageSiteModal';
 import type { UnmanageSiteScope } from './UnmanageSiteModal';
 
@@ -131,6 +135,8 @@ export const SitesAndCookiesTab: React.FC<SitesAndCookiesTabProps> = ({
     trackId: string;
     label: string;
     accountNote: string;
+    color: string;
+    badgeText: string;
   } | null>(null);
   const [splitTargetSite, setSplitTargetSite] = useState<string | null>(null);
   const [splitLabel, setSplitLabel] = useState('');
@@ -138,6 +144,9 @@ export const SitesAndCookiesTab: React.FC<SitesAndCookiesTabProps> = ({
   const [createAcctMode, setCreateAcctMode] = useState<AccountCreateMode>('clean_new');
   const [createAcctLabel, setCreateAcctLabel] = useState('');
   const [createAcctNote, setCreateAcctNote] = useState('');
+  const [createAcctColor, setCreateAcctColor] = useState('');
+  const [createAcctBadgeText, setCreateAcctBadgeText] = useState('');
+  const [shareImportOpen, setShareImportOpen] = useState(false);
 
   const { isBannerVisible, dismissBanner } = useBannerPrefs();
 
@@ -364,6 +373,8 @@ export const SitesAndCookiesTab: React.FC<SitesAndCookiesTabProps> = ({
       await sidePanelApi.updateSiteTrack(renameTarget.siteKey, renameTarget.trackId, {
         label: renameTarget.label.trim(),
         accountNote: renameTarget.accountNote.trim(),
+        color: renameTarget.color || null,
+        badgeText: sliceBadgeCodePoints(renameTarget.badgeText.trim(), 4) || null,
       });
       toast.success('账号信息已更新');
       setRenameTarget(null);
@@ -412,6 +423,8 @@ export const SitesAndCookiesTab: React.FC<SitesAndCookiesTabProps> = ({
         mode: createAcctMode,
         label: createAcctLabel.trim() || undefined,
         accountNote: createAcctNote.trim() || undefined,
+        color: createAcctColor || undefined,
+        badgeText: sliceBadgeCodePoints(createAcctBadgeText.trim(), 4) || undefined,
         triggerRefresh: createAcctMode === 'clean_new',
       });
       toast.success(
@@ -422,6 +435,8 @@ export const SitesAndCookiesTab: React.FC<SitesAndCookiesTabProps> = ({
       setCreateAcctSite(null);
       setCreateAcctLabel('');
       setCreateAcctNote('');
+      setCreateAcctColor('');
+      setCreateAcctBadgeText('');
       await handleAfterMutation();
     } catch (err) {
       toast.error(`创建账号失败：${extractErrorMessage(err)}`);
@@ -704,14 +719,20 @@ export const SitesAndCookiesTab: React.FC<SitesAndCookiesTabProps> = ({
       {/* Sites Primary Action & Binding Filter Toolbar */}
       <div className="space-y-2">
         <div className="flex flex-wrap items-center justify-between gap-2">
-          <Button
-            variant="default"
-            size="sm"
-            className="h-8 px-3 text-xs font-medium shadow-sm"
-            onClick={() => setAddSitesOpen(true)}>
-            <Plus className="mr-1 h-3.5 w-3.5" />
-            添加同步网站
-          </Button>
+          <div className="flex flex-wrap items-center gap-1.5">
+            <Button
+              variant="default"
+              size="sm"
+              className="h-8 px-3 text-xs font-medium shadow-sm"
+              onClick={() => setAddSitesOpen(true)}>
+              <Plus className="mr-1 h-3.5 w-3.5" />
+              添加同步网站
+            </Button>
+            <Button variant="outline" size="sm" className="h-8 px-2.5 text-xs" onClick={() => setShareImportOpen(true)}>
+              <Upload className="mr-1 h-3.5 w-3.5 text-purple-600 dark:text-purple-400" />
+              导入分享会话
+            </Button>
+          </div>
 
           <div className="flex items-center gap-1">
             <Button
@@ -825,6 +846,10 @@ export const SitesAndCookiesTab: React.FC<SitesAndCookiesTabProps> = ({
             const bindingMeta = getBindingMeta(site.binding.state);
             const syncMeta = getCookieSyncStatusMeta(site.syncStatus);
             const isBlacklisted = site.binding.state === 'BLACKLISTED';
+            const expiryBadgeMeta =
+              site.expiryHealth && site.expiryHealth.status !== 'healthy'
+                ? getExpiryBadgeMeta(site.expiryHealth.status)
+                : null;
             return (
               <div
                 key={site.siteKey}
@@ -849,6 +874,17 @@ export const SitesAndCookiesTab: React.FC<SitesAndCookiesTabProps> = ({
                         {site.allTracks.length > 1 ? (
                           <StatusBadge tone="primary">{site.allTracks.length} 账号</StatusBadge>
                         ) : null}
+                        {expiryBadgeMeta && site.expiryHealth ? (
+                          <StatusBadge tone={expiryBadgeMeta.tone}>
+                            {site.expiryHealth.status === 'expired'
+                              ? 'Cookie 已过期'
+                              : `${expiryBadgeMeta.label}${
+                                  site.expiryHealth.remainingMs !== undefined
+                                    ? ` · ${formatRemainingDuration(site.expiryHealth.remainingMs)}`
+                                    : ''
+                                }`}
+                          </StatusBadge>
+                        ) : null}
                         {site.rollingTokenDamped ? (
                           <StatusBadge tone="warning">
                             <ShieldAlert className="h-3 w-3" />
@@ -859,9 +895,10 @@ export const SitesAndCookiesTab: React.FC<SitesAndCookiesTabProps> = ({
 
                       {/* Track & Metrics */}
                       <div className="mt-1 flex flex-wrap items-center gap-x-2.5 gap-y-1 text-[11px] text-muted-foreground">
-                        <span className="inline-flex items-center gap-1 text-foreground/85 font-medium">
+                        <span className="inline-flex flex-wrap items-center gap-1 text-foreground/85 font-medium">
                           <GitBranch className="h-3 w-3 text-primary" />
-                          {site.activeTrack?.label || '未绑定轨道'}
+                          <TrackBadges track={site.activeTrack} />
+                          <span>{site.activeTrack?.label || '未绑定轨道'}</span>
                         </span>
                         {site.activeTrack?.accountNote ? (
                           <span className="truncate max-w-[160px] text-[10px] text-muted-foreground">
@@ -953,6 +990,8 @@ export const SitesAndCookiesTab: React.FC<SitesAndCookiesTabProps> = ({
                           setCreateAcctMode('clean_new');
                           setCreateAcctLabel('');
                           setCreateAcctNote('');
+                          setCreateAcctColor('');
+                          setCreateAcctBadgeText('');
                         }}
                         title="新增多账号（清空页面登录新号 / 保存当前登录态）">
                         <UserPlus className="mr-1 h-3 w-3" />
@@ -1041,6 +1080,8 @@ export const SitesAndCookiesTab: React.FC<SitesAndCookiesTabProps> = ({
                                     trackId: site.activeTrack!.trackId,
                                     label: site.activeTrack!.label,
                                     accountNote: site.activeTrack!.accountNote || '',
+                                    color: site.activeTrack!.color || '',
+                                    badgeText: site.activeTrack!.badgeText || '',
                                   })
                                 }>
                                 <Tag className="mr-2 h-3.5 w-3.5" />
@@ -1163,6 +1204,13 @@ export const SitesAndCookiesTab: React.FC<SitesAndCookiesTabProps> = ({
               }}
             />
           </div>
+          <AccountAppearanceFields
+            idPrefix="sites-rename"
+            color={renameTarget?.color || ''}
+            onColorChange={c => setRenameTarget(prev => (prev ? { ...prev, color: c } : null))}
+            badgeText={renameTarget?.badgeText || ''}
+            onBadgeTextChange={b => setRenameTarget(prev => (prev ? { ...prev, badgeText: b } : null))}
+          />
         </div>
       </Modal>
 
@@ -1261,8 +1309,21 @@ export const SitesAndCookiesTab: React.FC<SitesAndCookiesTabProps> = ({
               if (e.key === 'Enter') void handleConfirmCreateAccount();
             }}
           />
+          <AccountAppearanceFields
+            idPrefix="sites-create-acct"
+            color={createAcctColor}
+            onColorChange={setCreateAcctColor}
+            badgeText={createAcctBadgeText}
+            onBadgeTextChange={setCreateAcctBadgeText}
+          />
         </div>
       </Modal>
+
+      <SessionShareImportModal
+        open={shareImportOpen}
+        onClose={() => setShareImportOpen(false)}
+        onImported={handleAfterMutation}
+      />
     </div>
   );
 };

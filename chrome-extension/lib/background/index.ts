@@ -5,24 +5,40 @@ import {
   RulesEngine,
   SyncEngine,
   toStructuredError,
+  type SanitizedStorageProviderConfig,
   type SiteSummaryView,
   type SpaceSettings,
+  type SyncStatusSummary,
   type WebDAVConfig,
 } from '@sessionmesh/core';
 import {
   isSyncableHttpUrl,
+  type ContentPageMountConfig,
   type CurrentSiteSnapshot,
   type PopupSummaryPayload,
   type SessionMeshCommand,
   type SessionMeshResponse,
 } from '@sessionmesh/shared';
-import { IndexedDBStorageBackend, NonExtractableKeyVault, uiStateStorage } from '@sessionmesh/storage';
-import { updateBadgeFromStatus } from './badge';
+import {
+  defaultDirHandleStore,
+  IndexedDBStorageBackend,
+  localeStorage,
+  NonExtractableKeyVault,
+  uiStateStorage,
+} from '@sessionmesh/storage';
+import { deriveTrackBadgeText, updateBadgeForTab, updateBadgeFromStatus } from './badge';
 import { ChromeBrowserAdapter } from './chromeBrowserAdapter';
+import {
+  consumePendingTabAccountToast,
+  registerCommandShortcutsListener,
+  savePendingTabAccountToast,
+} from './commands';
 import { registerContextMenuListener, setupContextMenus } from './contextMenu';
 
 const ALARM_POLL = 'sessionmesh-poll';
 const ALARM_FLUSH = 'sessionmesh-flush';
+const ALARM_EXPIRY_CHECK = 'sessionmesh-expiry-check';
+const EXPIRY_CHECK_PERIOD_MINUTES = 30;
 const MIN_POLL_PERIOD_MINUTES = 0.5;
 const LOW_FREQ_MIN_POLL_MINUTES = 5;
 const SITE_VISIT_DEDUPE_MS = 1_500;
@@ -165,13 +181,109 @@ async function syncPollAlarmFromSettings(settings: SpaceSettings): Promise<void>
   }
 }
 
+async function ensureExpiryCheckAlarm(): Promise<void> {
+  if (typeof chrome === 'undefined' || !chrome.alarms?.create) return;
+  try {
+    await chrome.alarms.create(ALARM_EXPIRY_CHECK, {
+      delayInMinutes: EXPIRY_CHECK_PERIOD_MINUTES,
+      periodInMinutes: EXPIRY_CHECK_PERIOD_MINUTES,
+    });
+  } catch {
+    // ignore expiry alarm errors
+  }
+}
+
 async function syncVaultAndAlarms(engine: SyncEngine): Promise<void> {
   try {
     const settings = await engine.getSpaceSettings();
     await keyVault.setSessionLockEnabled(Boolean(settings.sessionLockEnabled));
     await syncPollAlarmFromSettings(settings);
+    await ensureExpiryCheckAlarm();
   } catch (err) {
     console.warn('SessionMesh failed to sync vault/alarm settings:', err);
+  }
+}
+
+async function refreshTabBadgeForUrl(
+  engine: SyncEngine,
+  tabId: number,
+  url: string | undefined,
+  summary: SyncStatusSummary,
+  settings?: SpaceSettings,
+  sitesBySiteKey?: Map<string, SiteSummaryView>,
+): Promise<void> {
+  const effectiveSettings = settings ?? (await engine.getSpaceSettings().catch(() => DEFAULT_SPACE_SETTINGS));
+  const ssoGroups = engine.getCachedSsoGroups();
+  const siteKey = isSyncableHttpUrl(url) ? resolveSiteKey(url!, ssoGroups) : '';
+  let siteSummary = siteKey ? sitesBySiteKey?.get(siteKey) : undefined;
+  if (siteKey && !sitesBySiteKey) {
+    const overview = await engine.getSitesOverview().catch(() => []);
+    siteSummary = overview.find(item => item.siteKey === siteKey);
+  }
+  updateBadgeForTab({
+    tabId,
+    summary,
+    siteSummary,
+    badgeDisplayMode: effectiveSettings.badgeDisplayMode ?? 'multi_or_tagged',
+  });
+}
+
+async function refreshAllTabBadges(engine: SyncEngine, summary: SyncStatusSummary): Promise<void> {
+  try {
+    const [tabs, settings, overview] = await Promise.all([
+      browserAdapter.queryTabs(),
+      engine.getSpaceSettings().catch(() => DEFAULT_SPACE_SETTINGS),
+      engine.getSitesOverview().catch(() => [] as SiteSummaryView[]),
+    ]);
+    const sitesByKey = new Map<string, SiteSummaryView>();
+    for (const item of overview) {
+      sitesByKey.set(item.siteKey, item);
+    }
+    const ssoGroups = engine.getCachedSsoGroups();
+    for (const tab of tabs) {
+      if (typeof tab.id !== 'number') continue;
+      const siteKey = isSyncableHttpUrl(tab.url) ? resolveSiteKey(tab.url!, ssoGroups) : '';
+      updateBadgeForTab({
+        tabId: tab.id,
+        summary,
+        siteSummary: siteKey ? sitesByKey.get(siteKey) : undefined,
+        badgeDisplayMode: settings.badgeDisplayMode ?? 'multi_or_tagged',
+      });
+    }
+  } catch {
+    // ignore per-tab badge refresh errors
+  }
+}
+
+async function propagateExtendedMonitorsToOpenTabs(engine: SyncEngine, filterSiteKey?: string): Promise<void> {
+  try {
+    const tabs = await browserAdapter.queryTabs();
+    const ssoGroups = engine.getCachedSsoGroups();
+    const seenOrigins = new Set<string>();
+    for (const tab of tabs) {
+      if (!isSyncableHttpUrl(tab.url)) continue;
+      let origin: string;
+      try {
+        origin = new URL(tab.url!).origin;
+      } catch {
+        continue;
+      }
+      if (seenOrigins.has(origin)) continue;
+      seenOrigins.add(origin);
+      if (filterSiteKey && resolveSiteKey(origin, ssoGroups) !== filterSiteKey) continue;
+
+      const cfg = await engine.getPageMountConfig(origin).catch(() => null);
+      if (!cfg) continue;
+      await browserAdapter.configureOriginExtendedMonitors(origin, {
+        syncSessionStorage: Boolean(cfg.syncSessionStorage),
+        sessionStorageKeyAllowlist: cfg.sessionStorageKeyAllowlist,
+        syncIndexedDb: Boolean(cfg.syncIndexedDb),
+        indexedDbTargets: cfg.indexedDbTargets,
+        indexedDbMaxTotalBytes: cfg.indexedDbMaxTotalBytes,
+      });
+    }
+  } catch {
+    // ignore extended monitor propagation errors
   }
 }
 
@@ -180,6 +292,7 @@ async function broadcastUiStateNow(): Promise<void> {
     const engine = await ensureEngineReady();
     const summary = await engine.getStatusSummary();
     updateBadgeFromStatus(summary);
+    await refreshAllTabBadges(engine, summary);
     await uiStateStorage.publishStatus(summary);
     scheduleAutoPushAlarmIfNeeded(engine);
   } catch (err) {
@@ -220,6 +333,9 @@ export async function ensureEngineReady(): Promise<SyncEngine> {
       const engine = new SyncEngine({
         storage: storageBackend,
         browser: browserAdapter,
+        storageAdapterOptions: {
+          resolveDirectoryHandle: async handleKey => defaultDirHandleStore.getDirectoryHandle(handleKey),
+        },
         keyVault,
         debounceMs: 3_000,
         refreshCoalesceMs: 1_200,
@@ -445,26 +561,99 @@ async function handleTabRemoved(tabId: number): Promise<void> {
   }
 }
 
-async function executeCommand(cmd: SessionMeshCommand): Promise<unknown> {
+async function buildAccountSwitchToast(
+  engine: SyncEngine,
+  siteKey: string,
+  trackId: string,
+): Promise<{
+  siteKey: string;
+  label: string;
+  badgeText: string;
+  color?: string;
+  index: number;
+  total: number;
+} | null> {
+  const overview = await engine.getSitesOverview().catch(() => []);
+  const site = overview.find(item => item.siteKey === siteKey);
+  if (!site) return null;
+  const idx = site.allTracks.findIndex(t => t.trackId === trackId);
+  const track = (idx >= 0 ? site.allTracks[idx] : site.activeTrack) ?? site.allTracks[0];
+  if (!track) return null;
+  const total = Math.max(1, site.allTracks.length);
+  const indexOneBased = idx >= 0 ? idx + 1 : 1;
+  return {
+    siteKey,
+    label: track.label,
+    badgeText: deriveTrackBadgeText(track, indexOneBased, total),
+    color: track.color,
+    index: indexOneBased,
+    total,
+  };
+}
+
+async function resolveNextRotationPreviewToast(
+  engine: SyncEngine,
+  siteKey: string,
+  direction: 'next' | 'prev',
+): Promise<{
+  siteKey: string;
+  label: string;
+  badgeText: string;
+  color?: string;
+  index: number;
+  total: number;
+} | null> {
+  const overview = await engine.getSitesOverview().catch(() => []);
+  const site = overview.find(item => item.siteKey === siteKey);
+  if (!site || site.allTracks.length === 0) return null;
+  const sorted = site.allTracks;
+  const currentIdx = site.binding.trackId ? sorted.findIndex(t => t.trackId === site.binding.trackId) : -1;
+  const nextIdx =
+    sorted.length === 1
+      ? 0
+      : currentIdx < 0
+        ? direction === 'prev'
+          ? sorted.length - 1
+          : 0
+        : direction === 'prev'
+          ? (currentIdx - 1 + sorted.length) % sorted.length
+          : (currentIdx + 1) % sorted.length;
+  const target = sorted[nextIdx];
+  const indexOneBased = nextIdx + 1;
+  const total = sorted.length;
+  return {
+    siteKey,
+    label: target.label,
+    badgeText: deriveTrackBadgeText(target, indexOneBased, total),
+    color: target.color,
+    index: indexOneBased,
+    total,
+  };
+}
+
+async function executeCommand(cmd: SessionMeshCommand, sender?: chrome.runtime.MessageSender): Promise<unknown> {
   const engine = await ensureEngineReady();
 
   switch (cmd.type) {
     case 'GET_STATUS_SUMMARY': {
       const status = await engine.getStatusSummary(cmd.activeUrl);
       const currentSite = await buildCurrentSiteSnapshot(engine, cmd.activeUrl);
-      const [settings, webdav] = await Promise.all([
+      const [settings, webdav, storage] = await Promise.all([
         engine.getSpaceSettings().catch(() => undefined),
         engine.getWebDAVConfig().catch(() => null),
+        engine.getSanitizedStorageConfig().catch(() => null),
       ]);
       updateBadgeFromStatus(status);
       const payload: PopupSummaryPayload & {
         settings?: SpaceSettings;
         webdav?: Omit<WebDAVConfig, 'password' | 'bearerToken'> | null;
+        storage?: SanitizedStorageProviderConfig | null;
       } = {
         status,
         currentSite,
         settings,
         webdav: sanitizeWebDAVConfig(webdav),
+        storage,
       };
       return payload;
     }
@@ -472,12 +661,25 @@ async function executeCommand(cmd: SessionMeshCommand): Promise<unknown> {
     case 'TEST_WEBDAV_CONNECTION':
       return engine.testWebDAVConnection(cmd.config);
 
+    case 'TEST_STORAGE_CONNECTION':
+      return engine.testStorageConnection(cmd.storage);
+
     case 'PROBE_REMOTE_SPACES':
       return engine.probeRemoteSpaces(cmd.config);
+
+    case 'PROBE_STORAGE_SPACES':
+      return engine.probeStorageSpaces(cmd.storage);
 
     case 'VERIFY_SPACE_PASSWORD':
       return engine.verifyRemoteSpacePassword({
         webdav: cmd.webdav,
+        spaceId: cmd.spaceId,
+        encryptionPassword: cmd.encryptionPassword,
+      });
+
+    case 'VERIFY_STORAGE_SPACE_PASSWORD':
+      return engine.verifyStorageSpacePassword({
+        storage: cmd.storage,
         spaceId: cmd.spaceId,
         encryptionPassword: cmd.encryptionPassword,
       });
@@ -494,6 +696,7 @@ async function executeCommand(cmd: SessionMeshCommand): Promise<unknown> {
       };
       const report = await engine.saveAndJoinSpace({
         webdav: cmd.webdav,
+        storage: cmd.storage,
         spaceId: cmd.spaceId,
         spaceName: cmd.spaceName,
         encryptionPassword: cmd.encryptionPassword,
@@ -505,6 +708,20 @@ async function executeCommand(cmd: SessionMeshCommand): Promise<unknown> {
       await syncVaultAndAlarms(engine);
       await broadcastUiStateNow();
       return report;
+    }
+
+    case 'UPDATE_SPACE_STORAGE_CONFIG': {
+      await engine.updateSpaceStorageConfig(cmd.storage);
+      await syncVaultAndAlarms(engine);
+      await broadcastUiStateNow();
+      return { updated: true };
+    }
+
+    case 'NOTIFY_LOCAL_DIR_PERMISSION_GRANTED': {
+      await engine.clearLocalDirPermissionError(cmd.handleKey);
+      await engine.syncNow({ userInitiated: true }).catch(() => undefined);
+      await broadcastUiStateNow();
+      return { ok: true };
     }
 
     case 'UNLOCK_SESSION': {
@@ -545,6 +762,7 @@ async function executeCommand(cmd: SessionMeshCommand): Promise<unknown> {
 
     case 'SET_GLOBAL_PAUSED': {
       await engine.setGlobalPaused(cmd.paused);
+      await propagateExtendedMonitorsToOpenTabs(engine);
       await broadcastUiStateNow();
       return { paused: cmd.paused };
     }
@@ -553,6 +771,7 @@ async function executeCommand(cmd: SessionMeshCommand): Promise<unknown> {
       const updated = await engine.updateSpaceSettings(cmd.settings);
       await keyVault.setSessionLockEnabled(Boolean(updated.sessionLockEnabled));
       await syncPollAlarmFromSettings(updated);
+      await propagateExtendedMonitorsToOpenTabs(engine);
       await broadcastUiStateNow();
       return updated;
     }
@@ -759,6 +978,28 @@ async function executeCommand(cmd: SessionMeshCommand): Promise<unknown> {
     case 'EXPORT_COOKIES_JSON':
       return engine.exportCookiesJson(cmd.siteKey, cmd.trackId);
 
+    case 'EXPORT_DEBUG_STATE':
+      return engine.exportDebugState(cmd.request);
+
+    case 'TOGGLE_WATCHED_COOKIE': {
+      const watchedCookieNames = await engine.toggleWatchedCookie(cmd.siteKey, cmd.cookieName, cmd.watched);
+      await broadcastUiStateNow();
+      return { watchedCookieNames };
+    }
+
+    case 'CREATE_SESSION_SHARE':
+      return engine.createSessionShare(cmd.request);
+
+    case 'PREVIEW_SESSION_SHARE':
+      return engine.previewSessionShare(cmd.code, cmd.passphrase);
+
+    case 'IMPORT_SESSION_SHARE': {
+      const res = await engine.importSessionShare(cmd.request);
+      scheduleFlushAlarm();
+      await broadcastUiStateNow();
+      return res;
+    }
+
     case 'GET_LOCAL_STORAGE_RECORDS':
       return engine.getLocalStorageRecords({
         siteKey: cmd.siteKey,
@@ -786,29 +1027,91 @@ async function executeCommand(cmd: SessionMeshCommand): Promise<unknown> {
       return { deleted: cmd.logicalIds.length };
     }
 
+    case 'GET_SESSION_STORAGE_RECORDS':
+      return engine.getSessionStorageRecords({
+        siteKey: cmd.siteKey,
+        origin: cmd.origin,
+        trackId: cmd.trackId,
+      });
+
+    case 'UPSERT_SESSION_STORAGE_ITEM': {
+      const record = await engine.upsertSessionStorageItem(cmd.origin, cmd.key, cmd.value, cmd.trackId);
+      scheduleFlushAlarm();
+      await broadcastUiStateNow();
+      return record;
+    }
+
+    case 'APPLY_SESSION_STORAGE_ITEM': {
+      const record = await engine.applySessionStorageItem(cmd.logicalId);
+      await broadcastUiStateNow();
+      return record;
+    }
+
+    case 'DELETE_SESSION_STORAGE_ITEMS': {
+      await engine.deleteSessionStorageItems(cmd.logicalIds, cmd.scope);
+      scheduleFlushAlarm();
+      await broadcastUiStateNow();
+      return { deleted: cmd.logicalIds.length };
+    }
+
+    case 'INSPECT_PAGE_INDEXED_DB':
+      return engine.inspectPageIndexedDb(cmd.origin);
+
+    case 'GET_INDEXED_DB_RECORDS':
+      return engine.getIndexedDbRecords({
+        siteKey: cmd.siteKey,
+        origin: cmd.origin,
+        trackId: cmd.trackId,
+        dbName: cmd.dbName,
+      });
+
+    case 'APPLY_INDEXED_DB_RECORD': {
+      const record = await engine.applyIndexedDbRecord(cmd.logicalId);
+      await broadcastUiStateNow();
+      return record;
+    }
+
+    case 'DELETE_INDEXED_DB_RECORDS': {
+      await engine.deleteIndexedDbRecords(cmd.logicalIds, cmd.scope);
+      scheduleFlushAlarm();
+      await broadcastUiStateNow();
+      return { deleted: cmd.logicalIds.length };
+    }
+
+    case 'CAPTURE_PAGE_EXTENDED_STORAGE_NOW': {
+      const res = await engine.capturePageExtendedStorageNow(cmd.origin);
+      scheduleFlushAlarm();
+      await broadcastUiStateNow();
+      return res;
+    }
+
     case 'GET_RULES_AND_BLACKLIST':
       return engine.getRulesAndBlacklist();
 
     case 'ADD_BLACKLIST_ENTRY': {
       const entry = await engine.addBlacklistEntry(cmd.entry);
+      await propagateExtendedMonitorsToOpenTabs(engine);
       await broadcastUiStateNow();
       return entry;
     }
 
     case 'REMOVE_BLACKLIST_ENTRY': {
       await engine.removeBlacklistEntry(cmd.id, cmd.scope);
+      await propagateExtendedMonitorsToOpenTabs(engine);
       await broadcastUiStateNow();
       return { removed: true };
     }
 
     case 'UPSERT_SITE_RULE': {
       await engine.upsertSiteRule(cmd.rule);
+      await propagateExtendedMonitorsToOpenTabs(engine, cmd.rule.siteKey);
       await broadcastUiStateNow();
       return { saved: true };
     }
 
     case 'REMOVE_SITE_RULE': {
       await engine.removeSiteRule(cmd.siteKey);
+      await propagateExtendedMonitorsToOpenTabs(engine, cmd.siteKey);
       await broadcastUiStateNow();
       return { removed: true };
     }
@@ -845,6 +1148,7 @@ async function executeCommand(cmd: SessionMeshCommand): Promise<unknown> {
 
     case 'IMPORT_RULES_JSON': {
       await engine.importRulesJson(cmd.payload);
+      await propagateExtendedMonitorsToOpenTabs(engine);
       await broadcastUiStateNow();
       return { imported: true };
     }
@@ -934,10 +1238,51 @@ async function executeCommand(cmd: SessionMeshCommand): Promise<unknown> {
       return { restored: true };
     }
 
+    case 'EXPORT_ARCHIVE_BACKUP': {
+      const res = await engine.exportArchiveBackup(cmd.passphrase);
+      return {
+        base64: res.base64,
+        suggestedFilename: res.suggestedFilename,
+        byteLength: res.byteLength,
+      };
+    }
+
+    case 'IMPORT_ARCHIVE_BACKUP': {
+      const res = await engine.importArchiveBackup({
+        base64: cmd.base64,
+        passphrase: cmd.passphrase,
+        mode: cmd.mode,
+      });
+      scheduleFlushAlarm();
+      await broadcastUiStateNow();
+      return res;
+    }
+
     case 'CONTENT_PAGE_MOUNTED': {
       await engine.ingestLocalStorageSnapshot(cmd.origin, cmd.items);
+      if (cmd.sessionItems) {
+        await engine.ingestSessionStorageSnapshot(cmd.origin, cmd.sessionItems);
+      }
+      const mountConfig = await engine.getPageMountConfig(cmd.origin);
+      const siteKey = resolveSiteKey(cmd.origin, engine.getCachedSsoGroups());
+      const pendingToast =
+        sender?.tab?.id !== undefined ? await consumePendingTabAccountToast(sender.tab.id, siteKey || undefined) : null;
+      if (mountConfig.syncSessionStorage || mountConfig.syncIndexedDb) {
+        setTimeout(() => {
+          void ensureEngineReady()
+            .then(async eng => {
+              await eng.reconcileOriginExtendedStorage(cmd.origin);
+              await broadcastUiStateNow();
+            })
+            .catch(() => undefined);
+        }, 80);
+      }
       await broadcastUiStateNow();
-      return { acknowledged: true };
+      const response: ContentPageMountConfig = {
+        ...mountConfig,
+        pendingToast,
+      };
+      return response;
     }
 
     case 'CONTENT_LOCAL_STORAGE_CHANGED': {
@@ -946,9 +1291,24 @@ async function executeCommand(cmd: SessionMeshCommand): Promise<unknown> {
       return { acknowledged: true };
     }
 
+    case 'CONTENT_SESSION_STORAGE_CHANGED': {
+      await engine.ingestSessionStorageMutations(cmd.origin, cmd.changes);
+      await broadcastUiStateNow();
+      return { acknowledged: true };
+    }
+
+    case 'CONTENT_INDEXED_DB_CHANGED': {
+      await engine.captureOriginIndexedDb(cmd.origin);
+      await broadcastUiStateNow();
+      return { acknowledged: true };
+    }
+
     case 'CONTENT_PAGE_LEAVING': {
       if (cmd.changes.length > 0) {
         await engine.ingestLocalStorageMutations(cmd.origin, cmd.changes, { isPageLeaving: true });
+      }
+      if (cmd.sessionChanges && cmd.sessionChanges.length > 0) {
+        await engine.ingestSessionStorageMutations(cmd.origin, cmd.sessionChanges, { isPageLeaving: true });
       }
       // Delay briefly so Chromium updates/closes the unloading tab before checking if any tab for this site remains open;
       // keeps same-site navigations deferred in on_page_leave mode without blocking real cross-site leave/close dedupe.
@@ -974,6 +1334,53 @@ async function executeCommand(cmd: SessionMeshCommand): Promise<unknown> {
 // Top-Level MV3 Event Registrations (MUST be synchronous at module evaluation)
 // =============================================================================
 
+async function performTabAccountRotation(
+  direction: 'next' | 'prev',
+  tabUrl?: string,
+  explicitTabId?: number,
+): Promise<void> {
+  if (!isSyncableHttpUrl(tabUrl)) return;
+  const engine = await ensureEngineReady();
+  const ssoGroups = engine.getCachedSsoGroups();
+  const siteKey = resolveSiteKey(tabUrl!, ssoGroups);
+  if (!siteKey) return;
+
+  let targetTabId = explicitTabId;
+  if (targetTabId === undefined) {
+    const activeTabs = await browserAdapter.queryTabs({ active: true }).catch(() => []);
+    targetTabId = activeTabs.find(t => t.url === tabUrl)?.id;
+  }
+
+  const previewToast = await resolveNextRotationPreviewToast(engine, siteKey, direction);
+  if (targetTabId !== undefined && previewToast) {
+    await savePendingTabAccountToast(targetTabId, previewToast);
+  }
+
+  const res = await engine.rotateSiteTrack(siteKey, direction);
+  if (targetTabId !== undefined) {
+    const exactToast = (await buildAccountSwitchToast(engine, siteKey, res.track.trackId)) ?? {
+      siteKey,
+      label: res.track.label,
+      badgeText: deriveTrackBadgeText(res.track, res.index, res.total),
+      color: res.track.color,
+      index: res.index,
+      total: res.total,
+    };
+    if (res.total <= 1 || res.previousTrackId === res.track.trackId || !res.reloadedTabs) {
+      await consumePendingTabAccountToast(targetTabId, siteKey);
+      await browserAdapter.sendAccountToastToTab(targetTabId, exactToast);
+    } else {
+      const stillPending = await consumePendingTabAccountToast(targetTabId, siteKey);
+      if (stillPending) {
+        await savePendingTabAccountToast(targetTabId, exactToast);
+      }
+    }
+  }
+
+  scheduleFlushAlarm();
+  await broadcastUiStateNow();
+}
+
 // 1. Context menu click listener (top-level so it survives SW restarts)
 registerContextMenuListener({
   onAddManagedSite: async tabUrl => {
@@ -991,15 +1398,8 @@ registerContextMenuListener({
     }
   },
   onRotateSiteAccount: async tabUrl => {
-    if (!isSyncableHttpUrl(tabUrl)) return;
     try {
-      const engine = await ensureEngineReady();
-      const rules = await engine.getRulesAndBlacklist().catch(() => null);
-      const siteKey = resolveSiteKey(tabUrl!, rules?.ssoGroups);
-      if (!siteKey) return;
-      await engine.rotateSiteTrack(siteKey, 'next');
-      scheduleFlushAlarm();
-      await broadcastUiStateNow();
+      await performTabAccountRotation('next', tabUrl);
     } catch (err) {
       console.warn('SessionMesh contextMenu rotateSiteAccount failed:', err);
     }
@@ -1045,6 +1445,62 @@ registerContextMenuListener({
   },
 });
 
+// 1b. Keyboard shortcut commands listener (top-level so it survives SW restarts)
+registerCommandShortcutsListener({
+  onRotateAccount: async (direction, tab) => {
+    try {
+      await performTabAccountRotation(direction, tab?.url, tab?.id);
+    } catch (err) {
+      console.warn('SessionMesh shortcut rotateAccount failed:', err);
+    }
+  },
+  onSyncCurrentSite: async tab => {
+    try {
+      const engine = await ensureEngineReady();
+      const ssoGroups = engine.getCachedSsoGroups();
+      const siteKey = isSyncableHttpUrl(tab?.url) ? resolveSiteKey(tab!.url!, ssoGroups) : undefined;
+      await engine.syncNow(siteKey ? { siteKey, userInitiated: true } : { userInitiated: true });
+      await broadcastUiStateNow();
+      if (tab?.id !== undefined && siteKey) {
+        const isEn = localeStorage.resolve() === 'en';
+        await browserAdapter.sendAccountToastToTab(tab.id, {
+          siteKey,
+          label: siteKey,
+          message: isEn ? 'Current site synced' : '当前站点已完成双向同步',
+        });
+      }
+    } catch (err) {
+      console.warn('SessionMesh shortcut syncCurrentSite failed:', err);
+    }
+  },
+  onCopyCurrentCurl: async tab => {
+    if (!tab?.url || !isSyncableHttpUrl(tab.url) || tab.id === undefined) return;
+    try {
+      const engine = await ensureEngineReady();
+      const res = await engine.exportDebugState({
+        targetUrl: tab.url,
+        format: 'curl',
+      });
+      const isEn = localeStorage.resolve() === 'en';
+      await browserAdapter.copyTextInTab(
+        tab.id,
+        res.content,
+        isEn
+          ? `Copied cURL for ${res.siteKey} (contains live session)`
+          : `已复制 ${res.siteKey} 的 cURL 命令（含敏感登录态，切勿外泄）`,
+      );
+    } catch (err) {
+      console.warn('SessionMesh shortcut copyCurrentCurl failed:', err);
+    }
+  },
+});
+
+// Rebuild right-click menus and refresh toolbar badge tooltips whenever UI language changes
+localeStorage.subscribe(() => {
+  setupContextMenus(localeStorage.resolve());
+  void broadcastUiStateNow();
+});
+
 // 2. Runtime install & update lifecycle
 chrome.runtime.onInstalled.addListener(details => {
   try {
@@ -1054,6 +1510,7 @@ chrome.runtime.onInstalled.addListener(details => {
   }
 
   setupContextMenus();
+  void ensureExpiryCheckAlarm();
 
   void ensureEngineReady()
     .then(() => broadcastUiStateNow())
@@ -1071,8 +1528,10 @@ chrome.runtime.onInstalled.addListener(details => {
 chrome.runtime.onStartup.addListener(() => {
   setupContextMenus();
   seedTabUrlCache();
+  void ensureExpiryCheckAlarm();
   void ensureEngineReady()
     .then(async engine => {
+      await engine.cleanupExpiredEphemeralTracks().catch(() => 0);
       const summary = await engine.getStatusSummary();
       const settings = await engine.getSpaceSettings();
       if (summary.configured && !summary.locked && settings.autoSync && summary.status !== 'PAUSED') {
@@ -1089,7 +1548,7 @@ chrome.runtime.onStartup.addListener(() => {
     .catch(err => console.warn('SessionMesh init onStartup error:', err));
 });
 
-// 4. Alarms for periodic polling & durable debounced flush
+// 4. Alarms for periodic polling, durable debounced flush & ephemeral/expiry checks
 chrome.alarms.onAlarm.addListener(alarm => {
   if (alarm.name === ALARM_POLL) {
     void ensureEngineReady()
@@ -1123,6 +1582,13 @@ chrome.alarms.onAlarm.addListener(alarm => {
         await broadcastUiStateNow();
       })
       .catch(err => console.warn('SessionMesh flush alarm error:', err));
+  } else if (alarm.name === ALARM_EXPIRY_CHECK) {
+    void ensureEngineReady()
+      .then(async engine => {
+        await engine.cleanupExpiredEphemeralTracks();
+        await broadcastUiStateNow();
+      })
+      .catch(err => console.warn('SessionMesh expiry check alarm error:', err));
   }
 });
 
@@ -1132,6 +1598,12 @@ chrome.tabs.onCreated.addListener(tab => {
     rememberTabUrl(tab.id, tab.url);
     // Trigger initial silent visit check here too (recentSiteVisits dedupes against onCommitted)
     void handleSiteVisited(tab.url, tab.id);
+    void ensureEngineReady()
+      .then(async engine => {
+        const summary = await engine.getStatusSummary(tab.url);
+        await refreshTabBadgeForUrl(engine, tab.id!, tab.url, summary);
+      })
+      .catch(() => undefined);
   }
 });
 
@@ -1139,12 +1611,27 @@ chrome.webNavigation?.onCommitted.addListener(details => {
   if (details.frameId !== 0) return;
   const isReload = details.transitionType === 'reload' || details.transitionType === 'auto_subframe';
   void handleTabNavigationChange(details.tabId, details.url, isReload);
+  void ensureEngineReady()
+    .then(async engine => {
+      const summary = await engine.getStatusSummary(details.url);
+      await refreshTabBadgeForUrl(engine, details.tabId, details.url, summary);
+    })
+    .catch(() => undefined);
 });
 
-chrome.tabs.onUpdated.addListener((tabId, changeInfo) => {
-  // ONLY react to URL changes — NEVER to status='loading' (which fires on every reload and causes reload loops!)
+chrome.tabs.onUpdated.addListener((tabId, changeInfo, tab) => {
+  // ONLY trigger navigation/visit sync on URL changes — NEVER on status='loading' (prevents reload loops!)
   if (changeInfo.url) {
     void handleTabNavigationChange(tabId, changeInfo.url, false);
+  }
+  if (changeInfo.url || changeInfo.status === 'complete') {
+    const activeUrl = changeInfo.url ?? tab?.url;
+    void ensureEngineReady()
+      .then(async engine => {
+        const summary = await engine.getStatusSummary(activeUrl);
+        await refreshTabBadgeForUrl(engine, tabId, activeUrl, summary);
+      })
+      .catch(() => undefined);
   }
 });
 
@@ -1153,12 +1640,18 @@ chrome.tabs.onRemoved.addListener(tabId => {
 });
 
 chrome.tabs.onActivated.addListener(activeInfo => {
-  // Keep tabUrlById fresh without triggering disruptive pulls or reloads on every tab switch
+  // Keep tabUrlById fresh and update active tab badge without triggering disruptive pulls or reloads
   chrome.tabs.get(activeInfo.tabId, tab => {
     if (chrome.runtime.lastError || !tab?.url || tab.id === undefined) return;
     if (isSyncableHttpUrl(tab.url)) {
       rememberTabUrl(tab.id, tab.url);
     }
+    void ensureEngineReady()
+      .then(async engine => {
+        const summary = await engine.getStatusSummary(tab.url);
+        await refreshTabBadgeForUrl(engine, tab.id!, tab.url, summary);
+      })
+      .catch(() => undefined);
   });
 });
 
@@ -1166,7 +1659,7 @@ chrome.tabs.onActivated.addListener(activeInfo => {
 chrome.runtime.onMessage.addListener(
   (
     message: unknown,
-    _sender: chrome.runtime.MessageSender,
+    sender: chrome.runtime.MessageSender,
     sendResponse: (response: SessionMeshResponse) => void,
   ): boolean | void => {
     if (!message || typeof message !== 'object' || !('type' in message)) {
@@ -1179,7 +1672,7 @@ chrome.runtime.onMessage.addListener(
       return;
     }
 
-    void executeCommand(cmd)
+    void executeCommand(cmd, sender)
       .then(data => {
         sendResponse({ ok: true, data });
       })

@@ -1374,6 +1374,9 @@ describe('rules: buildPresetBlacklistEntries & RulesEngine', () => {
       direction: 'bidirectional',
       syncCookies: true,
       syncLocalStorage: true,
+      syncSessionStorage: false,
+      syncIndexedDb: false,
+      indexedDbMaxTotalBytes: 1024 * 1024,
       autoRefresh: true,
     });
 
@@ -1389,6 +1392,9 @@ describe('rules: buildPresetBlacklistEntries & RulesEngine', () => {
       direction: 'pull_only',
       syncCookies: true,
       syncLocalStorage: true,
+      syncSessionStorage: false,
+      syncIndexedDb: false,
+      indexedDbMaxTotalBytes: 1024 * 1024,
       autoRefresh: false,
     });
   });

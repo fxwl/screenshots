@@ -2,7 +2,9 @@ import { extractErrorMessage, sidePanelApi } from '@console/lib/api';
 import {
   downloadJsonFile,
   formatRelativeTime,
+  formatRemainingDuration,
   getBindingMeta,
+  getExpiryBadgeMeta,
   normalizeManualSiteKey,
   parseImportedCookiesJson,
   shortId,
@@ -11,6 +13,7 @@ import type {
   AccountCreateMode,
   BrowserCandidateSite,
   EnvCookieSyncRule,
+  ExpiryHealthStatus,
   SiteSummaryView,
   SiteTrack,
 } from '@sessionmesh/shared';
@@ -20,6 +23,9 @@ import {
   DropdownMenuContent,
   DropdownMenuItem,
   DropdownMenuSeparator,
+  DropdownMenuSub,
+  DropdownMenuSubContent,
+  DropdownMenuSubTrigger,
   DropdownMenuTrigger,
   Input,
   Label,
@@ -44,7 +50,9 @@ import {
   RefreshCw,
   Repeat,
   Search,
+  Share2,
   StickyNote,
+  Terminal,
   Trash2,
   Upload,
   UserPlus,
@@ -55,11 +63,15 @@ import type React from 'react';
 import { useCallback, useEffect, useMemo, useState } from 'react';
 import { toast } from 'sonner';
 import { StatusBadge } from './common/Badge';
+import { DebugExportMenuItems } from './common/DebugExportDropdown';
 import { EmptyState } from './common/EmptyState';
 import { JsonImportModal } from './common/JsonImportModal';
 import { Modal } from './common/Modal';
+import { AccountAppearanceFields, sliceBadgeCodePoints, TrackBadges } from './common/TrackAppearance';
 import { CookieDetailView } from './CookieDetailView';
 import { LocalStorageTab } from './LocalStorageTab';
+import { SessionShareImportModal } from './SessionShareImportModal';
+import { SessionShareModal } from './SessionShareModal';
 
 export interface AccountsManagerTabProps {
   globalSearch: string;
@@ -126,6 +138,8 @@ export const AccountsManagerTab: React.FC<AccountsManagerTabProps> = ({
   const [createMode, setCreateMode] = useState<AccountCreateMode>('clean_new');
   const [createLabel, setCreateLabel] = useState('');
   const [createNote, setCreateNote] = useState('');
+  const [createColor, setCreateColor] = useState('');
+  const [createBadgeText, setCreateBadgeText] = useState('');
 
   // Edit Account Name & Note Modal
   const [editTarget, setEditTarget] = useState<{
@@ -133,7 +147,17 @@ export const AccountsManagerTab: React.FC<AccountsManagerTabProps> = ({
     trackId: string;
     label: string;
     accountNote: string;
+    color: string;
+    badgeText: string;
   } | null>(null);
+
+  // Team Session Share Modals
+  const [shareTarget, setShareTarget] = useState<{
+    siteKey: string;
+    trackId: string;
+    label: string;
+  } | null>(null);
+  const [shareImportOpen, setShareImportOpen] = useState(false);
 
   // Delete Account Confirm Modal
   const [deleteTarget, setDeleteTarget] = useState<{
@@ -158,6 +182,7 @@ export const AccountsManagerTab: React.FC<AccountsManagerTabProps> = ({
   const [envTargetUrl, setEnvTargetUrl] = useState('http://localhost:3000');
   const [envRuleScope, setEnvRuleScope] = useState<'device' | 'space'>('device');
   const [envSyncLs, setEnvSyncLs] = useState(true);
+  const [envSyncSs, setEnvSyncSs] = useState(false);
   const [envAdaptHttp, setEnvAdaptHttp] = useState(true);
   const [envCleanTarget, setEnvCleanTarget] = useState(true);
   const [envAutoSync, setEnvAutoSync] = useState(true);
@@ -262,6 +287,8 @@ export const AccountsManagerTab: React.FC<AccountsManagerTabProps> = ({
     setCreateMode('clean_new');
     setCreateLabel('');
     setCreateNote('');
+    setCreateColor('');
+    setCreateBadgeText('');
     setCreateOpen(true);
   };
 
@@ -277,6 +304,8 @@ export const AccountsManagerTab: React.FC<AccountsManagerTabProps> = ({
         mode: createMode,
         label: createLabel.trim() || undefined,
         accountNote: createNote.trim() || undefined,
+        color: createColor || undefined,
+        badgeText: sliceBadgeCodePoints(createBadgeText.trim(), 4) || undefined,
         triggerRefresh: createMode === 'clean_new',
       });
       toast.success(
@@ -347,8 +376,10 @@ export const AccountsManagerTab: React.FC<AccountsManagerTabProps> = ({
       await sidePanelApi.updateSiteTrack(editTarget.siteKey, editTarget.trackId, {
         label: editTarget.label.trim(),
         accountNote: editTarget.accountNote.trim(),
+        color: editTarget.color || null,
+        badgeText: sliceBadgeCodePoints(editTarget.badgeText.trim(), 4) || null,
       });
-      toast.success('账号名称与备注已保存');
+      toast.success('账号信息已保存');
       setEditTarget(null);
       await handleAfterMutation();
     } catch (err) {
@@ -405,6 +436,7 @@ export const AccountsManagerTab: React.FC<AccountsManagerTabProps> = ({
     setEnvTargetUrl('http://localhost:3000');
     setEnvRuleScope('device');
     setEnvSyncLs(true);
+    setEnvSyncSs(false);
     setEnvAdaptHttp(true);
     setEnvCleanTarget(true);
     setEnvAutoSync(true);
@@ -431,6 +463,7 @@ export const AccountsManagerTab: React.FC<AccountsManagerTabProps> = ({
           targetUrl: dst,
           syncCookies: true,
           syncLocalStorage: envSyncLs,
+          syncSessionStorage: envSyncSs,
           adaptForHttp: envAdaptHttp,
           cleanTargetBeforeSync: envCleanTarget,
           autoSync: envAutoSync,
@@ -438,8 +471,9 @@ export const AccountsManagerTab: React.FC<AccountsManagerTabProps> = ({
         });
         const res = await sidePanelApi.executeEnvSync({ ruleId: saved.id });
         const lsHint = res.appliedLocalStorage > 0 ? `、${res.appliedLocalStorage} 项 LS` : '';
+        const ssHint = (res.appliedSessionStorage ?? 0) > 0 ? `、${res.appliedSessionStorage} 项 SS` : '';
         toast.success(
-          `已绑定账号「${track.label}」并同步 ${res.appliedCookies} 条 Cookie${lsHint} 至 ${res.targetHost}`,
+          `已绑定账号「${track.label}」并同步 ${res.appliedCookies} 条 Cookie${lsHint}${ssHint} 至 ${res.targetHost}`,
         );
       } else {
         const res = await sidePanelApi.executeEnvSync({
@@ -449,14 +483,16 @@ export const AccountsManagerTab: React.FC<AccountsManagerTabProps> = ({
             targetUrl: dst,
             syncCookies: true,
             syncLocalStorage: envSyncLs,
+            syncSessionStorage: envSyncSs,
             adaptForHttp: envAdaptHttp,
             cleanTargetBeforeSync: envCleanTarget,
             autoReloadTarget: envAutoReload,
           },
         });
         const lsHint = res.appliedLocalStorage > 0 ? `、${res.appliedLocalStorage} 项 LS` : '';
+        const ssHint = (res.appliedSessionStorage ?? 0) > 0 ? `、${res.appliedSessionStorage} 项 SS` : '';
         toast.success(
-          `单次注入完成：已将「${track.label}」的 ${res.appliedCookies} 条 Cookie${lsHint} 写入 ${res.targetHost}`,
+          `单次注入完成：已将「${track.label}」的 ${res.appliedCookies} 条 Cookie${lsHint}${ssHint} 写入 ${res.targetHost}`,
         );
       }
       await handleAfterMutation();
@@ -472,8 +508,9 @@ export const AccountsManagerTab: React.FC<AccountsManagerTabProps> = ({
     try {
       const res = await sidePanelApi.executeEnvSync({ ruleId: rule.id, reverse });
       const lsHint = res.appliedLocalStorage > 0 ? `、${res.appliedLocalStorage} 项 LS` : '';
+      const ssHint = (res.appliedSessionStorage ?? 0) > 0 ? `、${res.appliedSessionStorage} 项 SS` : '';
       toast.success(
-        `${reverse ? '反向' : '环境'}同步完成：写入 ${res.appliedCookies} 条 Cookie${lsHint}（${res.targetHost}）`,
+        `${reverse ? '反向' : '环境'}同步完成：写入 ${res.appliedCookies} 条 Cookie${lsHint}${ssHint}（${res.targetHost}）`,
       );
       await handleAfterMutation();
     } catch (err) {
@@ -606,6 +643,10 @@ export const AccountsManagerTab: React.FC<AccountsManagerTabProps> = ({
             <UserPlus className="mr-1.5 h-3.5 w-3.5" />
             新增账号
           </Button>
+          <Button size="sm" variant="outline" className="h-8 px-2.5 text-xs" onClick={() => setShareImportOpen(true)}>
+            <Upload className="mr-1.5 h-3.5 w-3.5 text-purple-600 dark:text-purple-400" />
+            导入分享会话
+          </Button>
 
           <div className="flex items-center gap-1">
             {(
@@ -689,6 +730,10 @@ export const AccountsManagerTab: React.FC<AccountsManagerTabProps> = ({
             const bindingMeta = getBindingMeta(site.binding.state);
             const activeTrackId = site.activeTrack?.trackId;
             const siteEnvRules = envRules.filter(r => r.sourceSiteKey === site.siteKey);
+            const siteExpiryMeta =
+              site.expiryHealth && site.expiryHealth.status !== 'healthy'
+                ? getExpiryBadgeMeta(site.expiryHealth.status)
+                : null;
 
             return (
               <section
@@ -705,9 +750,22 @@ export const AccountsManagerTab: React.FC<AccountsManagerTabProps> = ({
                         <StatusBadge tone={site.allTracks.length >= 2 ? 'primary' : 'neutral'}>
                           {site.allTracks.length} 个账号
                         </StatusBadge>
+                        {siteExpiryMeta && site.expiryHealth ? (
+                          <StatusBadge tone={siteExpiryMeta.tone}>
+                            {site.expiryHealth.status === 'expired'
+                              ? 'Cookie 已过期'
+                              : `${siteExpiryMeta.label}${
+                                  site.expiryHealth.remainingMs !== undefined
+                                    ? ` · ${formatRemainingDuration(site.expiryHealth.remainingMs)}`
+                                    : ''
+                                }`}
+                          </StatusBadge>
+                        ) : null}
                       </div>
-                      <p className="mt-0.5 text-[11px] text-muted-foreground">
-                        当前激活：{site.activeTrack?.label || '未绑定'}
+                      <p className="mt-0.5 flex flex-wrap items-center gap-1 text-[11px] text-muted-foreground">
+                        <span>当前激活：</span>
+                        <TrackBadges track={site.activeTrack} showEphemeralCountdown={false} />
+                        <span>{site.activeTrack?.label || '未绑定'}</span>
                         {site.activeTrack?.accountNote ? ` · ${site.activeTrack.accountNote}` : ''}
                       </p>
                     </div>
@@ -753,6 +811,17 @@ export const AccountsManagerTab: React.FC<AccountsManagerTabProps> = ({
                       const pinnedRules = siteEnvRules.filter(r => r.sourceTrackId === track.trackId);
                       const followRules = isActive ? siteEnvRules.filter(r => !r.sourceTrackId) : [];
                       const linkedRules = [...pinnedRules, ...followRules];
+                      const trackExpiring = (site.expiryHealth?.expiringCookies ?? []).filter(
+                        ec => ec.trackId === track.trackId,
+                      );
+                      const worstTrackExpiry = trackExpiring.reduce<ExpiryHealthStatus | null>((worst, item) => {
+                        const rank = (st: ExpiryHealthStatus | null) =>
+                          st === 'expired' ? 3 : st === 'critical' ? 2 : st === 'expiring_soon' ? 1 : 0;
+                        return rank(item.status) > rank(worst) ? item.status : worst;
+                      }, null);
+                      const earliestTrackRemaining =
+                        trackExpiring.length > 0 ? trackExpiring[0].remainingMs : undefined;
+                      const trackExpiryMeta = worstTrackExpiry ? getExpiryBadgeMeta(worstTrackExpiry) : null;
                       const isBusy =
                         busyKey === `switch:${track.trackId}` ||
                         busyKey === `reorder:${track.trackId}` ||
@@ -802,11 +871,23 @@ export const AccountsManagerTab: React.FC<AccountsManagerTabProps> = ({
                               {/* Name, Note, Stats, Linked Env Rules */}
                               <div className="min-w-0 flex-1 space-y-1">
                                 <div className="flex flex-wrap items-center gap-1.5">
+                                  <TrackBadges track={track} />
                                   <span className="text-sm font-semibold text-foreground">{track.label}</span>
                                   {isActive ? (
                                     <StatusBadge tone="success">
                                       <CheckCircle2 className="h-3 w-3" />
                                       当前激活
+                                    </StatusBadge>
+                                  ) : null}
+                                  {trackExpiryMeta ? (
+                                    <StatusBadge tone={trackExpiryMeta.tone}>
+                                      {worstTrackExpiry === 'expired'
+                                        ? 'Cookie 已过期'
+                                        : `${trackExpiryMeta.label}${
+                                            earliestTrackRemaining !== undefined
+                                              ? ` · ${formatRemainingDuration(earliestTrackRemaining)}`
+                                              : ''
+                                          }`}
                                     </StatusBadge>
                                   ) : null}
                                   <button
@@ -817,10 +898,12 @@ export const AccountsManagerTab: React.FC<AccountsManagerTabProps> = ({
                                         trackId: track.trackId,
                                         label: track.label,
                                         accountNote: track.accountNote || '',
+                                        color: track.color || '',
+                                        badgeText: track.badgeText || '',
                                       })
                                     }
                                     className="rounded p-0.5 text-muted-foreground hover:bg-muted hover:text-foreground"
-                                    title="编辑账号名称与备注">
+                                    title="编辑账号名称、颜色标识与备注">
                                     <Edit3 className="h-3 w-3" />
                                   </button>
                                 </div>
@@ -939,7 +1022,7 @@ export const AccountsManagerTab: React.FC<AccountsManagerTabProps> = ({
                                     <MoreHorizontal className="h-3.5 w-3.5" />
                                   </Button>
                                 </DropdownMenuTrigger>
-                                <DropdownMenuContent align="end" className="w-48">
+                                <DropdownMenuContent align="end" className="w-52">
                                   <DropdownMenuItem
                                     onClick={() =>
                                       setEditTarget({
@@ -947,11 +1030,37 @@ export const AccountsManagerTab: React.FC<AccountsManagerTabProps> = ({
                                         trackId: track.trackId,
                                         label: track.label,
                                         accountNote: track.accountNote || '',
+                                        color: track.color || '',
+                                        badgeText: track.badgeText || '',
                                       })
                                     }>
                                     <Edit3 className="mr-2 h-3.5 w-3.5" />
-                                    编辑名称与备注
+                                    编辑名称、标识与备注
                                   </DropdownMenuItem>
+                                  <DropdownMenuItem
+                                    onClick={() =>
+                                      setShareTarget({
+                                        siteKey: site.siteKey,
+                                        trackId: track.trackId,
+                                        label: track.label,
+                                      })
+                                    }>
+                                    <Share2 className="mr-2 h-3.5 w-3.5 text-primary" />
+                                    临时加密分享
+                                  </DropdownMenuItem>
+                                  <DropdownMenuSub>
+                                    <DropdownMenuSubTrigger className="text-xs">
+                                      <Terminal className="mr-2 h-3.5 w-3.5" />
+                                      导出调试态 (7种格式)
+                                    </DropdownMenuSubTrigger>
+                                    <DropdownMenuSubContent className="w-56">
+                                      <DebugExportMenuItems
+                                        siteKey={site.siteKey}
+                                        trackId={track.trackId}
+                                        trackLabel={track.label}
+                                      />
+                                    </DropdownMenuSubContent>
+                                  </DropdownMenuSub>
                                   <DropdownMenuSeparator />
                                   <DropdownMenuItem
                                     onClick={() => void handleExportAccountCookies(site.siteKey, track)}>
@@ -1105,15 +1214,22 @@ export const AccountsManagerTab: React.FC<AccountsManagerTabProps> = ({
               }}
             />
           </div>
+          <AccountAppearanceFields
+            idPrefix="acct-create"
+            color={createColor}
+            onColorChange={setCreateColor}
+            badgeText={createBadgeText}
+            onBadgeTextChange={setCreateBadgeText}
+          />
         </div>
       </Modal>
 
-      {/* Edit Account Name & Note Modal */}
+      {/* Edit Account Name, Appearance & Note Modal */}
       <Modal
         open={!!editTarget}
         onClose={() => setEditTarget(null)}
         title={`编辑账号信息 (${editTarget?.siteKey || ''})`}
-        description="修改后的账号名称与备注将随同步空间加密同步至所有设备。"
+        description="修改后的账号名称、颜色角标与备注将随同步空间加密同步至所有设备。"
         footer={
           <>
             <Button variant="outline" size="sm" onClick={() => setEditTarget(null)}>
@@ -1159,6 +1275,13 @@ export const AccountsManagerTab: React.FC<AccountsManagerTabProps> = ({
               }}
             />
           </div>
+          <AccountAppearanceFields
+            idPrefix="acct-edit"
+            color={editTarget?.color || ''}
+            onColorChange={c => setEditTarget(prev => (prev ? { ...prev, color: c } : null))}
+            badgeText={editTarget?.badgeText || ''}
+            onBadgeTextChange={b => setEditTarget(prev => (prev ? { ...prev, badgeText: b } : null))}
+          />
         </div>
       </Modal>
 
@@ -1364,6 +1487,12 @@ export const AccountsManagerTab: React.FC<AccountsManagerTabProps> = ({
                 </Label>
               </div>
               <div className="flex items-center gap-1.5">
+                <Switch id="acct-env-ss" className="scale-75" checked={envSyncSs} onCheckedChange={setEnvSyncSs} />
+                <Label htmlFor="acct-env-ss" className="text-[11px] cursor-pointer">
+                  同步 sessionStorage
+                </Label>
+              </div>
+              <div className="flex items-center gap-1.5">
                 <Switch
                   id="acct-env-auto"
                   className="scale-75"
@@ -1400,6 +1529,21 @@ export const AccountsManagerTab: React.FC<AccountsManagerTabProps> = ({
           </div>
         </div>
       </Modal>
+
+      {/* Team Encrypted Session Share & Import Modals */}
+      <SessionShareModal
+        open={!!shareTarget}
+        onClose={() => setShareTarget(null)}
+        siteKey={shareTarget?.siteKey || ''}
+        trackId={shareTarget?.trackId}
+        trackLabel={shareTarget?.label}
+      />
+
+      <SessionShareImportModal
+        open={shareImportOpen}
+        onClose={() => setShareImportOpen(false)}
+        onImported={handleAfterMutation}
+      />
     </div>
   );
 };
