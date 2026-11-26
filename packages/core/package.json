@@ -18,7 +18,7 @@
     "test": "vitest run"
   },
   "dependencies": {
-    "pako": "^2.1.0",
+    "pako": "^3.0.3",
     "protobufjs": "^7.3.2"
   },
   "devDependencies": {
@@ -26,7 +26,7 @@
     "@sessionmesh/tsconfig": "workspace:*",
     "@types/chrome": "^0.0.268",
     "@types/node": "^20.12.11",
-    "@types/pako": "^2.0.3",
+    "@types/pako": "^3.0.0",
     "tsup": "8.0.2",
     "vitest": "^1.6.0"
   }
